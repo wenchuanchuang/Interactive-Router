@@ -1,0 +1,76 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Python virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python tooling cache
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Build outputs
+build/
+dist/
+out/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.obj
+*.o
+*.lib
+*.dll
+*.pyd
+*.so
+*.dylib
+*.exe
+
+# KiCad board/project files used as local test data
+*.kicad_pcb
+*.kicad_pcb-bak
+*.kicad_sch
+*.kicad_pro
+*.kicad_prl
+*-backups/
+fp-info-cache
+
+# KiCad manufacturing outputs
+Gerber/
+gerber/
+drill/
+*.gbr
+*.gbl
+*.gtl
+*.gbs
+*.gts
+*.gbo
+*.gto
+*.drl
+*.pos
+*.rpt
+*.net
+
+# Local app/log/temp files
+*.log
+*.tmp
+*.bak
+
+# IDE/editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
