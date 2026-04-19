@@ -25,9 +25,16 @@ CMakeFiles/
 CMakeCache.txt
 cmake_install.cmake
 Makefile
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
 *.obj
 *.o
 *.lib
+*.exp
+*.ilk
+*.pdb
 *.dll
 *.pyd
 *.so
@@ -35,6 +42,7 @@ Makefile
 *.exe
 
 # KiCad board/project files used as local test data
+test_boards/
 *.kicad_pcb
 *.kicad_pcb-bak
 *.kicad_sch

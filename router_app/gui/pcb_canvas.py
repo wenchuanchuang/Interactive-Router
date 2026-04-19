@@ -14,7 +14,7 @@ from PyQt5.QtWidgets import (
     QGraphicsView,
 )
 
-from router_app.kicad_parser import BoardData, Footprint, Pad, TrackSegment
+from router_app.kicad_parser import BoardData, Footprint, Pad, TrackSegment, Via
 
 
 class TrackItem(QGraphicsLineItem):
@@ -58,21 +58,67 @@ class TrackItem(QGraphicsLineItem):
         super().hoverEnterEvent(event)
 
 
+class ViaItem(QGraphicsEllipseItem):
+    def __init__(self, via: Via, scale: float, on_clicked: Callable[[int], None]):
+        radius = max(via.diameter * scale * 0.5, 3.0)
+        x, y = via.center
+        super().__init__(x * scale - radius, y * scale - radius, radius * 2.0, radius * 2.0)
+        self.via = via
+        self._on_clicked = on_clicked
+        self.setAcceptHoverEvents(True)
+        self.setFlag(QGraphicsItem.ItemIsSelectable, False)
+        self.setZValue(8)
+        self.apply_style(False, False)
+
+    def apply_style(self, highlighted: bool, dimmed: bool) -> None:
+        if highlighted:
+            pen = QPen(QColor("#ffffff"), 2.4)
+            brush = QBrush(QColor("#ffd21f"))
+            self.setZValue(28)
+        else:
+            color = QColor("#dfe6ef")
+            if dimmed:
+                color.setAlpha(70)
+            pen = QPen(color, 1.4)
+            brush_color = QColor("#2d343d")
+            brush_color.setAlpha(210 if not dimmed else 80)
+            brush = QBrush(brush_color)
+            self.setZValue(8)
+        pen.setCosmetic(True)
+        self.setPen(pen)
+        self.setBrush(brush)
+
+    def mousePressEvent(self, event) -> None:
+        self._on_clicked(self.via.net_id)
+        super().mousePressEvent(event)
+
+    def hoverEnterEvent(self, event) -> None:
+        self.setCursor(Qt.PointingHandCursor)
+        super().hoverEnterEvent(event)
+
+
 class PcbCanvas(QGraphicsView):
     traceSelected = pyqtSignal(object)
+    netSelectionChanged = pyqtSignal(object)
+    ripupStateChanged = pyqtSignal(int)
+    rippedNetsChanged = pyqtSignal(object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._scene = QGraphicsScene(self)
         self._board: BoardData | None = None
         self._track_items: list[TrackItem] = []
+        self._via_items: list[ViaItem] = []
         self._component_items: list[tuple[QGraphicsItem, tuple[str, ...]]] = []
-        self._selected_net_id: int | None = None
+        self._selected_net_ids: set[int] = set()
+        self._ripped_net_ids: set[int] = set()
+        self._ripup_history: list[set[int]] = []
         self._current_layer = "F.Cu"
         self._show_all_layers = True
         self._show_components = True
         self._emphasize_two_pin_nets = True
         self._scale = 22.0
+        self._zoom_level = 1.0
 
         self.setScene(self._scene)
         self.setRenderHints(QPainter.Antialiasing | QPainter.TextAntialiasing)
@@ -83,11 +129,14 @@ class PcbCanvas(QGraphicsView):
 
     def load_board(self, board: BoardData) -> None:
         self._board = board
-        self._selected_net_id = None
+        self._selected_net_ids.clear()
+        self._ripped_net_ids.clear()
+        self._ripup_history.clear()
         layers = board.copper_layers
         if layers:
             self._current_layer = layers[0]
         self._track_items.clear()
+        self._via_items.clear()
         self._component_items.clear()
         self._scene.clear()
 
@@ -99,10 +148,57 @@ class PcbCanvas(QGraphicsView):
             self._track_items.append(item)
             self._scene.addItem(item)
 
+        for via in board.vias:
+            item = ViaItem(via, self._scale, self._toggle_net_selection)
+            self._via_items.append(item)
+            self._scene.addItem(item)
+
         self._refresh_visibility()
         self._refresh_highlight()
         self._scene.setSceneRect(self._scene.itemsBoundingRect().adjusted(-60, -60, 60, 60))
         self.fit_board()
+        self.netSelectionChanged.emit(set(self._selected_net_ids))
+        self.ripupStateChanged.emit(len(self._ripup_history))
+        self.rippedNetsChanged.emit(set(self._ripped_net_ids))
+
+    @property
+    def selected_net_ids(self) -> set[int]:
+        return set(self._selected_net_ids)
+
+    @property
+    def ripped_net_ids(self) -> set[int]:
+        return set(self._ripped_net_ids)
+
+    @property
+    def can_undo_rip_up(self) -> bool:
+        return bool(self._ripup_history)
+
+    def rip_up_selected(self) -> bool:
+        if not self._selected_net_ids:
+            return False
+
+        ripped_now = set(self._selected_net_ids)
+        self._ripped_net_ids.update(ripped_now)
+        self._ripup_history.append(ripped_now)
+        self._selected_net_ids.clear()
+        self._refresh_visibility()
+        self._refresh_highlight()
+        self.netSelectionChanged.emit(set(self._selected_net_ids))
+        self.ripupStateChanged.emit(len(self._ripup_history))
+        self.rippedNetsChanged.emit(set(self._ripped_net_ids))
+        return True
+
+    def undo_rip_up(self) -> bool:
+        if not self._ripup_history:
+            return False
+
+        restored = self._ripup_history.pop()
+        self._ripped_net_ids.difference_update(restored)
+        self._refresh_visibility()
+        self._refresh_highlight()
+        self.ripupStateChanged.emit(len(self._ripup_history))
+        self.rippedNetsChanged.emit(set(self._ripped_net_ids))
+        return True
 
     def set_current_layer(self, layer: str) -> None:
         self._current_layer = layer
@@ -123,6 +219,7 @@ class PcbCanvas(QGraphicsView):
     def fit_board(self) -> None:
         rect = self._scene.itemsBoundingRect()
         if not rect.isNull():
+            self._zoom_level = 1.0
             self.fitInView(rect.adjusted(-30, -30, 30, 30), Qt.KeepAspectRatio)
 
     def resizeEvent(self, event) -> None:
@@ -131,25 +228,57 @@ class PcbCanvas(QGraphicsView):
             self.fit_board()
 
     def wheelEvent(self, event) -> None:
-        factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
+        delta = event.angleDelta().y()
+        if delta == 0:
+            delta = event.pixelDelta().y()
+        if delta == 0:
+            event.ignore()
+            return
+
+        factor = 1.0015 ** delta
+        next_zoom = self._zoom_level * factor
+        if next_zoom < 0.08 or next_zoom > 40.0:
+            event.accept()
+            return
+
+        self._zoom_level = next_zoom
         self.scale(factor, factor)
+        event.accept()
 
     def _select_track(self, track: TrackSegment) -> None:
-        self._selected_net_id = track.net_id
-        self._refresh_highlight()
+        self._toggle_net_selection(track.net_id)
         self.traceSelected.emit(track)
+
+    def _toggle_net_selection(self, net_id: int) -> None:
+        if net_id in self._ripped_net_ids:
+            return
+        if net_id in self._selected_net_ids:
+            self._selected_net_ids.remove(net_id)
+        else:
+            self._selected_net_ids.add(net_id)
+        self._refresh_highlight()
+        self.netSelectionChanged.emit(set(self._selected_net_ids))
 
     def _refresh_highlight(self) -> None:
         two_pin_nets = self._board.two_pin_net_ids if self._board is not None else set()
         for item in self._track_items:
-            highlighted = item.track.net_id == self._selected_net_id
-            dimmed = self._selected_net_id is not None and not highlighted
+            highlighted = item.track.net_id in self._selected_net_ids
+            dimmed = bool(self._selected_net_ids) and not highlighted
             emphasized = self._emphasize_two_pin_nets and item.track.net_id in two_pin_nets
             item.apply_style(highlighted, dimmed, emphasized)
+        for item in self._via_items:
+            highlighted = item.via.net_id in self._selected_net_ids
+            dimmed = bool(self._selected_net_ids) and not highlighted
+            item.apply_style(highlighted, dimmed)
 
     def _refresh_visibility(self) -> None:
         for item in self._track_items:
-            item.setVisible(self._show_all_layers or _same_layer(item.track.layer, self._current_layer))
+            item.setVisible(
+                item.track.net_id not in self._ripped_net_ids
+                and (self._show_all_layers or _same_layer(item.track.layer, self._current_layer))
+            )
+        for item in self._via_items:
+            item.setVisible(item.via.net_id not in self._ripped_net_ids)
 
         for item, layers in self._component_items:
             item.setVisible(
@@ -217,6 +346,161 @@ class PcbCanvas(QGraphicsView):
         return item
 
 
+class RoutePreviewCanvas(QGraphicsView):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._scene = QGraphicsScene(self)
+        self._zoom_level = 1.0
+        self.setScene(self._scene)
+        self.setRenderHints(QPainter.Antialiasing | QPainter.TextAntialiasing)
+        self.setBackgroundBrush(QBrush(QColor("#101318")))
+        self.setDragMode(QGraphicsView.ScrollHandDrag)
+        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.AnchorViewCenter)
+
+    def show_message(self, message: str) -> None:
+        self._scene.clear()
+        text = QGraphicsTextItem(message)
+        text.setDefaultTextColor(QColor("#8d96a5"))
+        text.setPos(16, 16)
+        self._scene.addItem(text)
+        self._scene.setSceneRect(self._scene.itemsBoundingRect().adjusted(-16, -16, 120, 80))
+        self._zoom_level = 1.0
+
+    def show_route(
+        self,
+        route_result,
+        board: BoardData | None = None,
+        ripped_net_ids: set[int] | None = None,
+    ) -> None:
+        self._scene.clear()
+        points = list(route_result.path_mm)
+        if len(points) < 2:
+            self.show_message("No route path")
+            return
+
+        ripped_net_ids = ripped_net_ids or set()
+        scale = 22.0
+        min_x, min_y = _preview_origin(points, board)
+
+        if board is not None:
+            self._draw_preview_board(board, ripped_net_ids, scale, min_x, min_y)
+
+        halo_pen = QPen(QColor("#111318"), 9.0, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+        for index, (start, end) in enumerate(zip(points, points[1:])):
+            x1, y1 = _preview_point(start, scale, min_x, min_y)
+            x2, y2 = _preview_point(end, scale, min_x, min_y)
+            self._scene.addLine(x1, y1, x2, y2, halo_pen).setZValue(40)
+            layer = _route_layer_for_segment(route_result, board, index)
+            route_pen = QPen(
+                _layer_highlight_color(layer),
+                5.0,
+                _layer_pen_style(layer),
+                Qt.RoundCap,
+                Qt.RoundJoin,
+            )
+            self._scene.addLine(x1, y1, x2, y2, route_pen).setZValue(_layer_z_value(layer) + 41)
+            if _route_changes_layer(route_result, index):
+                self._draw_route_layer_change_marker(x2, y2, layer)
+
+        label = QGraphicsTextItem(f"Net {route_result.net_id} | pitch {route_result.grid_pitch:g} mm")
+        label.setDefaultTextColor(QColor("#ffffff"))
+        label.setPos(8, 8)
+        label.setZValue(10)
+        self._scene.addItem(label)
+        self._scene.setSceneRect(self._scene.itemsBoundingRect().adjusted(-40, -40, 40, 40))
+        self._zoom_level = 1.0
+        self.fitInView(self._scene.itemsBoundingRect().adjusted(-30, -30, 30, 30), Qt.KeepAspectRatio)
+
+    def _draw_route_layer_change_marker(self, x: float, y: float, layer: str) -> None:
+        marker = QGraphicsEllipseItem(x - 6, y - 6, 12, 12)
+        marker.setBrush(QBrush(_layer_highlight_color(layer)))
+        pen = QPen(QColor("#ffffff"), 1.6)
+        pen.setCosmetic(True)
+        marker.setPen(pen)
+        marker.setZValue(60)
+        self._scene.addItem(marker)
+
+    def wheelEvent(self, event) -> None:
+        delta = event.angleDelta().y()
+        if delta == 0:
+            delta = event.pixelDelta().y()
+        if delta == 0:
+            event.ignore()
+            return
+
+        factor = 1.0015 ** delta
+        next_zoom = self._zoom_level * factor
+        if next_zoom < 0.08 or next_zoom > 40.0:
+            event.accept()
+            return
+
+        self._zoom_level = next_zoom
+        self.scale(factor, factor)
+        event.accept()
+
+    def _draw_preview_board(
+        self,
+        board: BoardData,
+        ripped_net_ids: set[int],
+        scale: float,
+        min_x: float,
+        min_y: float,
+    ) -> None:
+        for footprint in board.footprints:
+            for pad in footprint.pads:
+                x, y = pad.center
+                width, height = pad.size
+                rect = QRectF(
+                    (x - width / 2 - min_x) * scale,
+                    (y - height / 2 - min_y) * scale,
+                    max(width * scale, 2.0),
+                    max(height * scale, 2.0),
+                )
+                item = QGraphicsEllipseItem(rect) if pad.shape in {"circle", "oval"} else QGraphicsRectItem(rect)
+                pad_color = _pad_color(pad.layers)
+                pad_color.setAlpha(65)
+                item.setBrush(QBrush(pad_color))
+                pen = QPen(QColor("#c7ced8"), 0.8)
+                pen.setCosmetic(True)
+                item.setPen(pen)
+                item.setZValue(1)
+                self._scene.addItem(item)
+
+        for track in board.tracks:
+            if track.net_id in ripped_net_ids:
+                continue
+            x1 = (track.start[0] - min_x) * scale
+            y1 = (track.start[1] - min_y) * scale
+            x2 = (track.end[0] - min_x) * scale
+            y2 = (track.end[1] - min_y) * scale
+            color = _layer_color(track.layer)
+            color.setAlpha(95)
+            pen = QPen(
+                color,
+                max(track.width * scale, 1.6),
+                _layer_pen_style(track.layer),
+                Qt.RoundCap,
+                Qt.RoundJoin,
+            )
+            item = self._scene.addLine(x1, y1, x2, y2, pen)
+            item.setZValue(_layer_z_value(track.layer))
+
+        for via in board.vias:
+            if via.net_id in ripped_net_ids:
+                continue
+            radius = max(via.diameter * scale * 0.5, 2.2)
+            x = (via.center[0] - min_x) * scale
+            y = (via.center[1] - min_y) * scale
+            item = QGraphicsEllipseItem(x - radius, y - radius, radius * 2, radius * 2)
+            item.setBrush(QBrush(QColor("#2d343d")))
+            pen = QPen(QColor("#dfe6ef"), 1.0)
+            pen.setCosmetic(True)
+            item.setPen(pen)
+            item.setZValue(8)
+            self._scene.addItem(item)
+
+
 def _layer_color(layer: str) -> QColor:
     if layer == "F.Cu":
         return QColor("#f15a3b")
@@ -282,6 +566,61 @@ def _pad_color(layers: tuple[str, ...]) -> QColor:
 
 def _layers_include(layers: tuple[str, ...], current_layer: str) -> bool:
     return "*.Cu" in layers or current_layer in layers
+
+
+def _preview_origin(points: list[object], board: BoardData | None) -> tuple[float, float]:
+    xs = [_point_x(point) for point in points]
+    ys = [_point_y(point) for point in points]
+    if board is not None:
+        for track in board.tracks:
+            xs.extend([track.start[0], track.end[0]])
+            ys.extend([track.start[1], track.end[1]])
+        for footprint in board.footprints:
+            for pad in footprint.pads:
+                half_x = pad.size[0] * 0.5
+                half_y = pad.size[1] * 0.5
+                xs.extend([pad.center[0] - half_x, pad.center[0] + half_x])
+                ys.extend([pad.center[1] - half_y, pad.center[1] + half_y])
+        for via in board.vias:
+            radius = via.diameter * 0.5
+            xs.extend([via.center[0] - radius, via.center[0] + radius])
+            ys.extend([via.center[1] - radius, via.center[1] + radius])
+    return min(xs), min(ys)
+
+
+def _preview_point(point: object, scale: float, min_x: float, min_y: float) -> tuple[float, float]:
+    return (_point_x(point) - min_x) * scale, (_point_y(point) - min_y) * scale
+
+
+def _route_layer_for_segment(route_result: object, board: BoardData | None, index: int) -> str:
+    layers = board.copper_layers if board is not None else []
+    path_grid = list(getattr(route_result, "path_grid", []))
+    if layers and index < len(path_grid):
+        z = int(getattr(path_grid[index], "z", 0))
+        if 0 <= z < len(layers):
+            return layers[z]
+
+    if board is not None:
+        net_id = int(getattr(route_result, "net_id", 0))
+        for track in board.tracks:
+            if track.net_id == net_id:
+                return track.layer
+    return "F.Cu"
+
+
+def _route_changes_layer(route_result: object, index: int) -> bool:
+    path_grid = list(getattr(route_result, "path_grid", []))
+    if index + 1 >= len(path_grid):
+        return False
+    return int(getattr(path_grid[index], "z", 0)) != int(getattr(path_grid[index + 1], "z", 0))
+
+
+def _point_x(point: object) -> float:
+    return float(getattr(point, "x"))
+
+
+def _point_y(point: object) -> float:
+    return float(getattr(point, "y"))
 
 
 def _same_layer(layer: str, current_layer: str) -> bool:

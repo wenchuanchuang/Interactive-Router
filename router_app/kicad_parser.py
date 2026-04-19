@@ -41,11 +41,20 @@ class Footprint:
 
 
 @dataclass(frozen=True)
+class Via:
+    center: tuple[float, float]
+    diameter: float
+    net_id: int
+    net_name: str
+
+
+@dataclass(frozen=True)
 class BoardData:
     path: Path
     nets: dict[int, str]
     tracks: list[TrackSegment]
     footprints: list[Footprint]
+    vias: list[Via]
     backend: str = "sexpr"
     design_rules: dict[str, float] | None = None
 
@@ -93,8 +102,11 @@ def _load_board_with_pcbnew(path: str | Path) -> BoardData:
                 load_path.unlink()
             except OSError:
                 pass
+    if board is None:
+        raise RuntimeError(f"pcbnew failed to load board: {board_path}")
     nets = _pcbnew_nets(board)
     tracks = _pcbnew_tracks(board, pcbnew, nets)
+    vias = _pcbnew_vias(board, pcbnew, nets)
     footprints = _pcbnew_footprints(board, pcbnew, nets)
 
     return BoardData(
@@ -102,6 +114,7 @@ def _load_board_with_pcbnew(path: str | Path) -> BoardData:
         nets=nets,
         tracks=tracks,
         footprints=footprints,
+        vias=vias,
         backend="pcbnew-normalized" if load_path != board_path else "pcbnew",
         design_rules=_pcbnew_design_rules(board, pcbnew),
     )
@@ -113,6 +126,7 @@ def _load_board_with_sexpr(path: str | Path) -> BoardData:
     sexpr = _parse_sexpr(text)
     nets: dict[int, str] = {}
     tracks: list[TrackSegment] = []
+    vias: list[Via] = []
     footprints: list[Footprint] = []
 
     for node in _walk_lists(sexpr):
@@ -129,6 +143,10 @@ def _load_board_with_sexpr(path: str | Path) -> BoardData:
             segment = _parse_segment(node, nets)
             if segment is not None:
                 tracks.append(segment)
+        if kind == "via":
+            via = _parse_via(node, nets)
+            if via is not None:
+                vias.append(via)
 
     for node in _top_level_nodes(sexpr, "footprint"):
         footprint = _parse_footprint(node, nets)
@@ -139,7 +157,7 @@ def _load_board_with_sexpr(path: str | Path) -> BoardData:
         if footprint is not None:
             footprints.append(footprint)
 
-    return BoardData(path=board_path, nets=nets, tracks=tracks, footprints=footprints, backend="sexpr")
+    return BoardData(path=board_path, nets=nets, tracks=tracks, footprints=footprints, vias=vias, backend="sexpr")
 
 
 def _uses_legacy_layer_names(path: str | Path) -> bool:
@@ -374,6 +392,41 @@ def _pcbnew_tracks(board: Any, pcbnew: Any, nets: dict[int, str]) -> list[TrackS
     return tracks
 
 
+def _pcbnew_vias(board: Any, pcbnew: Any, nets: dict[int, str]) -> list[Via]:
+    vias: list[Via] = []
+    for item in board.GetTracks():
+        if not _pcbnew_is_via(item, pcbnew):
+            continue
+        net_id = int(_call_or_default(item, "GetNetCode", 0))
+        diameter = _pcbnew_via_diameter(board, item)
+        vias.append(
+            Via(
+                center=_pcbnew_point_to_mm(item.GetPosition(), pcbnew),
+                diameter=_pcbnew_to_mm(diameter, pcbnew),
+                net_id=net_id,
+                net_name=_call_or_default(item, "GetNetname", nets.get(net_id, f"Net {net_id}")),
+            )
+        )
+    return vias
+
+
+def _pcbnew_via_diameter(board: Any, via: Any) -> int | float:
+    layer_id = _call_or_default(via, "TopLayer", None)
+    if layer_id is None:
+        layer_id = _call_or_default(via, "GetLayer", None)
+    if layer_id is None:
+        layer_id = _call_or_default(board, "GetLayerID", 0, "F.Cu")
+
+    if hasattr(via, "GetWidth"):
+        try:
+            return via.GetWidth(layer_id)
+        except TypeError:
+            return via.GetWidth()
+    if hasattr(via, "GetDiameter"):
+        return via.GetDiameter()
+    return 0
+
+
 def _pcbnew_footprints(board: Any, pcbnew: Any, nets: dict[int, str]) -> list[Footprint]:
     footprints: list[Footprint] = []
     for footprint in _pcbnew_board_footprints(board):
@@ -538,6 +591,22 @@ def _parse_segment(node: list[Any], nets: dict[int, str]) -> TrackSegment | None
     )
 
 
+def _parse_via(node: list[Any], nets: dict[int, str]) -> Via | None:
+    center = _pair(_child(node, "at"))
+    diameter = _number(_child_value(node, "size"), default=0.6)
+    net_id = _to_int(_child_value(node, "net"))
+
+    if center is None or net_id is None:
+        return None
+
+    return Via(
+        center=center,
+        diameter=diameter,
+        net_id=net_id,
+        net_name=nets.get(net_id, f"Net {net_id}"),
+    )
+
+
 def _parse_footprint(node: list[Any], nets: dict[int, str]) -> Footprint | None:
     if len(node) < 2:
         return None
@@ -610,7 +679,9 @@ def _transform_point(
     offset: tuple[float, float],
     angle_degrees: float,
 ) -> tuple[float, float]:
-    angle = radians(angle_degrees)
+    # KiCad board coordinates use a downward-positive Y axis, so module
+    # rotation appears clockwise compared with the usual mathematical plane.
+    angle = radians(-angle_degrees)
     x, y = point
     return (
         offset[0] + x * cos(angle) - y * sin(angle),

@@ -18,7 +18,11 @@ if (-not $KiCadBin) {
             continue
         }
 
-        $VersionDirs = Get-ChildItem $Root -Directory | Sort-Object Name -Descending
+        try {
+            $VersionDirs = Get-ChildItem $Root -Directory -ErrorAction Stop | Sort-Object Name -Descending
+        } catch {
+            continue
+        }
         foreach ($VersionDir in $VersionDirs) {
             $CandidateBin = Join-Path $VersionDir.FullName "bin"
             $CandidatePython = Join-Path $CandidateBin "python.exe"
@@ -38,7 +42,7 @@ $KiCadPython = Join-Path $KiCadBin "python.exe"
 if (-not (Test-Path $KiCadPython)) {
     Write-Host "KiCad Python was not found."
     Write-Host "Set KICAD_BIN to your KiCad bin folder and run this script again."
-    Write-Host 'Example: $env:KICAD_BIN="C:\Path\To\KiCad\9.0\bin"'
+    Write-Host 'Example: $env:KICAD_BIN="<KiCad bin folder>"'
     exit 1
 }
 
@@ -52,4 +56,33 @@ if ($LASTEXITCODE -ne 0) {
     Write-Host "`"$KiCadPython`" -m pip install -r requirements.txt"
     exit 1
 }
+
+$RouterCore = Get-ChildItem -Path "build" -Recurse -Filter "router_core*.pyd" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+$CoreSources = Get-ChildItem -Path "cpp_core", "CMakeLists.txt" -Recurse -File -ErrorAction SilentlyContinue
+$NeedsBuild = -not $RouterCore
+if (-not $NeedsBuild -and $CoreSources) {
+    $NewestSource = $CoreSources | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    $NeedsBuild = $NewestSource.LastWriteTime -gt $RouterCore.LastWriteTime
+}
+
+if ($NeedsBuild) {
+    if ($RouterCore) {
+        Write-Host "router_core is older than C++ sources. Rebuilding it now..."
+    } else {
+        Write-Host "router_core is not built yet. Building it now..."
+    }
+    powershell -ExecutionPolicy Bypass -File .\build_router_core.ps1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "router_core build failed."
+        exit $LASTEXITCODE
+    }
+    $RouterCore = Get-ChildItem -Path "build" -Recurse -Filter "router_core*.pyd" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+}
+
+if (-not $RouterCore) {
+    Write-Host "router_core build did not produce a .pyd file."
+    Write-Host "Check the build output above, then rerun this script."
+    exit 1
+}
+
 & $KiCadPython -m router_app.main @args

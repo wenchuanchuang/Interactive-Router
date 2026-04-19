@@ -11,15 +11,18 @@ from PyQt5.QtWidgets import (
     QFormLayout,
     QFrame,
     QLabel,
+    QListWidget,
     QMainWindow,
     QMessageBox,
+    QPushButton,
     QSplitter,
     QToolBar,
     QVBoxLayout,
 )
 
 from router_app.kicad_parser import BoardData, TrackSegment, load_board
-from router_app.gui.pcb_canvas import PcbCanvas
+from router_app.reroute_engine import run_dijkstra_reroute_test
+from router_app.gui.pcb_canvas import PcbCanvas, RoutePreviewCanvas
 
 
 class MainWindow(QMainWindow):
@@ -42,13 +45,16 @@ class MainWindow(QMainWindow):
         left_column = QSplitter(Qt.Vertical)
         self.canvas = PcbCanvas()
         self.canvas.traceSelected.connect(self._show_trace)
+        self.canvas.netSelectionChanged.connect(self._show_selected_nets)
+        self.canvas.netSelectionChanged.connect(self._update_ripup_buttons)
+        self.canvas.ripupStateChanged.connect(self._update_ripup_buttons)
+        self.canvas.rippedNetsChanged.connect(self._show_ripped_nets)
         left_column.addWidget(self.canvas)
 
-        lower_placeholder = QLabel("Routing workspace")
-        lower_placeholder.setAlignment(Qt.AlignCenter)
-        lower_placeholder.setMinimumHeight(220)
-        lower_placeholder.setStyleSheet("color: #8d96a5; background: #101318;")
-        left_column.addWidget(lower_placeholder)
+        self.route_preview = RoutePreviewCanvas()
+        self.route_preview.setMinimumHeight(220)
+        self.route_preview.show_message("Reroute preview")
+        left_column.addWidget(self.route_preview)
         left_column.setStretchFactor(0, 3)
         left_column.setStretchFactor(1, 2)
 
@@ -92,6 +98,21 @@ class MainWindow(QMainWindow):
         self.two_pin_check.toggled.connect(self.canvas.set_emphasize_two_pin_nets)
         toolbar.addWidget(self.two_pin_check)
 
+        self.rip_up_button = QPushButton("Rip up")
+        self.rip_up_button.setEnabled(False)
+        self.rip_up_button.clicked.connect(self._rip_up_selected)
+        toolbar.addWidget(self.rip_up_button)
+
+        self.undo_rip_up_button = QPushButton("Undo")
+        self.undo_rip_up_button.setEnabled(False)
+        self.undo_rip_up_button.clicked.connect(self._undo_rip_up)
+        toolbar.addWidget(self.undo_rip_up_button)
+
+        self.reroute_button = QPushButton("Reroute")
+        self.reroute_button.setEnabled(False)
+        self.reroute_button.clicked.connect(self._reroute_selected_removed_nets)
+        toolbar.addWidget(self.reroute_button)
+
         self.addToolBar(toolbar)
 
     def _choose_board(self) -> None:
@@ -115,16 +136,61 @@ class MainWindow(QMainWindow):
         self.canvas.load_board(board)
         self._set_layers(board.copper_layers)
         self.trace_panel.show_board(board)
+        self._update_ripup_buttons()
         pad_count = sum(len(footprint.pads) for footprint in board.footprints)
         self.statusBar().showMessage(
             f"Loaded {board.path.name} via {board.backend}: {len(board.tracks)} traces, "
-            f"{len(board.footprints)} components, {pad_count} pads, "
+            f"{len(board.vias)} vias, {len(board.footprints)} components, {pad_count} pads, "
             f"{len(board.two_pin_net_ids)} two-pin nets"
         )
 
     def _show_trace(self, track: TrackSegment) -> None:
         if self._board is not None:
             self.trace_panel.show_trace(self._board, track)
+
+    def _show_selected_nets(self, selected_net_ids: set[int]) -> None:
+        if self._board is not None:
+            self.trace_panel.show_selection(self._board, selected_net_ids)
+
+    def _rip_up_selected(self) -> None:
+        if self.canvas.rip_up_selected() and self._board is not None:
+            self.trace_panel.show_selection(self._board, set())
+            self.trace_panel.show_ripped_nets(self._board, self.canvas.ripped_net_ids)
+            self._show_status_counts("Rip-up applied")
+
+    def _undo_rip_up(self) -> None:
+        if self.canvas.undo_rip_up():
+            if self._board is not None:
+                self.trace_panel.show_ripped_nets(self._board, self.canvas.ripped_net_ids)
+            self._show_status_counts("Rip-up undone")
+
+    def _update_ripup_buttons(self, *_args) -> None:
+        self.rip_up_button.setEnabled(bool(self.canvas.selected_net_ids))
+        self.undo_rip_up_button.setEnabled(self.canvas.can_undo_rip_up)
+        self.reroute_button.setEnabled(bool(self.canvas.ripped_net_ids))
+
+    def _show_ripped_nets(self, ripped_net_ids: set[int]) -> None:
+        if self._board is not None:
+            self.trace_panel.show_ripped_nets(self._board, ripped_net_ids)
+        self._update_ripup_buttons()
+
+    def _reroute_selected_removed_nets(self) -> None:
+        if self._board is None:
+            return
+        outcome = run_dijkstra_reroute_test(self._board, self.canvas.ripped_net_ids)
+        self.statusBar().showMessage(outcome.message)
+        if outcome.ok and outcome.result is not None:
+            self.route_preview.show_route(outcome.result, self._board, self.canvas.ripped_net_ids)
+        else:
+            self.route_preview.show_message(outcome.message)
+
+    def _show_status_counts(self, prefix: str) -> None:
+        if self._board is None:
+            return
+        self.statusBar().showMessage(
+            f"{prefix}: {len(self.canvas.selected_net_ids)} selected nets, "
+            f"{len(self._board.tracks)} original traces"
+        )
 
     def _set_layers(self, layers: list[str]) -> None:
         self.layer_combo.blockSignals(True)
@@ -158,8 +224,24 @@ class TracePanel(QFrame):
         self.layer_label = QLabel("-")
         self.segment_count_label = QLabel("-")
         self.width_label = QLabel("-")
+        self.selected_list = QListWidget()
+        self.selected_list.setMinimumHeight(120)
+        self.selected_list.setMaximumHeight(180)
+        self.selected_list.setStyleSheet(
+            "QListWidget { background: #ffffff; border: 1px solid #c8ced8; }"
+            "QListWidget::item { padding: 3px 4px; }"
+        )
+        self.ripped_list = QListWidget()
+        self.ripped_list.setMinimumHeight(120)
+        self.ripped_list.setMaximumHeight(180)
+        self.ripped_list.setStyleSheet(
+            "QListWidget { background: #fff8f0; border: 1px solid #d7b99a; }"
+            "QListWidget::item { padding: 3px 4px; }"
+        )
 
         form.addRow("File", self.file_label)
+        form.addRow("Selected nets", self.selected_list)
+        form.addRow("Ripped-up nets", self.ripped_list)
         form.addRow("Net ID", self.net_id_label)
         form.addRow("Net name", self.net_name_label)
         form.addRow("Clicked layer", self.layer_label)
@@ -175,6 +257,10 @@ class TracePanel(QFrame):
         self.layer_label.setText("-")
         self.segment_count_label.setText(str(len(board.tracks)))
         self.width_label.setText("-")
+        self.selected_list.clear()
+        self.ripped_list.clear()
+        self.selected_list.addItem("No nets selected")
+        self.ripped_list.addItem("No nets ripped up")
 
     def show_trace(self, board: BoardData, track: TrackSegment) -> None:
         count = sum(1 for candidate in board.tracks if candidate.net_id == track.net_id)
@@ -183,3 +269,21 @@ class TracePanel(QFrame):
         self.layer_label.setText(track.layer)
         self.segment_count_label.setText(str(count))
         self.width_label.setText(f"{track.width:g} mm")
+
+    def show_selection(self, board: BoardData, selected_net_ids: set[int]) -> None:
+        self.selected_list.clear()
+        if not selected_net_ids:
+            self.selected_list.addItem("No nets selected")
+            return
+
+        for net_id in sorted(selected_net_ids):
+            self.selected_list.addItem(f"{net_id}: {board.nets.get(net_id, f'Net {net_id}')}")
+
+    def show_ripped_nets(self, board: BoardData, ripped_net_ids: set[int]) -> None:
+        self.ripped_list.clear()
+        if not ripped_net_ids:
+            self.ripped_list.addItem("No nets ripped up")
+            return
+
+        for net_id in sorted(ripped_net_ids):
+            self.ripped_list.addItem(f"{net_id}: {board.nets.get(net_id, f'Net {net_id}')}")
