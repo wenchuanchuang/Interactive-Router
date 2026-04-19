@@ -23,6 +23,15 @@ double widthForNet(const RouteRequest& request, int net_id) {
     return request.min_trace_width;
 }
 
+double clearanceForNet(const RouteRequest& request, int net_id) {
+    for (const auto& track : request.tracks) {
+        if (track.net_id == net_id && track.clearance > 0.0) {
+            return track.clearance;
+        }
+    }
+    return request.min_clearance;
+}
+
 bool layerMatchesPad(const PadGeometry& pad, const std::string& layer) {
     return std::find(pad.layers.begin(), pad.layers.end(), layer) != pad.layers.end()
         || std::find(pad.layers.begin(), pad.layers.end(), "*.Cu") != pad.layers.end();
@@ -123,7 +132,8 @@ Grid3D buildObstacleGridForNet(const RouteRequest& request, int net_id, double n
         if (track.net_id == net_id || containsNet(request.ripped_net_ids, track.net_id)) {
             continue;
         }
-        markTrack(grid, track, bloat);
+        double track_clearance = std::max(clearance, track.clearance);
+        markTrack(grid, track, net_width * 0.5 + track_clearance);
     }
 
     for (const auto& via : request.vias) {
@@ -204,7 +214,7 @@ RouteResult runDijkstraTest(const RouteRequest& request) {
 
     int net_id = request.ripped_net_ids.front();
     double net_width = widthForNet(request, net_id);
-    double clearance = request.min_clearance;
+    double clearance = clearanceForNet(request, net_id);
     Grid3D grid = buildObstacleGridForNet(request, net_id, net_width, clearance);
 
     result.net_id = net_id;

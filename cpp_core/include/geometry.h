@@ -25,6 +25,7 @@ struct TrackGeometry {
     Point2D start;
     Point2D end;
     double width = 0.0;
+    double clearance = 0.0;
     int net_id = 0;
     std::string layer;
 };

@@ -373,37 +373,49 @@ class RoutePreviewCanvas(QGraphicsView):
         board: BoardData | None = None,
         ripped_net_ids: set[int] | None = None,
     ) -> None:
+        self.show_routes([route_result], board, ripped_net_ids)
+
+    def show_routes(
+        self,
+        route_results,
+        board: BoardData | None = None,
+        ripped_net_ids: set[int] | None = None,
+    ) -> None:
         self._scene.clear()
-        points = list(route_result.path_mm)
-        if len(points) < 2:
+        route_results = [result for result in route_results if len(list(result.path_mm)) >= 2]
+        if not route_results:
             self.show_message("No route path")
             return
 
         ripped_net_ids = ripped_net_ids or set()
         scale = 22.0
-        min_x, min_y = _preview_origin(points, board)
+        all_points = [point for result in route_results for point in result.path_mm]
+        min_x, min_y = _preview_origin(all_points, board)
 
         if board is not None:
             self._draw_preview_board(board, ripped_net_ids, scale, min_x, min_y)
 
         halo_pen = QPen(QColor("#111318"), 9.0, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
-        for index, (start, end) in enumerate(zip(points, points[1:])):
-            x1, y1 = _preview_point(start, scale, min_x, min_y)
-            x2, y2 = _preview_point(end, scale, min_x, min_y)
-            self._scene.addLine(x1, y1, x2, y2, halo_pen).setZValue(40)
-            layer = _route_layer_for_segment(route_result, board, index)
-            route_pen = QPen(
-                _layer_highlight_color(layer),
-                5.0,
-                _layer_pen_style(layer),
-                Qt.RoundCap,
-                Qt.RoundJoin,
-            )
-            self._scene.addLine(x1, y1, x2, y2, route_pen).setZValue(_layer_z_value(layer) + 41)
-            if _route_changes_layer(route_result, index):
-                self._draw_route_layer_change_marker(x2, y2, layer)
+        for route_result in route_results:
+            points = list(route_result.path_mm)
+            for index, (start, end) in enumerate(zip(points, points[1:])):
+                x1, y1 = _preview_point(start, scale, min_x, min_y)
+                x2, y2 = _preview_point(end, scale, min_x, min_y)
+                self._scene.addLine(x1, y1, x2, y2, halo_pen).setZValue(40)
+                layer = _route_layer_for_segment(route_result, board, index)
+                route_pen = QPen(
+                    _layer_highlight_color(layer),
+                    5.0,
+                    _layer_pen_style(layer),
+                    Qt.RoundCap,
+                    Qt.RoundJoin,
+                )
+                self._scene.addLine(x1, y1, x2, y2, route_pen).setZValue(_layer_z_value(layer) + 41)
+                if _route_changes_layer(route_result, index):
+                    self._draw_route_layer_change_marker(x2, y2, layer)
 
-        label = QGraphicsTextItem(f"Net {route_result.net_id} | pitch {route_result.grid_pitch:g} mm")
+        net_ids = ", ".join(str(int(getattr(result, "net_id", 0))) for result in route_results)
+        label = QGraphicsTextItem(f"Nets {net_ids} | {len(route_results)} routes")
         label.setDefaultTextColor(QColor("#ffffff"))
         label.setPos(8, 8)
         label.setZValue(10)

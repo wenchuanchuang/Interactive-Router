@@ -57,6 +57,7 @@ class BoardData:
     vias: list[Via]
     backend: str = "sexpr"
     design_rules: dict[str, float] | None = None
+    net_clearances: dict[int, float] | None = None
 
     @property
     def copper_layers(self) -> list[str]:
@@ -117,6 +118,7 @@ def _load_board_with_pcbnew(path: str | Path) -> BoardData:
         vias=vias,
         backend="pcbnew-normalized" if load_path != board_path else "pcbnew",
         design_rules=_pcbnew_design_rules(board, pcbnew),
+        net_clearances=_pcbnew_net_clearances(board, pcbnew),
     )
 
 
@@ -479,6 +481,34 @@ def _pcbnew_design_rules(board: Any, pcbnew: Any) -> dict[str, float]:
         if isinstance(value, (int, float)):
             rules[key] = _pcbnew_to_mm(value, pcbnew)
     return rules
+
+
+def _pcbnew_net_clearances(board: Any, pcbnew: Any) -> dict[int, float]:
+    net_info = _call_or_default(board, "GetNetInfo", None)
+    all_classes = _call_or_default(board, "GetAllNetClasses", None)
+    if net_info is None or not isinstance(all_classes, dict):
+        return {}
+
+    class_clearances: dict[str, float] = {}
+    for name, net_class in all_classes.items():
+        clearance = _call_or_default(net_class, "GetClearance", None)
+        if isinstance(clearance, (int, float)):
+            class_clearances[str(name)] = _pcbnew_to_mm(clearance, pcbnew)
+
+    clearances: dict[int, float] = {}
+    net_count = _call_or_default(net_info, "GetNetCount", 0)
+    if not isinstance(net_count, int):
+        return clearances
+
+    for net_id in range(net_count + 1):
+        net_item = _call_or_default(net_info, "GetNetItem", None, net_id)
+        if net_item is None:
+            continue
+        class_name = _call_or_default(net_item, "GetNetClassName", "")
+        clearance = class_clearances.get(str(class_name))
+        if clearance is not None:
+            clearances[net_id] = clearance
+    return clearances
 
 
 def _pcbnew_board_footprints(board: Any) -> Iterable[Any]:

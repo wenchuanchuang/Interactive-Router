@@ -28,6 +28,7 @@ PYBIND11_MODULE(router_core, m) {
         .def_readwrite("start", &TrackGeometry::start)
         .def_readwrite("end", &TrackGeometry::end)
         .def_readwrite("width", &TrackGeometry::width)
+        .def_readwrite("clearance", &TrackGeometry::clearance)
         .def_readwrite("net_id", &TrackGeometry::net_id)
         .def_readwrite("layer", &TrackGeometry::layer);
 

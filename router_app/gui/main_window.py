@@ -179,8 +179,8 @@ class MainWindow(QMainWindow):
             return
         outcome = run_dijkstra_reroute_test(self._board, self.canvas.ripped_net_ids)
         self.statusBar().showMessage(outcome.message)
-        if outcome.ok and outcome.result is not None:
-            self.route_preview.show_route(outcome.result, self._board, self.canvas.ripped_net_ids)
+        if outcome.result:
+            self.route_preview.show_routes(outcome.result, self._board, self.canvas.ripped_net_ids)
         else:
             self.route_preview.show_message(outcome.message)
 

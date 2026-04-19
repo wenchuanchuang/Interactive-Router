@@ -28,9 +28,46 @@ def run_dijkstra_reroute_test(board: BoardData, ripped_net_ids: set[int]) -> Rer
             exc,
         )
 
+    results = []
+    failures: list[str] = []
+    all_ripped_net_ids = sorted(ripped_net_ids)
+    for net_id in all_ripped_net_ids:
+        ordered_ripped_net_ids = [net_id] + [other for other in all_ripped_net_ids if other != net_id]
+        result = _run_single_dijkstra_reroute_test(router_core, board, ordered_ripped_net_ids)
+        if result.found:
+            results.append(result)
+            continue
+
+        reason = getattr(result, "failure_reason", "") or "No path was found."
+        terminal_sizes = getattr(result, "terminal_group_sizes", [])
+        if terminal_sizes:
+            reason = f"{reason} terminal vertices per pad: {list(terminal_sizes)}"
+        reason = f"{reason} {_net_debug_summary(board, result.net_id)}"
+        failures.append(f"net {result.net_id}: {reason}")
+
+    if failures:
+        return RerouteOutcome(
+            False,
+            f"Rerouted {len(results)}/{len(all_ripped_net_ids)} nets. Failed: {' | '.join(failures)}",
+            results,
+        )
+
+    total_vertices = sum(len(result.path_mm) for result in results)
+    return RerouteOutcome(
+        True,
+        f"Rerouted {len(results)} nets: {total_vertices} total grid vertices.",
+        results,
+    )
+
+
+def _run_single_dijkstra_reroute_test(
+    router_core: Any,
+    board: BoardData,
+    ordered_ripped_net_ids: list[int],
+) -> Any:
     request = router_core.RouteRequest()
     request.layers = board.copper_layers or ["F.Cu"]
-    request.ripped_net_ids = sorted(ripped_net_ids)
+    request.ripped_net_ids = ordered_ripped_net_ids
     request.min_x, request.min_y, request.max_x, request.max_y = _board_bounds(board)
     request.min_trace_width = _min_trace_width(board)
     request.min_clearance = _min_clearance(board)
@@ -41,6 +78,7 @@ def run_dijkstra_reroute_test(board: BoardData, ripped_net_ids: set[int]) -> Rer
         item.start = router_core.Point2D(track.start[0], track.start[1])
         item.end = router_core.Point2D(track.end[0], track.end[1])
         item.width = track.width
+        item.clearance = _clearance_for_net(board, track.net_id)
         item.net_id = track.net_id
         item.layer = track.layer
         track_items.append(item)
@@ -68,24 +106,7 @@ def run_dijkstra_reroute_test(board: BoardData, ripped_net_ids: set[int]) -> Rer
         via_items.append(item)
     request.vias = via_items
 
-    result = router_core.run_dijkstra_test(request)
-    if not result.found:
-        reason = getattr(result, "failure_reason", "") or "No path was found."
-        terminal_sizes = getattr(result, "terminal_group_sizes", [])
-        if terminal_sizes:
-            reason = f"{reason} terminal vertices per pad: {list(terminal_sizes)}"
-        reason = f"{reason} {_net_debug_summary(board, result.net_id)}"
-        return RerouteOutcome(
-            False,
-            f"Dijkstra did not find a path for net {result.net_id}: {reason}",
-            result,
-        )
-
-    return RerouteOutcome(
-        True,
-        f"Rerouted net {result.net_id}: {len(result.path_mm)} grid vertices, pitch {result.grid_pitch:g} mm.",
-        result,
-    )
+    return router_core.run_dijkstra_test(request)
 
 
 def _import_router_core():
@@ -133,7 +154,6 @@ def _board_bounds(board: BoardData) -> tuple[float, float, float, float]:
         radius = via.diameter * 0.5
         xs.extend([via.center[0] - radius, via.center[0] + radius])
         ys.extend([via.center[1] - radius, via.center[1] + radius])
-
     if not xs or not ys:
         return (0.0, 0.0, 10.0, 10.0)
     return (min(xs), min(ys), max(xs), max(ys))
@@ -152,3 +172,9 @@ def _min_clearance(board: BoardData) -> float:
     if board.design_rules and board.design_rules.get("min_clearance"):
         return board.design_rules["min_clearance"]
     return 0.2
+
+
+def _clearance_for_net(board: BoardData, net_id: int) -> float:
+    if board.net_clearances and net_id in board.net_clearances:
+        return board.net_clearances[net_id]
+    return _min_clearance(board)
