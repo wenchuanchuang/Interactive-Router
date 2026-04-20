@@ -29,6 +29,7 @@ class Pad:
     layers: tuple[str, ...]
     net_id: int | None
     net_name: str
+    rotation_degrees: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -462,6 +463,7 @@ def _pcbnew_pad(board: Any, pcbnew: Any, pad: Any, nets: dict[int, str]) -> Pad 
         layers=layers,
         net_id=net_id,
         net_name=_call_or_default(pad, "GetNetname", nets.get(net_id, f"Net {net_id}")),
+        rotation_degrees=float(_call_or_default(pad, "GetOrientationDegrees", 0.0)),
     )
 
 
@@ -692,6 +694,7 @@ def _parse_pad(
         layers=layers,
         net_id=net_id,
         net_name=nets.get(net_id, f"Net {net_id}") if net_id is not None else "",
+        rotation_degrees=footprint_angle + pad_angle,
     )
 
 

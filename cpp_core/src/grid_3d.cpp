@@ -8,6 +8,8 @@
 namespace interactive_router {
 namespace {
 
+constexpr double kPi = 3.14159265358979323846;
+
 void fillCircle(Grid3D& grid, const Point2D& center, double radius, int layer_index, bool blocked) {
     if (layer_index < 0 || layer_index >= grid.nz()) {
         return;
@@ -42,6 +44,89 @@ void fillRect(Grid3D& grid, const Point2D& center, double half_x, double half_y,
             grid.setBlocked({x, y, layer_index}, blocked);
         }
     }
+}
+
+void fillRotatedRect(
+    Grid3D& grid,
+    const Point2D& center,
+    double half_x,
+    double half_y,
+    double rotation_degrees,
+    int layer_index,
+    bool blocked
+) {
+    if (layer_index < 0 || layer_index >= grid.nz()) {
+        return;
+    }
+
+    double angle = rotation_degrees * kPi / 180.0;
+    double cos_a = std::cos(angle);
+    double sin_a = std::sin(angle);
+    double extent_x = std::abs(cos_a) * half_x + std::abs(sin_a) * half_y;
+    double extent_y = std::abs(sin_a) * half_x + std::abs(cos_a) * half_y;
+
+    int min_x = std::max(0, static_cast<int>(std::floor((center.x - extent_x - grid.origin_x()) / grid.pitch())));
+    int max_x = std::min(grid.nx() - 1, static_cast<int>(std::ceil((center.x + extent_x - grid.origin_x()) / grid.pitch())));
+    int min_y = std::max(0, static_cast<int>(std::floor((center.y - extent_y - grid.origin_y()) / grid.pitch())));
+    int max_y = std::min(grid.ny() - 1, static_cast<int>(std::ceil((center.y + extent_y - grid.origin_y()) / grid.pitch())));
+
+    for (int y = min_y; y <= max_y; ++y) {
+        for (int x = min_x; x <= max_x; ++x) {
+            Point2D physical = grid.gridToPhysical({x, y, layer_index});
+            double dx = physical.x - center.x;
+            double dy = physical.y - center.y;
+            double local_x = dx * cos_a + dy * sin_a;
+            double local_y = -dx * sin_a + dy * cos_a;
+            if (std::abs(local_x) <= half_x && std::abs(local_y) <= half_y) {
+                grid.setBlocked({x, y, layer_index}, blocked);
+            }
+        }
+    }
+}
+
+void fillRotatedEllipse(
+    Grid3D& grid,
+    const Point2D& center,
+    double radius_x,
+    double radius_y,
+    double rotation_degrees,
+    int layer_index,
+    bool blocked
+) {
+    if (layer_index < 0 || layer_index >= grid.nz() || radius_x <= 0.0 || radius_y <= 0.0) {
+        return;
+    }
+
+    double angle = rotation_degrees * kPi / 180.0;
+    double cos_a = std::cos(angle);
+    double sin_a = std::sin(angle);
+    double extent_x = std::abs(cos_a) * radius_x + std::abs(sin_a) * radius_y;
+    double extent_y = std::abs(sin_a) * radius_x + std::abs(cos_a) * radius_y;
+
+    int min_x = std::max(0, static_cast<int>(std::floor((center.x - extent_x - grid.origin_x()) / grid.pitch())));
+    int max_x = std::min(grid.nx() - 1, static_cast<int>(std::ceil((center.x + extent_x - grid.origin_x()) / grid.pitch())));
+    int min_y = std::max(0, static_cast<int>(std::floor((center.y - extent_y - grid.origin_y()) / grid.pitch())));
+    int max_y = std::min(grid.ny() - 1, static_cast<int>(std::ceil((center.y + extent_y - grid.origin_y()) / grid.pitch())));
+
+    for (int y = min_y; y <= max_y; ++y) {
+        for (int x = min_x; x <= max_x; ++x) {
+            Point2D physical = grid.gridToPhysical({x, y, layer_index});
+            double dx = physical.x - center.x;
+            double dy = physical.y - center.y;
+            double local_x = dx * cos_a + dy * sin_a;
+            double local_y = -dx * sin_a + dy * cos_a;
+            double norm_x = local_x / radius_x;
+            double norm_y = local_y / radius_y;
+            if (norm_x * norm_x + norm_y * norm_y <= 1.0) {
+                grid.setBlocked({x, y, layer_index}, blocked);
+            }
+        }
+    }
+}
+
+bool padOnLayer(const PadGeometry& pad, const std::string& layer) {
+    return std::find(pad.layers.begin(), pad.layers.end(), layer) != pad.layers.end()
+        || std::find(pad.layers.begin(), pad.layers.end(), "*.Cu") != pad.layers.end();
 }
 
 }  // namespace
@@ -167,12 +252,42 @@ void Grid3D::markSegment(const Point2D& start, const Point2D& end, double radius
     }
 }
 
+void Grid3D::markPad(const PadGeometry& pad, double bloat) {
+    for (int z = 0; z < nz_; ++z) {
+        if (!padOnLayer(pad, layers_[z])) {
+            continue;
+        }
+        if (pad.shape == "circle") {
+            markCircle(pad.center, std::max(pad.size_x, pad.size_y) * 0.5 + bloat, z);
+        } else if (pad.shape == "oval") {
+            fillRotatedEllipse(*this, pad.center, pad.size_x * 0.5 + bloat, pad.size_y * 0.5 + bloat, pad.rotation_degrees, z, true);
+        } else {
+            fillRotatedRect(*this, pad.center, pad.size_x * 0.5 + bloat, pad.size_y * 0.5 + bloat, pad.rotation_degrees, z, true);
+        }
+    }
+}
+
 void Grid3D::clearCircle(const Point2D& center, double radius, int layer_index) {
     fillCircle(*this, center, radius, layer_index, false);
 }
 
 void Grid3D::clearRect(const Point2D& center, double half_x, double half_y, int layer_index) {
     fillRect(*this, center, half_x, half_y, layer_index, false);
+}
+
+void Grid3D::clearPad(const PadGeometry& pad, double clearance) {
+    for (int z = 0; z < nz_; ++z) {
+        if (!padOnLayer(pad, layers_[z])) {
+            continue;
+        }
+        if (pad.shape == "circle") {
+            clearCircle(pad.center, std::max(pad.size_x, pad.size_y) * 0.5 + clearance, z);
+        } else if (pad.shape == "oval") {
+            fillRotatedEllipse(*this, pad.center, pad.size_x * 0.5 + clearance, pad.size_y * 0.5 + clearance, pad.rotation_degrees, z, false);
+        } else {
+            fillRotatedRect(*this, pad.center, pad.size_x * 0.5 + clearance, pad.size_y * 0.5 + clearance, pad.rotation_degrees, z, false);
+        }
+    }
 }
 
 std::vector<GridPoint> Grid3D::verticesInsidePad(const PadGeometry& pad, double bloat, int layer_index) const {
@@ -183,22 +298,33 @@ std::vector<GridPoint> Grid3D::verticesInsidePad(const PadGeometry& pad, double 
 
     double half_x = pad.size_x * 0.5 + bloat;
     double half_y = pad.size_y * 0.5 + bloat;
-    int min_x = std::max(0, static_cast<int>(std::floor((pad.center.x - half_x - origin_x_) / pitch_)));
-    int max_x = std::min(nx_ - 1, static_cast<int>(std::ceil((pad.center.x + half_x - origin_x_) / pitch_)));
-    int min_y = std::max(0, static_cast<int>(std::floor((pad.center.y - half_y - origin_y_) / pitch_)));
-    int max_y = std::min(ny_ - 1, static_cast<int>(std::ceil((pad.center.y + half_y - origin_y_) / pitch_)));
+    bool circular = pad.shape == "circle";
+    bool elliptical = circular || pad.shape == "oval";
+    double angle = circular ? 0.0 : pad.rotation_degrees * kPi / 180.0;
+    double cos_a = std::cos(angle);
+    double sin_a = std::sin(angle);
+    double extent_x = circular ? half_x : std::abs(cos_a) * half_x + std::abs(sin_a) * half_y;
+    double extent_y = circular ? half_y : std::abs(sin_a) * half_x + std::abs(cos_a) * half_y;
 
-    bool circular = pad.shape == "circle" || pad.shape == "oval";
+    int min_x = std::max(0, static_cast<int>(std::floor((pad.center.x - extent_x - origin_x_) / pitch_)));
+    int max_x = std::min(nx_ - 1, static_cast<int>(std::ceil((pad.center.x + extent_x - origin_x_) / pitch_)));
+    int min_y = std::max(0, static_cast<int>(std::floor((pad.center.y - extent_y - origin_y_) / pitch_)));
+    int max_y = std::min(ny_ - 1, static_cast<int>(std::ceil((pad.center.y + extent_y - origin_y_) / pitch_)));
+
     for (int y = min_y; y <= max_y; ++y) {
         for (int x = min_x; x <= max_x; ++x) {
             Point2D physical = gridToPhysical({x, y, layer_index});
             bool inside = false;
-            if (circular) {
-                double rx = half_x > 0.0 ? (physical.x - pad.center.x) / half_x : 0.0;
-                double ry = half_y > 0.0 ? (physical.y - pad.center.y) / half_y : 0.0;
+            double dx = physical.x - pad.center.x;
+            double dy = physical.y - pad.center.y;
+            double local_x = dx * cos_a + dy * sin_a;
+            double local_y = -dx * sin_a + dy * cos_a;
+            if (elliptical) {
+                double rx = half_x > 0.0 ? local_x / half_x : 0.0;
+                double ry = half_y > 0.0 ? local_y / half_y : 0.0;
                 inside = rx * rx + ry * ry <= 1.0;
             } else {
-                inside = std::abs(physical.x - pad.center.x) <= half_x && std::abs(physical.y - pad.center.y) <= half_y;
+                inside = std::abs(local_x) <= half_x && std::abs(local_y) <= half_y;
             }
             if (inside) {
                 vertices.push_back({x, y, layer_index});

@@ -34,6 +34,7 @@ struct PadGeometry {
     Point2D center;
     double size_x = 0.0;
     double size_y = 0.0;
+    double rotation_degrees = 0.0;
     std::string shape;
     int net_id = 0;
     std::vector<std::string> layers;
@@ -74,6 +75,8 @@ struct RouteResult {
     std::vector<GridPoint> goal_vertices;
     std::vector<GridPoint> path_grid;
     std::vector<Point2D> path_mm;
+    std::vector<std::vector<GridPoint>> candidate_paths_grid;
+    std::vector<std::vector<Point2D>> candidate_paths_mm;
 };
 
 }  // namespace interactive_router

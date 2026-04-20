@@ -52,10 +52,14 @@ def run_dijkstra_reroute_test(board: BoardData, ripped_net_ids: set[int]) -> Rer
             results,
         )
 
-    total_vertices = sum(len(result.path_mm) for result in results)
+    total_candidates = sum(len(getattr(result, "candidate_paths_mm", [])) or 1 for result in results)
+    total_vertices = sum(
+        sum(len(path) for path in getattr(result, "candidate_paths_mm", [])) or len(result.path_mm)
+        for result in results
+    )
     return RerouteOutcome(
         True,
-        f"Rerouted {len(results)} nets: {total_vertices} total grid vertices.",
+        f"Rerouted {len(results)} nets: {total_candidates} candidate paths, {total_vertices} total grid vertices.",
         results,
     )
 
@@ -91,6 +95,7 @@ def _run_single_dijkstra_reroute_test(
             item.center = router_core.Point2D(pad.center[0], pad.center[1])
             item.size_x = pad.size[0]
             item.size_y = pad.size[1]
+            item.rotation_degrees = pad.rotation_degrees
             item.shape = pad.shape
             item.net_id = pad.net_id or 0
             item.layers = list(pad.layers)
@@ -114,6 +119,7 @@ def _import_router_core():
     for candidate in [
         root,
         root / "build",
+        root / "build-linux",
         root / "build" / "Release",
         root / "build" / "Debug",
     ]:

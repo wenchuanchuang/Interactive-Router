@@ -15,9 +15,12 @@ ENV/
 .ruff_cache/
 .coverage
 htmlcov/
+*.egg-info/
+.eggs/
 
 # Build outputs
 build/
+build-*/
 dist/
 out/
 cmake-build-*/
@@ -25,6 +28,11 @@ CMakeFiles/
 CMakeCache.txt
 cmake_install.cmake
 Makefile
+compile_commands.json
+build.ninja
+rules.ninja
+.ninja_deps
+.ninja_log
 *.sln
 *.vcxproj
 *.vcxproj.filters
@@ -68,6 +76,9 @@ drill/
 *.net
 
 # Local app/log/temp files
+tmp.cpp
+.env
+.env.*
 *.log
 *.tmp
 *.bak

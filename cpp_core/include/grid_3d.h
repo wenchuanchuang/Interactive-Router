@@ -45,8 +45,10 @@ public:
     void markCircle(const Point2D& center, double radius, int layer_index);
     void markRect(const Point2D& center, double half_x, double half_y, int layer_index);
     void markSegment(const Point2D& start, const Point2D& end, double radius, int layer_index);
+    void markPad(const PadGeometry& pad, double bloat);
     void clearCircle(const Point2D& center, double radius, int layer_index);
     void clearRect(const Point2D& center, double half_x, double half_y, int layer_index);
+    void clearPad(const PadGeometry& pad, double clearance);
 
     std::vector<GridPoint> verticesInsidePad(const PadGeometry& pad, double bloat, int layer_index) const;
 

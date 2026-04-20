@@ -37,6 +37,7 @@ PYBIND11_MODULE(router_core, m) {
         .def_readwrite("center", &PadGeometry::center)
         .def_readwrite("size_x", &PadGeometry::size_x)
         .def_readwrite("size_y", &PadGeometry::size_y)
+        .def_readwrite("rotation_degrees", &PadGeometry::rotation_degrees)
         .def_readwrite("shape", &PadGeometry::shape)
         .def_readwrite("net_id", &PadGeometry::net_id)
         .def_readwrite("layers", &PadGeometry::layers);
@@ -76,7 +77,9 @@ PYBIND11_MODULE(router_core, m) {
         .def_readonly("start_vertices", &RouteResult::start_vertices)
         .def_readonly("goal_vertices", &RouteResult::goal_vertices)
         .def_readonly("path_grid", &RouteResult::path_grid)
-        .def_readonly("path_mm", &RouteResult::path_mm);
+        .def_readonly("path_mm", &RouteResult::path_mm)
+        .def_readonly("candidate_paths_grid", &RouteResult::candidate_paths_grid)
+        .def_readonly("candidate_paths_mm", &RouteResult::candidate_paths_mm);
 
     m.def("run_dijkstra_test", &runDijkstraTest, py::arg("request"));
 }

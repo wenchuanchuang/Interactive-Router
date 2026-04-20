@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from math import cos, sin
 from typing import Callable
 
 from PyQt5.QtCore import QRectF, Qt, pyqtSignal
@@ -292,7 +293,7 @@ class PcbCanvas(QGraphicsView):
         for pad in footprint.pads:
             item = self._pad_item(pad)
             footprint_layers.update(pad.layers)
-            pad_rects.append(item.rect() if isinstance(item, QGraphicsRectItem) else item.rect())
+            pad_rects.append(item.mapToScene(item.boundingRect()).boundingRect())
             self._component_items.append((item, pad.layers))
             self._scene.addItem(item)
 
@@ -330,16 +331,13 @@ class PcbCanvas(QGraphicsView):
     def _pad_item(self, pad: Pad) -> QGraphicsItem:
         x, y = pad.center
         width, height = pad.size
-        rect = QRectF(
-            (x - width / 2) * self._scale,
-            (y - height / 2) * self._scale,
-            width * self._scale,
-            height * self._scale,
-        )
+        rect = QRectF(-width * self._scale / 2, -height * self._scale / 2, width * self._scale, height * self._scale)
         if pad.shape in {"circle", "oval"}:
             item = QGraphicsEllipseItem(rect)
         else:
             item = QGraphicsRectItem(rect)
+        item.setPos(x * self._scale, y * self._scale)
+        item.setRotation(pad.rotation_degrees)
         item.setPen(QPen(QColor("#f4f5f7"), 1.0))
         item.setBrush(QBrush(_pad_color(pad.layers)))
         item.setZValue(2)
@@ -382,30 +380,32 @@ class RoutePreviewCanvas(QGraphicsView):
         ripped_net_ids: set[int] | None = None,
     ) -> None:
         self._scene.clear()
-        route_results = [result for result in route_results if len(list(result.path_mm)) >= 2]
-        if not route_results:
+        route_paths = _preview_route_paths(route_results)
+        if not route_paths:
             self.show_message("No route path")
             return
 
         ripped_net_ids = ripped_net_ids or set()
         scale = 22.0
-        all_points = [point for result in route_results for point in result.path_mm]
+        all_points = [point for _, _, points in route_paths for point in points]
         min_x, min_y = _preview_origin(all_points, board)
 
         if board is not None:
             self._draw_preview_board(board, ripped_net_ids, scale, min_x, min_y)
 
         halo_pen = QPen(QColor("#111318"), 9.0, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
-        for route_result in route_results:
-            points = list(route_result.path_mm)
+        for route_result, candidate_index, points in route_paths:
+            candidate_alpha = 255 if candidate_index == 0 else 120
             for index, (start, end) in enumerate(zip(points, points[1:])):
                 x1, y1 = _preview_point(start, scale, min_x, min_y)
                 x2, y2 = _preview_point(end, scale, min_x, min_y)
                 self._scene.addLine(x1, y1, x2, y2, halo_pen).setZValue(40)
                 layer = _route_layer_for_segment(route_result, board, index)
+                route_color = _layer_highlight_color(layer)
+                route_color.setAlpha(candidate_alpha)
                 route_pen = QPen(
-                    _layer_highlight_color(layer),
-                    5.0,
+                    route_color,
+                    5.0 if candidate_index == 0 else 3.0,
                     _layer_pen_style(layer),
                     Qt.RoundCap,
                     Qt.RoundJoin,
@@ -415,7 +415,7 @@ class RoutePreviewCanvas(QGraphicsView):
                     self._draw_route_layer_change_marker(x2, y2, layer)
 
         net_ids = ", ".join(str(int(getattr(result, "net_id", 0))) for result in route_results)
-        label = QGraphicsTextItem(f"Nets {net_ids} | {len(route_results)} routes")
+        label = QGraphicsTextItem(f"Nets {net_ids} | {len(route_paths)} candidates")
         label.setDefaultTextColor(QColor("#ffffff"))
         label.setPos(8, 8)
         label.setZValue(10)
@@ -463,13 +463,12 @@ class RoutePreviewCanvas(QGraphicsView):
             for pad in footprint.pads:
                 x, y = pad.center
                 width, height = pad.size
-                rect = QRectF(
-                    (x - width / 2 - min_x) * scale,
-                    (y - height / 2 - min_y) * scale,
-                    max(width * scale, 2.0),
-                    max(height * scale, 2.0),
-                )
+                scaled_width = max(width * scale, 2.0)
+                scaled_height = max(height * scale, 2.0)
+                rect = QRectF(-scaled_width / 2, -scaled_height / 2, scaled_width, scaled_height)
                 item = QGraphicsEllipseItem(rect) if pad.shape in {"circle", "oval"} else QGraphicsRectItem(rect)
+                item.setPos((x - min_x) * scale, (y - min_y) * scale)
+                item.setRotation(pad.rotation_degrees)
                 pad_color = _pad_color(pad.layers)
                 pad_color.setAlpha(65)
                 item.setBrush(QBrush(pad_color))
@@ -589,10 +588,9 @@ def _preview_origin(points: list[object], board: BoardData | None) -> tuple[floa
             ys.extend([track.start[1], track.end[1]])
         for footprint in board.footprints:
             for pad in footprint.pads:
-                half_x = pad.size[0] * 0.5
-                half_y = pad.size[1] * 0.5
-                xs.extend([pad.center[0] - half_x, pad.center[0] + half_x])
-                ys.extend([pad.center[1] - half_y, pad.center[1] + half_y])
+                min_x, min_y, max_x, max_y = _rotated_pad_bounds(pad)
+                xs.extend([min_x, max_x])
+                ys.extend([min_y, max_y])
         for via in board.vias:
             radius = via.diameter * 0.5
             xs.extend([via.center[0] - radius, via.center[0] + radius])
@@ -602,6 +600,34 @@ def _preview_origin(points: list[object], board: BoardData | None) -> tuple[floa
 
 def _preview_point(point: object, scale: float, min_x: float, min_y: float) -> tuple[float, float]:
     return (_point_x(point) - min_x) * scale, (_point_y(point) - min_y) * scale
+
+
+def _rotated_pad_bounds(pad: Pad) -> tuple[float, float, float, float]:
+    x, y = pad.center
+    half_x = pad.size[0] * 0.5
+    half_y = pad.size[1] * 0.5
+    angle = pad.rotation_degrees * 3.141592653589793 / 180.0
+    cos_a = abs(cos(angle))
+    sin_a = abs(sin(angle))
+    extent_x = cos_a * half_x + sin_a * half_y
+    extent_y = sin_a * half_x + cos_a * half_y
+    return (x - extent_x, y - extent_y, x + extent_x, y + extent_y)
+
+
+def _preview_route_paths(route_results) -> list[tuple[object, int, list[object]]]:
+    route_paths: list[tuple[object, int, list[object]]] = []
+    for route_result in route_results:
+        candidate_paths = list(getattr(route_result, "candidate_paths_mm", []))
+        if candidate_paths:
+            for index, path in enumerate(candidate_paths):
+                points = list(path)
+                if len(points) >= 2:
+                    route_paths.append((route_result, index, points))
+        else:
+            points = list(getattr(route_result, "path_mm", []))
+            if len(points) >= 2:
+                route_paths.append((route_result, 0, points))
+    return route_paths
 
 
 def _route_layer_for_segment(route_result: object, board: BoardData | None, index: int) -> str:
