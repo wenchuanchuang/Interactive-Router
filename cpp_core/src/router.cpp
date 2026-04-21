@@ -43,6 +43,76 @@ bool layerMatchesPad(const PadGeometry& pad, const std::string& layer) {
         || std::find(pad.layers.begin(), pad.layers.end(), "*.Cu") != pad.layers.end();
 }
 
+//某個實體座標 point，有沒有落在 pad 幾何範圍裡
+bool pointInsidePad(const PadGeometry& pad, const Point2D& point, double bloat = 0.0) {
+    constexpr double kPi = 3.14159265358979323846;
+    double dx = point.x - pad.center.x;
+    double dy = point.y - pad.center.y;
+
+    if (pad.shape == "circle") {
+        double radius = std::max(pad.size_x, pad.size_y) * 0.5 + bloat;
+        return dx * dx + dy * dy <= radius * radius;
+    }
+
+    double angle = pad.rotation_degrees * kPi / 180.0;
+    double cos_a = std::cos(angle);
+    double sin_a = std::sin(angle);
+    double local_x = dx * cos_a + dy * sin_a;
+    double local_y = -dx * sin_a + dy * cos_a;
+
+    if (pad.shape == "oval") {
+        double radius_x = pad.size_x * 0.5 + bloat;
+        double radius_y = pad.size_y * 0.5 + bloat;
+        if (radius_x <= 0.0 || radius_y <= 0.0) {
+            return false;
+        }
+        double norm_x = local_x / radius_x;
+        double norm_y = local_y / radius_y;
+        return norm_x * norm_x + norm_y * norm_y <= 1.0;
+    }
+
+    return std::abs(local_x) <= pad.size_x * 0.5 + bloat
+        && std::abs(local_y) <= pad.size_y * 0.5 + bloat;
+}
+
+//如果這顆起點 pad 有多層 center 可以當起點，那應該選哪一層當 start center
+// 如果起點 pad 有多層 center
+// 只取 一個 center_vertex當起點
+// 優先選「原本這個 net 的 track endpoint 落在 pad 裡的那一層」
+// 如果原本繞線不存在或判斷不出來，就退回 最上層可用 layer 的 center
+int preferredPadStartLayer(
+    const RouteRequest& request,
+    const PadGeometry& pad,
+    int net_id,
+    const Grid3D& grid
+) {
+    for (const auto& track : request.tracks) {
+        if (track.net_id != net_id) {
+            continue;
+        }
+        //檢查這條 track 的 layer 是不是 pad 支援的 layer
+        if (!layerMatchesPad(pad, track.layer)) {
+            continue;
+        }
+        //檢查這條 track 的 start/end 有沒有落在 pad 裡
+        if (pointInsidePad(pad, track.start) || pointInsidePad(pad, track.end)) {
+            // 原本這顆 pad 的連線是在這個 layer 上接入/接出的
+            int z = grid.layerIndex(track.layer);
+            if (z >= 0) {
+                return z;
+            }
+        }
+    }
+
+    //如果整個 net 都找不到 track endpoint 落在 pad 裡, 取 pad 的最上層可用 layer
+    for (int z = 0; z < grid.nz(); ++z) {
+        if (layerMatchesPad(pad, grid.layers()[z])) {
+            return z;
+        }
+    }
+    return -1;
+}
+
 std::vector<GridPoint> freeVertices(std::vector<GridPoint> vertices, const Grid3D& grid) {
     vertices.erase(
         std::remove_if(
@@ -1134,17 +1204,23 @@ RouteResult runDijkstraTest(const RouteRequest& request) {
     };
     std::vector<PadTerminals> pad_terminal_groups;
     for (const auto& pad : request.pads) {
+        //只處理這條 net 的 pad
         if (pad.net_id != net_id) {
             continue;
         }
         PadTerminals terminals;
+        //先決定這顆 pad 的 center 要取哪一層
+        int preferred_z = preferredPadStartLayer(request, pad, net_id, grid);
         for (int z = 0; z < grid.nz(); ++z) {
             if (!layerMatchesPad(pad, grid.layers()[z])) {
                 continue;
             }
-            auto center = grid.physicalToGrid(pad.center, z);
-            if (grid.inBounds(center)) {
-                terminals.center_vertices.push_back(center);
+            //如果這一層是 preferred_z，就把 pad center 放進 start 用的 center_vertices
+            if (z == preferred_z) {
+                auto center = grid.physicalToGrid(pad.center, z);
+                if (grid.inBounds(center)) {
+                    terminals.center_vertices.push_back(center);
+                }
             }
             auto vertices = grid.verticesInsidePad(pad, std::max(grid.pitch() * 0.25, net_width * 0.25), z);
             for (const auto& vertex : vertices) {
@@ -1195,8 +1271,8 @@ RouteResult runDijkstraTest(const RouteRequest& request) {
         return routeLength(a) < routeLength(b);
     });
     candidate_paths.erase(std::unique(candidate_paths.begin(), candidate_paths.end(), path_equal), candidate_paths.end());
-    if (candidate_paths.size() > 12) {
-        candidate_paths.resize(12);
+    if (candidate_paths.size() > 1000) {
+        candidate_paths.resize(1000);
     }
 
     if (candidate_paths.empty()) {
