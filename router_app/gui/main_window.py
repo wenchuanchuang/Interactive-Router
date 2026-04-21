@@ -16,12 +16,13 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSplitter,
+    QSpinBox,
     QToolBar,
     QVBoxLayout,
 )
 
 from router_app.kicad_parser import BoardData, TrackSegment, load_board
-from router_app.reroute_engine import run_dijkstra_reroute_test
+from router_app.reroute_engine import minimum_grid_steps_per_mm, run_dijkstra_reroute_test
 from router_app.gui.pcb_canvas import PcbCanvas, RoutePreviewCanvas
 
 
@@ -136,6 +137,7 @@ class MainWindow(QMainWindow):
         self.canvas.load_board(board)
         self._set_layers(board.copper_layers)
         self.trace_panel.show_board(board)
+        self.trace_panel.set_grid_density_minimum(minimum_grid_steps_per_mm(board))
         self._update_ripup_buttons()
         pad_count = sum(len(footprint.pads) for footprint in board.footprints)
         self.statusBar().showMessage(
@@ -177,7 +179,11 @@ class MainWindow(QMainWindow):
     def _reroute_selected_removed_nets(self) -> None:
         if self._board is None:
             return
-        outcome = run_dijkstra_reroute_test(self._board, self.canvas.ripped_net_ids)
+        outcome = run_dijkstra_reroute_test(
+            self._board,
+            self.canvas.ripped_net_ids,
+            self.trace_panel.grid_steps_per_mm,
+        )
         self.statusBar().showMessage(outcome.message)
         if outcome.result:
             self.route_preview.show_routes(outcome.result, self._board, self.canvas.ripped_net_ids)
@@ -224,6 +230,10 @@ class TracePanel(QFrame):
         self.layer_label = QLabel("-")
         self.segment_count_label = QLabel("-")
         self.width_label = QLabel("-")
+        self.grid_steps_spin = QSpinBox()
+        self.grid_steps_spin.setRange(1, 100)
+        self.grid_steps_spin.setValue(10)
+        self.grid_steps_spin.setSuffix(" grid/mm")
         self.selected_list = QListWidget()
         self.selected_list.setMinimumHeight(120)
         self.selected_list.setMaximumHeight(180)
@@ -247,8 +257,18 @@ class TracePanel(QFrame):
         form.addRow("Clicked layer", self.layer_label)
         form.addRow("Net trace count", self.segment_count_label)
         form.addRow("Clicked width", self.width_label)
+        form.addRow("Grid density", self.grid_steps_spin)
         layout.addLayout(form)
         layout.addStretch(1)
+
+    @property
+    def grid_steps_per_mm(self) -> float:
+        return float(self.grid_steps_spin.value())
+
+    def set_grid_density_minimum(self, minimum: int) -> None:
+        current = self.grid_steps_spin.value()
+        self.grid_steps_spin.setMinimum(max(1, minimum))
+        self.grid_steps_spin.setValue(max(current, self.grid_steps_spin.minimum()))
 
     def show_board(self, board: BoardData) -> None:
         self.file_label.setText(board.path.name)

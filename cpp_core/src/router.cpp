@@ -2,12 +2,15 @@
 
 #include <algorithm>
 #include <cmath>
+#include <deque>
 #include <functional>
+#include <future>
 #include <iostream>
 #include <limits>
 #include <numeric>
 #include <queue>
 #include <random>
+#include <tuple>
 #include <unordered_set>
 
 namespace interactive_router {
@@ -58,12 +61,20 @@ const int kNeighborDeltas[6][3] = {
 
 constexpr double kViaPenalty = 50.0;
 constexpr double kMinDiscount = 0.2;
+constexpr double kDefaultGridStepsPerMm = 10.0;
 constexpr int kBaseStepLimit = 1000;
+constexpr int kDijkstraStepBase = 15000;
 constexpr unsigned int kRandomSeed = 88;
 constexpr unsigned int kShuffleSeed = 777;
 
 const int kPlanarRayDirs[8][2] = {
     {1, 0}, {1, 1}, {0, 1}, {-1, 1}, {-1, 0}, {-1, -1}, {0, -1}, {1, -1},
+};
+
+const int kDijkstraDeltas[10][3] = {
+    {-1, 0, 0}, {1, 0, 0}, {0, -1, 0}, {0, 1, 0},
+    {0, 0, -1}, {0, 0, 1},
+    {-1, -1, 0}, {-1, 1, 0}, {1, -1, 0}, {1, 1, 0},
 };
 
 std::vector<GridPoint> neighbors(const Grid3D& grid, const GridPoint& point) {
@@ -174,6 +185,102 @@ bool isObstacleForPath(const Grid3D& grid, const GridPoint& point, const std::un
         return false;
     }
     return grid.isBlocked(point);
+}
+
+double gridSegmentLength(const GridPoint& a, const GridPoint& b) {
+    int dx = b.x - a.x;
+    int dy = b.y - a.y;
+    int dz = b.z - a.z;
+    return std::sqrt(static_cast<double>(dx * dx + dy * dy + dz * dz));
+}
+
+double dijkstraShortestDistanceToAnyGoal(
+    const Grid3D& grid,
+    const GridPoint& start,
+    const std::vector<GridPoint>& goal_vertices
+) {
+    if (!grid.inBounds(start) || goal_vertices.empty()) {
+        return -1.0;
+    }
+
+    std::unordered_set<std::size_t> goal_indices;
+    for (const auto& goal : goal_vertices) {
+        if (grid.inBounds(goal)) {
+            goal_indices.insert(grid.flatten(goal));
+        }
+    }
+    if (goal_indices.empty()) {
+        return -1.0;
+    }
+    if (isGoalPoint(grid, start, goal_indices)) {
+        return 0.0;
+    }
+
+    std::size_t grid_size = static_cast<std::size_t>(grid.nx()) * grid.ny() * grid.nz();
+    std::vector<double> dist(grid_size, std::numeric_limits<double>::infinity());
+    std::vector<GridPoint> prev(grid_size, {-1, -1, -1});
+    std::vector<std::uint8_t> visited(grid_size, 0);
+
+    using QueueItem = std::tuple<double, int, int, int>;
+    std::priority_queue<QueueItem, std::vector<QueueItem>, std::greater<>> queue;
+
+    std::size_t start_index = grid.flatten(start);
+    dist[start_index] = 0.0;
+    queue.push({0.0, start.x, start.y, start.z});
+
+    while (!queue.empty()) {
+        auto [current_dist, x, y, z] = queue.top();
+        queue.pop();
+
+        GridPoint current{x, y, z};
+        std::size_t current_index = grid.flatten(current);
+        if (visited[current_index]) {
+            continue;
+        }
+        visited[current_index] = 1;
+
+        if (isGoalPoint(grid, current, goal_indices)) {
+            return current_dist;
+        }
+
+        for (const auto& delta : kDijkstraDeltas) {
+            GridPoint next{x + delta[0], y + delta[1], z + delta[2]};
+            if (!grid.inBounds(next)) {
+                continue;
+            }
+            if (isObstacleForPath(grid, next, goal_indices)) {
+                continue;
+            }
+
+            GridPoint previous = prev[current_index];
+            if (previous.x >= 0 && previous.z == current.z && current.z == next.z) {
+                int dot_xy = (previous.x - current.x) * (next.x - current.x)
+                    + (previous.y - current.y) * (next.y - current.y);
+                if (dot_xy >= 0) {
+                    continue;
+                }
+            }
+
+            std::size_t next_index = grid.flatten(next);
+            double new_dist = current_dist + gridSegmentLength(current, next);
+            if (new_dist < dist[next_index]) {
+                dist[next_index] = new_dist;
+                prev[next_index] = current;
+                queue.push({new_dist, next.x, next.y, next.z});
+            }
+        }
+    }
+
+    return -1.0;
+}
+
+int directionIndexForDelta(int dx, int dy, int dz) {
+    for (int i = 0; i < 10; ++i) {
+        if (kDijkstraDeltas[i][0] == dx && kDijkstraDeltas[i][1] == dy && kDijkstraDeltas[i][2] == dz) {
+            return i;
+        }
+    }
+    return -1;
 }
 
 bool isViaClear(
@@ -291,6 +398,97 @@ bool isLineOfSightClear(
             }
         }
     }
+}
+
+int minimumSegmentCountToAnyGoal(
+    const Grid3D& grid,
+    const GridPoint& start,
+    const std::vector<GridPoint>& goal_vertices
+) {
+    if (!grid.inBounds(start) || goal_vertices.empty()) {
+        return -1;
+    }
+
+    std::unordered_set<std::size_t> goal_indices;
+    for (const auto& goal : goal_vertices) {
+        if (grid.inBounds(goal)) {
+            goal_indices.insert(grid.flatten(goal));
+        }
+    }
+    if (goal_indices.empty()) {
+        return -1;
+    }
+    if (isGoalPoint(grid, start, goal_indices)) {
+        return 0;
+    }
+
+    constexpr int kNoDirection = 10;
+    constexpr int kDirectionStates = 11;
+    constexpr int kInfSegments = std::numeric_limits<int>::max() / 4;
+
+    auto stateIndex = [&](const GridPoint& point, int dir_index) {
+        return grid.flatten(point) * kDirectionStates + static_cast<std::size_t>(dir_index);
+    };
+
+    std::size_t grid_size = static_cast<std::size_t>(grid.nx()) * grid.ny() * grid.nz();
+    std::vector<int> dist(grid_size * kDirectionStates, kInfSegments);
+    std::deque<std::pair<GridPoint, int>> queue;
+
+    std::size_t start_state = stateIndex(start, kNoDirection);
+    dist[start_state] = 0;
+    queue.push_front({start, kNoDirection});
+
+    while (!queue.empty()) {
+        auto [current, prev_dir_index] = queue.front();
+        queue.pop_front();
+        int current_segments = dist[stateIndex(current, prev_dir_index)];
+
+        if (isGoalPoint(grid, current, goal_indices)) {
+            return current_segments;
+        }
+
+        for (const auto& delta : kDijkstraDeltas) {
+            GridPoint next{current.x + delta[0], current.y + delta[1], current.z + delta[2]};
+            if (isObstacleForPath(grid, next, goal_indices)) {
+                continue;
+            }
+            if (delta[2] == 0) {
+                if (!isLineOfSightClear(grid, current.x, current.y, current.z, next.x, next.y, goal_indices)) {
+                    continue;
+                }
+            } else if (!isViaClear(grid, current.x, current.y, current.z, next.z, goal_indices)) {
+                continue;
+            }
+
+            int next_dir_index = directionIndexForDelta(delta[0], delta[1], delta[2]);
+            if (next_dir_index < 0) {
+                continue;
+            }
+
+            if (prev_dir_index != kNoDirection) {
+                const auto& prev_delta = kDijkstraDeltas[prev_dir_index];
+                if (!isAngleValid(prev_delta[0], prev_delta[1], prev_delta[2], delta[0], delta[1], delta[2])) {
+                    continue;
+                }
+            }
+
+            int turn_cost = (prev_dir_index == next_dir_index) ? 0 : 1;
+            int next_segments = current_segments + turn_cost;
+            std::size_t next_state = stateIndex(next, next_dir_index);
+            if (next_segments >= dist[next_state]) {
+                continue;
+            }
+
+            dist[next_state] = next_segments;
+            if (turn_cost == 0) {
+                queue.push_front({next, next_dir_index});
+            } else {
+                queue.push_back({next, next_dir_index});
+            }
+        }
+    }
+
+    return -1;
 }
 
 std::vector<GridPoint> castRays360(
@@ -647,26 +845,38 @@ std::vector<std::vector<GridPoint>> findAllExactSegmentPathsToAnyGoal(
 
     std::size_t branch_limit = std::min<std::size_t>(first_points.size(), 48);
     std::size_t local_max = std::max<std::size_t>(2, max_results / std::max<std::size_t>(1, branch_limit) + 2);
-    for (std::size_t i = 0; i < branch_limit && paths.size() < max_results; ++i) {
-        const auto& next = first_points[i];
+    std::vector<std::future<std::vector<std::vector<GridPoint>>>> futures;
+    futures.reserve(branch_limit);
+
+    for (std::size_t i = 0; i < branch_limit; ++i) {
+        GridPoint next = first_points[i];
         if (isGoalPoint(grid, next, goal_indices)) {
             continue;
         }
-        std::vector<std::vector<GridPoint>> local_paths;
-        dfsAllExactSegmentsToAnyGoal(
-            grid,
-            next,
-            goal_vertices,
-            goal_indices,
-            1,
-            target_segments,
-            {start, next},
-            local_paths,
-            local_max,
-            dynamic_step_limit,
-            uniform_heuristic,
-            kRandomSeed ^ static_cast<unsigned int>((i + 1) * 1234567U)
-        );
+
+        unsigned int child_seed = kRandomSeed ^ static_cast<unsigned int>((i + 1) * 1234567U);
+        futures.push_back(std::async(std::launch::async, [&, next, child_seed]() {
+            std::vector<std::vector<GridPoint>> local_paths;
+            dfsAllExactSegmentsToAnyGoal(
+                grid,
+                next,
+                goal_vertices,
+                goal_indices,
+                1,
+                target_segments,
+                {start, next},
+                local_paths,
+                local_max,
+                dynamic_step_limit,
+                uniform_heuristic,
+                child_seed
+            );
+            return local_paths;
+        }));
+    }
+
+    for (auto& future : futures) {
+        auto local_paths = future.get();
         for (auto& path : local_paths) {
             paths.push_back(std::move(path));
             if (paths.size() >= max_results) {
@@ -700,10 +910,32 @@ std::vector<std::vector<GridPoint>> generateCandidatePaths(
     for (const auto& goal : goals) {
         nearest = std::min(nearest, std::abs(goal.x - start.x) + std::abs(goal.y - start.y) + std::abs(goal.z - start.z));
     }
-    int dynamic_step_limit = kBaseStepLimit + (nearest == std::numeric_limits<int>::max() ? 0 : nearest * 60);
-    const int segment_counts[] = {1, 2, 3, 4, 6, 8, 10, 12};
-    for (int segments : segment_counts) {
-        std::cout << "  Searching for " << segments << "-segment paths..." << std::endl;
+    double real_dist = dijkstraShortestDistanceToAnyGoal(grid, start, goals);
+    int dynamic_step_limit = 0;
+    if (real_dist < 0.0) {
+        dynamic_step_limit = kBaseStepLimit + (nearest == std::numeric_limits<int>::max() ? 0 : nearest * 60);
+        std::cout << "  dynamic_step_limit use Manhattan " << std::endl;
+    } else {
+        dynamic_step_limit = kDijkstraStepBase + static_cast<int>(real_dist) * 60;
+        std::cout << "  dynamic_step_limit use dijkstraShortest " << std::endl;
+    }
+    std::cout << "  dynamic_step_limit " << dynamic_step_limit << std::endl;
+
+    int minimum_segments = minimumSegmentCountToAnyGoal(grid, start, goals);
+    if (minimum_segments < 0) {
+        std::cout << "  minimum_segment_presearch found no reachable grid path" << std::endl;
+        return {};
+    }
+
+    constexpr int kMaxCandidateSegments = 20;
+    std::cout << "  minimum_segment_presearch " << minimum_segments << " segments" << std::endl;
+    if (minimum_segments > kMaxCandidateSegments) {
+        std::cout << "  minimum segments exceed max candidate segments " << kMaxCandidateSegments << std::endl;
+        return {};
+    }
+
+    for (int segments = std::max(1, minimum_segments); segments <= kMaxCandidateSegments; ++segments) {
+        std::cout << "      Searching for " << segments << "-segment paths..." << std::endl;
 
         std::size_t quota = std::max<std::size_t>(2, max_results / 2);
         auto uniform = findAllExactSegmentPathsToAnyGoal(
@@ -731,8 +963,8 @@ std::vector<std::vector<GridPoint>> generateCandidatePaths(
         std::size_t paths_b_gre = backward_search ? greedy.size() : 0;
         std::size_t total_f = paths_f_uni + paths_f_gre;
         std::size_t total_b = paths_b_uni + paths_b_gre;
-        std::cout << "      Found " << (total_f + total_b) << " paths in total\n"
-                  << "      (forward-uniform:" << paths_f_uni << ", forward-greedy:" << paths_f_gre
+        std::cout << "          Found " << (total_f + total_b) << " paths in total\n"
+                  << "              (forward-uniform:" << paths_f_uni << ", forward-greedy:" << paths_f_gre
                   << " | backward-uniform:" << paths_b_uni << ", backward-greedy:" << paths_b_gre << ")" << std::endl;
 
         all_paths.insert(all_paths.end(), uniform.begin(), uniform.end());
@@ -781,7 +1013,8 @@ std::vector<std::vector<GridPoint>> generateCandidatePaths(
 }  // namespace
 
 Grid3D buildObstacleGridForNet(const RouteRequest& request, int net_id, double net_width, double clearance) {
-    double pitch = std::max(0.001, (request.min_trace_width + request.min_clearance) * 0.5);
+    double grid_steps_per_mm = request.grid_steps_per_mm > 0.0 ? request.grid_steps_per_mm : kDefaultGridStepsPerMm;
+    double pitch = 1.0 / grid_steps_per_mm;
     double bloat = net_width * 0.5 + clearance;
     double margin = std::max(2.0 * pitch, bloat + pitch);
 
@@ -935,7 +1168,7 @@ RouteResult runDijkstraTest(const RouteRequest& request) {
     result.goal_vertices = pad_terminal_groups[1].goal_vertices;
 
     std::vector<std::vector<GridPoint>> candidate_paths;
-    for (const auto& start : result.start_vertices) {
+    for (const auto& start : result.start_vertices) { // if center of start has multi layer
         auto paths = generateCandidatePaths(grid, start, result.goal_vertices, 12);
         candidate_paths.insert(candidate_paths.end(), paths.begin(), paths.end());
     }

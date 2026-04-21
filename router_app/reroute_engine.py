@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import ceil
 from pathlib import Path
 import sys
 from typing import Any
@@ -15,7 +16,18 @@ class RerouteOutcome:
     result: Any | None = None
 
 
-def run_dijkstra_reroute_test(board: BoardData, ripped_net_ids: set[int]) -> RerouteOutcome:
+def minimum_grid_steps_per_mm(board: BoardData) -> int:
+    previous_pitch = (_min_trace_width(board) + _min_clearance(board)) * 0.5
+    if previous_pitch <= 0:
+        return 1
+    return max(1, ceil(1.0 / previous_pitch))
+
+
+def run_dijkstra_reroute_test(
+    board: BoardData,
+    ripped_net_ids: set[int],
+    grid_steps_per_mm: float = 10.0,
+) -> RerouteOutcome:
     if not ripped_net_ids:
         return RerouteOutcome(False, "Rip up at least one net before rerouting.")
 
@@ -33,7 +45,7 @@ def run_dijkstra_reroute_test(board: BoardData, ripped_net_ids: set[int]) -> Rer
     all_ripped_net_ids = sorted(ripped_net_ids)
     for net_id in all_ripped_net_ids:
         ordered_ripped_net_ids = [net_id] + [other for other in all_ripped_net_ids if other != net_id]
-        result = _run_single_dijkstra_reroute_test(router_core, board, ordered_ripped_net_ids)
+        result = _run_single_dijkstra_reroute_test(router_core, board, ordered_ripped_net_ids, grid_steps_per_mm)
         if result.found:
             results.append(result)
             continue
@@ -68,6 +80,7 @@ def _run_single_dijkstra_reroute_test(
     router_core: Any,
     board: BoardData,
     ordered_ripped_net_ids: list[int],
+    grid_steps_per_mm: float = 10.0,
 ) -> Any:
     request = router_core.RouteRequest()
     request.layers = board.copper_layers or ["F.Cu"]
@@ -75,6 +88,7 @@ def _run_single_dijkstra_reroute_test(
     request.min_x, request.min_y, request.max_x, request.max_y = _board_bounds(board)
     request.min_trace_width = _min_trace_width(board)
     request.min_clearance = _min_clearance(board)
+    request.grid_steps_per_mm = grid_steps_per_mm
 
     track_items = []
     for track in board.tracks:
