@@ -1,4 +1,5 @@
 #include "router.h"
+#include "net_analysis.h"
 
 #include <algorithm>
 #include <cmath>
@@ -18,99 +19,6 @@ namespace {
 
 bool containsNet(const std::vector<int>& nets, int net_id) {
     return std::find(nets.begin(), nets.end(), net_id) != nets.end();
-}
-
-double widthForNet(const RouteRequest& request, int net_id) {
-    for (const auto& track : request.tracks) {
-        if (track.net_id == net_id && track.width > 0.0) {
-            return track.width;
-        }
-    }
-    return request.min_trace_width;
-}
-
-double clearanceForNet(const RouteRequest& request, int net_id) {
-    for (const auto& track : request.tracks) {
-        if (track.net_id == net_id && track.clearance > 0.0) {
-            return track.clearance;
-        }
-    }
-    return request.min_clearance;
-}
-
-bool layerMatchesPad(const PadGeometry& pad, const std::string& layer) {
-    return std::find(pad.layers.begin(), pad.layers.end(), layer) != pad.layers.end()
-        || std::find(pad.layers.begin(), pad.layers.end(), "*.Cu") != pad.layers.end();
-}
-
-//某個實體座標 point，有沒有落在 pad 幾何範圍裡
-bool pointInsidePad(const PadGeometry& pad, const Point2D& point, double bloat = 0.0) {
-    constexpr double kPi = 3.14159265358979323846;
-    double dx = point.x - pad.center.x;
-    double dy = point.y - pad.center.y;
-
-    if (pad.shape == "circle") {
-        double radius = std::max(pad.size_x, pad.size_y) * 0.5 + bloat;
-        return dx * dx + dy * dy <= radius * radius;
-    }
-
-    double angle = pad.rotation_degrees * kPi / 180.0;
-    double cos_a = std::cos(angle);
-    double sin_a = std::sin(angle);
-    double local_x = dx * cos_a + dy * sin_a;
-    double local_y = -dx * sin_a + dy * cos_a;
-
-    if (pad.shape == "oval") {
-        double radius_x = pad.size_x * 0.5 + bloat;
-        double radius_y = pad.size_y * 0.5 + bloat;
-        if (radius_x <= 0.0 || radius_y <= 0.0) {
-            return false;
-        }
-        double norm_x = local_x / radius_x;
-        double norm_y = local_y / radius_y;
-        return norm_x * norm_x + norm_y * norm_y <= 1.0;
-    }
-
-    return std::abs(local_x) <= pad.size_x * 0.5 + bloat
-        && std::abs(local_y) <= pad.size_y * 0.5 + bloat;
-}
-
-//如果這顆起點 pad 有多層 center 可以當起點，那應該選哪一層當 start center
-// 如果起點 pad 有多層 center
-// 只取 一個 center_vertex當起點
-// 優先選「原本這個 net 的 track endpoint 落在 pad 裡的那一層」
-// 如果原本繞線不存在或判斷不出來，就退回 最上層可用 layer 的 center
-int preferredPadStartLayer(
-    const RouteRequest& request,
-    const PadGeometry& pad,
-    int net_id,
-    const Grid3D& grid
-) {
-    for (const auto& track : request.tracks) {
-        if (track.net_id != net_id) {
-            continue;
-        }
-        //檢查這條 track 的 layer 是不是 pad 支援的 layer
-        if (!layerMatchesPad(pad, track.layer)) {
-            continue;
-        }
-        //檢查這條 track 的 start/end 有沒有落在 pad 裡
-        if (pointInsidePad(pad, track.start) || pointInsidePad(pad, track.end)) {
-            // 原本這顆 pad 的連線是在這個 layer 上接入/接出的
-            int z = grid.layerIndex(track.layer);
-            if (z >= 0) {
-                return z;
-            }
-        }
-    }
-
-    //如果整個 net 都找不到 track endpoint 落在 pad 裡, 取 pad 的最上層可用 layer
-    for (int z = 0; z < grid.nz(); ++z) {
-        if (layerMatchesPad(pad, grid.layers()[z])) {
-            return z;
-        }
-    }
-    return -1;
 }
 
 std::vector<GridPoint> freeVertices(std::vector<GridPoint> vertices, const Grid3D& grid) {
@@ -256,6 +164,15 @@ bool isObstacleForPath(const Grid3D& grid, const GridPoint& point, const std::un
     }
     return grid.isBlocked(point);
 }
+
+bool isValidFinalMove(const GridPoint& curr, const GridPoint& goal, int prev_dx, int prev_dy, int prev_dz);
+
+bool isClearFinalMove(
+    const Grid3D& grid,
+    const GridPoint& curr,
+    const GridPoint& goal,
+    const std::unordered_set<std::size_t>& goal_indices
+);
 
 double gridSegmentLength(const GridPoint& a, const GridPoint& b) {
     int dx = b.x - a.x;
@@ -503,6 +420,7 @@ int minimumSegmentCountToAnyGoal(
     std::size_t grid_size = static_cast<std::size_t>(grid.nx()) * grid.ny() * grid.nz();
     std::vector<int> dist(grid_size * kDirectionStates, kInfSegments);
     std::deque<std::pair<GridPoint, int>> queue;
+    int best_goal_segments = kInfSegments;
 
     std::size_t start_state = stateIndex(start, kNoDirection);
     dist[start_state] = 0;
@@ -514,7 +432,43 @@ int minimumSegmentCountToAnyGoal(
         int current_segments = dist[stateIndex(current, prev_dir_index)];
 
         if (isGoalPoint(grid, current, goal_indices)) {
-            return current_segments;
+            best_goal_segments = std::min(best_goal_segments, current_segments);
+            continue;
+        }
+        if (current_segments >= best_goal_segments) {
+            continue;
+        }
+
+        int prev_dx = 0;
+        int prev_dy = 0;
+        int prev_dz = 0;
+        if (prev_dir_index != kNoDirection) {
+            prev_dx = kDijkstraDeltas[prev_dir_index][0];
+            prev_dy = kDijkstraDeltas[prev_dir_index][1];
+            prev_dz = kDijkstraDeltas[prev_dir_index][2];
+        }
+
+        for (const auto& goal : goal_vertices) {
+            if (!isValidFinalMove(current, goal, prev_dx, prev_dy, prev_dz)) {
+                continue;
+            }
+            if (!isClearFinalMove(grid, current, goal, goal_indices)) {
+                continue;
+            }
+
+            int final_dir_index = kNoDirection;
+            int final_dx = goal.x - current.x;
+            int final_dy = goal.y - current.y;
+            int final_dz = goal.z - current.z;
+            if (final_dz != 0) {
+                final_dir_index = directionIndexForDelta(0, 0, final_dz > 0 ? 1 : -1);
+            } else if (final_dx != 0 || final_dy != 0) {
+                int gcd = std::gcd(std::abs(final_dx), std::abs(final_dy));
+                final_dir_index = directionIndexForDelta(final_dx / gcd, final_dy / gcd, 0);
+            }
+
+            int extra_segment = (prev_dir_index != kNoDirection && prev_dir_index == final_dir_index) ? 0 : 1;
+            best_goal_segments = std::min(best_goal_segments, current_segments + extra_segment);
         }
 
         for (const auto& delta : kDijkstraDeltas) {
@@ -558,7 +512,7 @@ int minimumSegmentCountToAnyGoal(
         }
     }
 
-    return -1;
+    return best_goal_segments == kInfSegments ? -1 : best_goal_segments;
 }
 
 std::vector<GridPoint> castRays360(
@@ -913,6 +867,7 @@ std::vector<std::vector<GridPoint>> findAllExactSegmentPathsToAnyGoal(
         return a.z < b.z;
     });
 
+    // TODO : 這邊要改成隨機取48個？
     std::size_t branch_limit = std::min<std::size_t>(first_points.size(), 48);
     std::size_t local_max = std::max<std::size_t>(2, max_results / std::max<std::size_t>(1, branch_limit) + 2);
     std::vector<std::future<std::vector<std::vector<GridPoint>>>> futures;
@@ -973,6 +928,7 @@ std::vector<std::vector<GridPoint>> generateCandidatePaths(
     const GridPoint& start,
     const std::vector<GridPoint>& goals,
     std::size_t max_results,
+    int max_candidate_segments,
     bool backward_search = false
 ) {
     std::vector<std::vector<GridPoint>> all_paths;
@@ -997,14 +953,14 @@ std::vector<std::vector<GridPoint>> generateCandidatePaths(
         return {};
     }
 
-    constexpr int kMaxCandidateSegments = 20;
     std::cout << "  minimum_segment_presearch " << minimum_segments << " segments" << std::endl;
-    if (minimum_segments > kMaxCandidateSegments) {
-        std::cout << "  minimum segments exceed max candidate segments " << kMaxCandidateSegments << std::endl;
+    std::cout << "  max_candidate_segments " << max_candidate_segments << std::endl;
+    if (minimum_segments > max_candidate_segments) {
+        std::cout << "  minimum segments exceed max candidate segments " << max_candidate_segments << std::endl;
         return {};
     }
 
-    for (int segments = std::max(1, minimum_segments); segments <= kMaxCandidateSegments; ++segments) {
+    for (int segments = std::max(1, minimum_segments); segments <= max_candidate_segments; ++segments) {
         std::cout << "      Searching for " << segments << "-segment paths..." << std::endl;
 
         std::size_t quota = std::max<std::size_t>(2, max_results / 2);
@@ -1189,6 +1145,13 @@ RouteResult runDijkstraTest(const RouteRequest& request) {
     double net_width = widthForNet(request, net_id);
     double clearance = clearanceForNet(request, net_id);
     Grid3D grid = buildObstacleGridForNet(request, net_id, net_width, clearance);
+    // 最大segment數 ： net原本的繞線的segment數＋ min(1+ board layer數, 5)
+    int original_segment_count = originalRouteSegmentCount(request, net_id);
+    int segment_margin = std::min(1 + grid.nz(), 5);
+    int max_candidate_segments = std::max(1, original_segment_count + segment_margin);
+    std::cout << "  original_route_segments " << original_segment_count << std::endl;
+    std::cout << "  segment_margin " << segment_margin << std::endl;
+    std::cout << "  dynamic_max_candidate_segments " << max_candidate_segments << std::endl;
 
     result.net_id = net_id;
     result.grid_pitch = grid.pitch();
@@ -1245,11 +1208,11 @@ RouteResult runDijkstraTest(const RouteRequest& request) {
 
     std::vector<std::vector<GridPoint>> candidate_paths;
     for (const auto& start : result.start_vertices) { // if center of start has multi layer
-        auto paths = generateCandidatePaths(grid, start, result.goal_vertices, 12);
+        auto paths = generateCandidatePaths(grid, start, result.goal_vertices, 12, max_candidate_segments);
         candidate_paths.insert(candidate_paths.end(), paths.begin(), paths.end());
     }
     for (const auto& backward_start : pad_terminal_groups[1].center_vertices) {
-        auto paths = generateCandidatePaths(grid, backward_start, pad_terminal_groups[0].goal_vertices, 12, true);
+        auto paths = generateCandidatePaths(grid, backward_start, pad_terminal_groups[0].goal_vertices, 12, max_candidate_segments, true);
         for (auto& path : paths) {
             std::reverse(path.begin(), path.end());
             candidate_paths.push_back(std::move(path));

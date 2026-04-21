@@ -11,6 +11,7 @@ find_package(pybind11 CONFIG REQUIRED)
 pybind11_add_module(router_core
     cpp_core/pybind_api.cpp
     cpp_core/src/grid_3d.cpp
+    cpp_core/src/net_analysis.cpp
     cpp_core/src/router.cpp
 )
 
