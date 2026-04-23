@@ -96,6 +96,7 @@ int originalRouteSegmentCount(const RouteRequest& request, int net_id) {
 
     for (const auto& [junction_key, incident_indices] : incident_tracks_by_point) {
         (void) junction_key;
+        //某個接點剛好只接兩條 track
         if (incident_indices.size() != 2) {
             continue;
         }
@@ -108,9 +109,11 @@ int originalRouteSegmentCount(const RouteRequest& request, int net_id) {
         Point2D junction = samePhysicalPoint(first.start, second.start) || samePhysicalPoint(first.start, second.end)
             ? first.start
             : first.end;
+        //在這個接點是直通、不是轉彎
         if (!isStraightThroughAtJunction(first, second, junction)) {
             continue;
         }
+        //把原本兩條 track 視為同一個幾何 segment，所以 count 減 1
         --count;
     }
 
