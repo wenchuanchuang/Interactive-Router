@@ -184,11 +184,16 @@ class MainWindow(QMainWindow):
             self.canvas.ripped_net_ids,
             self.trace_panel.grid_steps_per_mm,
         )
-        self.statusBar().showMessage(outcome.message)
+        elapsed = (
+            f" Runtime: {outcome.elapsed_seconds:.3f} s"
+            if outcome.elapsed_seconds is not None
+            else ""
+        )
+        self.statusBar().showMessage(f"{outcome.message}{elapsed}")
         if outcome.result:
             self.route_preview.show_routes(outcome.result, self._board, self.canvas.ripped_net_ids)
         else:
-            self.route_preview.show_message(outcome.message)
+            self.route_preview.show_message(f"{outcome.message}{elapsed}")
 
     def _show_status_counts(self, prefix: str) -> None:
         if self._board is None:

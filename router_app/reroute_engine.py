@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from math import ceil
 from pathlib import Path
+from time import perf_counter
 import sys
 from typing import Any
 
@@ -14,6 +15,7 @@ class RerouteOutcome:
     ok: bool
     message: str
     result: Any | None = None
+    elapsed_seconds: float | None = None
 
 
 def minimum_grid_steps_per_mm(board: BoardData) -> int:
@@ -31,6 +33,7 @@ def run_dijkstra_reroute_test(
     if not ripped_net_ids:
         return RerouteOutcome(False, "Rip up at least one net before rerouting.")
 
+    started_at = perf_counter()
     try:
         router_core = _import_router_core()
     except ImportError as exc:
@@ -38,6 +41,7 @@ def run_dijkstra_reroute_test(
             False,
             "router_core is not built yet. Build the C++ pybind module before rerouting.",
             exc,
+            perf_counter() - started_at,
         )
 
     results = []
@@ -62,6 +66,7 @@ def run_dijkstra_reroute_test(
             False,
             f"Rerouted {len(results)}/{len(all_ripped_net_ids)} nets. Failed: {' | '.join(failures)}",
             results,
+            perf_counter() - started_at,
         )
 
     total_candidates = sum(len(getattr(result, "candidate_paths_mm", [])) or 1 for result in results)
@@ -73,6 +78,7 @@ def run_dijkstra_reroute_test(
         True,
         f"Rerouted {len(results)} nets: {total_candidates} candidate paths, {total_vertices} total grid vertices.",
         results,
+        perf_counter() - started_at,
     )
 
 
