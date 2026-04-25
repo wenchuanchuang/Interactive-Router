@@ -129,6 +129,18 @@ bool padOnLayer(const PadGeometry& pad, const std::string& layer) {
         || std::find(pad.layers.begin(), pad.layers.end(), "*.Cu") != pad.layers.end();
 }
 
+bool pointInsidePadShape(double local_x, double local_y, double half_x, double half_y, bool elliptical) {
+    if (half_x <= 0.0 || half_y <= 0.0) {
+        return false;
+    }
+    if (elliptical) {
+        double rx = local_x / half_x;
+        double ry = local_y / half_y;
+        return rx * rx + ry * ry <= 1.0;
+    }
+    return std::abs(local_x) <= half_x && std::abs(local_y) <= half_y;
+}
+
 }  // namespace
 
 Grid3D::Grid3D(
@@ -319,14 +331,52 @@ std::vector<GridPoint> Grid3D::verticesInsidePad(const PadGeometry& pad, double 
             double dy = physical.y - pad.center.y;
             double local_x = dx * cos_a + dy * sin_a;
             double local_y = -dx * sin_a + dy * cos_a;
-            if (elliptical) {
-                double rx = half_x > 0.0 ? local_x / half_x : 0.0;
-                double ry = half_y > 0.0 ? local_y / half_y : 0.0;
-                inside = rx * rx + ry * ry <= 1.0;
-            } else {
-                inside = std::abs(local_x) <= half_x && std::abs(local_y) <= half_y;
-            }
+            inside = pointInsidePadShape(local_x, local_y, half_x, half_y, elliptical);
             if (inside) {
+                vertices.push_back({x, y, layer_index});
+            }
+        }
+    }
+    return vertices;
+}
+
+std::vector<GridPoint> Grid3D::verticesOnPadBoundary(const PadGeometry& pad, double bloat, int layer_index) const {
+    std::vector<GridPoint> vertices;
+    if (layer_index < 0 || layer_index >= nz_) {
+        return vertices;
+    }
+
+    double half_x = pad.size_x * 0.5 + bloat;
+    double half_y = pad.size_y * 0.5 + bloat;
+    bool circular = pad.shape == "circle";
+    bool elliptical = circular || pad.shape == "oval";
+    double angle = circular ? 0.0 : pad.rotation_degrees * kPi / 180.0;
+    double cos_a = std::cos(angle);
+    double sin_a = std::sin(angle);
+    double extent_x = circular ? half_x : std::abs(cos_a) * half_x + std::abs(sin_a) * half_y;
+    double extent_y = circular ? half_y : std::abs(sin_a) * half_x + std::abs(cos_a) * half_y;
+    double boundary_band = std::max(pitch_ * 0.5, 1e-6);
+    double inner_half_x = std::max(half_x - boundary_band, 0.0);
+    double inner_half_y = std::max(half_y - boundary_band, 0.0);
+
+    int min_x = std::max(0, static_cast<int>(std::floor((pad.center.x - extent_x - origin_x_) / pitch_)));
+    int max_x = std::min(nx_ - 1, static_cast<int>(std::ceil((pad.center.x + extent_x - origin_x_) / pitch_)));
+    int min_y = std::max(0, static_cast<int>(std::floor((pad.center.y - extent_y - origin_y_) / pitch_)));
+    int max_y = std::min(ny_ - 1, static_cast<int>(std::ceil((pad.center.y + extent_y - origin_y_) / pitch_)));
+
+    for (int y = min_y; y <= max_y; ++y) {
+        for (int x = min_x; x <= max_x; ++x) {
+            Point2D physical = gridToPhysical({x, y, layer_index});
+            double dx = physical.x - pad.center.x;
+            double dy = physical.y - pad.center.y;
+            double local_x = dx * cos_a + dy * sin_a;
+            double local_y = -dx * sin_a + dy * cos_a;
+            bool inside_outer = pointInsidePadShape(local_x, local_y, half_x, half_y, elliptical);
+            if (!inside_outer) {
+                continue;
+            }
+            bool inside_inner = pointInsidePadShape(local_x, local_y, inner_half_x, inner_half_y, elliptical);
+            if (!inside_inner) {
                 vertices.push_back({x, y, layer_index});
             }
         }

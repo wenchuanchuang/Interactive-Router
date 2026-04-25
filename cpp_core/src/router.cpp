@@ -651,21 +651,18 @@ double spatialNoise(int x, int y, int z, unsigned int seed) {
 
 
 bool isValidFinalMove(const GridPoint& curr, const GridPoint& goal, int prev_dx, int prev_dy, int prev_dz) {
-   int final_dx = goal.x - curr.x;
-   int final_dy = goal.y - curr.y;
-   int final_dz = goal.z - curr.z;
-   if (final_dz != 0) {
-       if (final_dx != 0 || final_dy != 0) {
-           return false;
-       }
-   } else {
-       int abs_dx = std::abs(final_dx);
-       int abs_dy = std::abs(final_dy);
-       if (abs_dx != 0 && abs_dy != 0 && abs_dx != abs_dy) {
-           return false;
-       }
-   }
-   return isAngleValid(prev_dx, prev_dy, prev_dz, final_dx, final_dy, final_dz);
+    int final_dx = goal.x - curr.x;
+    int final_dy = goal.y - curr.y;
+    int final_dz = goal.z - curr.z;
+    if (final_dz != 0) {
+        return false;
+    }
+    int abs_dx = std::abs(final_dx);
+    int abs_dy = std::abs(final_dy);
+    if (abs_dx != 0 && abs_dy != 0 && abs_dx != abs_dy) {
+        return false;
+    }
+    return isAngleValid(prev_dx, prev_dy, prev_dz, final_dx, final_dy, final_dz);
 }
 
 
@@ -675,16 +672,13 @@ bool isClearFinalMove(
    const GridPoint& goal,
    const std::unordered_set<std::size_t>& goal_indices
 ) {
-   int final_dx = goal.x - curr.x;
-   int final_dy = goal.y - curr.y;
-   int final_dz = goal.z - curr.z;
-   if (final_dz == 0) {
-       return isLineOfSightClear(grid, curr.x, curr.y, curr.z, goal.x, goal.y, goal_indices);
-   }
-   if (final_dx == 0 && final_dy == 0) {
-       return isViaClear(grid, curr.x, curr.y, curr.z, goal.z, goal_indices);
-   }
-   return false;
+    int final_dx = goal.x - curr.x;
+    int final_dy = goal.y - curr.y;
+    int final_dz = goal.z - curr.z;
+    if (final_dz != 0) {
+        return false;
+    }
+    return isLineOfSightClear(grid, curr.x, curr.y, curr.z, goal.x, goal.y, goal_indices);
 }
 
 
@@ -1551,11 +1545,38 @@ std::vector<GridPoint> collectTerminalVertices(
            if (!layerMatchesPad(pad, grid.layers()[z])) {
                continue;
            }
-           auto vertices = grid.verticesInsidePad(pad, pad_entry_bloat, z);
+           auto vertices = grid.verticesOnPadBoundary(pad, pad_entry_bloat, z);
            terminals.insert(terminals.end(), vertices.begin(), vertices.end());
        }
    }
    return terminals;
+}
+
+void blockGoalPadInteriorExceptBoundary(
+   Grid3D& grid,
+   const PadGeometry& goal_pad,
+   const std::vector<GridPoint>& goal_boundary_vertices,
+   double pad_entry_bloat
+) {
+   std::unordered_set<std::size_t> boundary_indices;
+   boundary_indices.reserve(goal_boundary_vertices.size());
+   for (const auto& vertex : goal_boundary_vertices) {
+       if (grid.inBounds(vertex)) {
+           boundary_indices.insert(grid.flatten(vertex));
+       }
+   }
+
+   for (int z = 0; z < grid.nz(); ++z) {
+       if (!layerMatchesPad(goal_pad, grid.layers()[z])) {
+           continue;
+       }
+       auto inside_vertices = grid.verticesInsidePad(goal_pad, pad_entry_bloat, z);
+       for (const auto& vertex : inside_vertices) {
+           if (boundary_indices.find(grid.flatten(vertex)) == boundary_indices.end()) {
+               grid.setBlocked(vertex, true);
+           }
+       }
+   }
 }
 
 
@@ -1591,6 +1612,7 @@ RouteResult runDijkstraTest(const RouteRequest& request) {
 
 
    struct PadTerminals {
+       const PadGeometry* pad = nullptr;
        std::vector<GridPoint> center_vertices;
        std::vector<GridPoint> goal_vertices;
    };
@@ -1601,6 +1623,7 @@ RouteResult runDijkstraTest(const RouteRequest& request) {
            continue;
        }
        PadTerminals terminals;
+       terminals.pad = &pad;
        //先決定這顆 pad 的 center 要取哪一層
        int preferred_z = preferredPadStartLayer(request, pad, net_id, grid);
        for (int z = 0; z < grid.nz(); ++z) {
@@ -1614,7 +1637,7 @@ RouteResult runDijkstraTest(const RouteRequest& request) {
                    terminals.center_vertices.push_back(center);
                }
            }
-           auto vertices = grid.verticesInsidePad(pad, std::max(grid.pitch() * 0.25, net_width * 0.25), z);
+           auto vertices = grid.verticesOnPadBoundary(pad, std::max(grid.pitch() * 0.25, net_width * 0.25), z);
            for (const auto& vertex : vertices) {
                if (!grid.isBlocked(vertex)) {
                    terminals.goal_vertices.push_back(vertex);
@@ -1639,12 +1662,34 @@ RouteResult runDijkstraTest(const RouteRequest& request) {
 
 
    std::vector<std::vector<GridPoint>> candidate_paths;
+   double pad_entry_bloat = std::max(grid.pitch() * 0.25, net_width * 0.25);
    for (const auto& start : result.start_vertices) { // if center of start has multi layer
-       auto paths = generateCandidatePaths(grid, start, result.goal_vertices, 100, max_candidate_segments);
+       Grid3D search_grid = grid;
+       blockGoalPadInteriorExceptBoundary(
+           search_grid,
+           *pad_terminal_groups[1].pad,
+           result.goal_vertices,
+           pad_entry_bloat
+       );
+       auto paths = generateCandidatePaths(search_grid, start, result.goal_vertices, 100, max_candidate_segments);
        candidate_paths.insert(candidate_paths.end(), paths.begin(), paths.end());
    }
    for (const auto& backward_start : pad_terminal_groups[1].center_vertices) {
-       auto paths = generateCandidatePaths(grid, backward_start, pad_terminal_groups[0].goal_vertices, 100, max_candidate_segments, true);
+       Grid3D search_grid = grid;
+       blockGoalPadInteriorExceptBoundary(
+           search_grid,
+           *pad_terminal_groups[0].pad,
+           pad_terminal_groups[0].goal_vertices,
+           pad_entry_bloat
+       );
+       auto paths = generateCandidatePaths(
+           search_grid,
+           backward_start,
+           pad_terminal_groups[0].goal_vertices,
+           100,
+           max_candidate_segments,
+           true
+       );
        for (auto& path : paths) {
            std::reverse(path.begin(), path.end());
            candidate_paths.push_back(std::move(path));
@@ -1668,7 +1713,7 @@ RouteResult runDijkstraTest(const RouteRequest& request) {
    });
    candidate_paths.erase(std::unique(candidate_paths.begin(), candidate_paths.end(), path_equal), candidate_paths.end());
    if (candidate_paths.size() > 1000) {
-       candidate_paths.resize(1000);
+       candidate_paths.resize(1000);//
    }
    printSegmentPathHistogram(candidate_paths, "Final candidate");
 

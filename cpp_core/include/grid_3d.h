@@ -51,6 +51,7 @@ public:
     void clearPad(const PadGeometry& pad, double clearance);
 
     std::vector<GridPoint> verticesInsidePad(const PadGeometry& pad, double bloat, int layer_index) const;
+    std::vector<GridPoint> verticesOnPadBoundary(const PadGeometry& pad, double bloat, int layer_index) const;
 
 private:
     double origin_x_ = 0.0;
