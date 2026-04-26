@@ -32,6 +32,7 @@ struct TrackGeometry {
 
 struct PadGeometry {
     Point2D center;
+    Point2D footprint_center;
     double size_x = 0.0;
     double size_y = 0.0;
     double rotation_degrees = 0.0;

@@ -113,6 +113,7 @@ def _run_single_dijkstra_reroute_test(
         for pad in footprint.pads:
             item = router_core.PadGeometry()
             item.center = router_core.Point2D(pad.center[0], pad.center[1])
+            item.footprint_center = router_core.Point2D(footprint.position[0], footprint.position[1])
             item.size_x = pad.size[0]
             item.size_y = pad.size[1]
             item.rotation_degrees = pad.rotation_degrees

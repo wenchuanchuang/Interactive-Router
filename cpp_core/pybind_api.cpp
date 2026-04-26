@@ -35,6 +35,7 @@ PYBIND11_MODULE(router_core, m) {
     py::class_<PadGeometry>(m, "PadGeometry")
         .def(py::init<>())
         .def_readwrite("center", &PadGeometry::center)
+        .def_readwrite("footprint_center", &PadGeometry::footprint_center)
         .def_readwrite("size_x", &PadGeometry::size_x)
         .def_readwrite("size_y", &PadGeometry::size_y)
         .def_readwrite("rotation_degrees", &PadGeometry::rotation_degrees)

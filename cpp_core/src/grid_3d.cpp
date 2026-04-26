@@ -4,6 +4,7 @@
 #include <cmath>
 #include <limits>
 #include <stdexcept>
+#include <unordered_set>
 
 namespace interactive_router {
 namespace {
@@ -341,47 +342,38 @@ std::vector<GridPoint> Grid3D::verticesInsidePad(const PadGeometry& pad, double 
 }
 
 std::vector<GridPoint> Grid3D::verticesOnPadBoundary(const PadGeometry& pad, double bloat, int layer_index) const {
-    std::vector<GridPoint> vertices;
-    if (layer_index < 0 || layer_index >= nz_) {
-        return vertices;
+    std::vector<GridPoint> inside = verticesInsidePad(pad, bloat, layer_index);
+    if (inside.empty()) {
+        return {};
     }
 
-    double half_x = pad.size_x * 0.5 + bloat;
-    double half_y = pad.size_y * 0.5 + bloat;
-    bool circular = pad.shape == "circle";
-    bool elliptical = circular || pad.shape == "oval";
-    double angle = circular ? 0.0 : pad.rotation_degrees * kPi / 180.0;
-    double cos_a = std::cos(angle);
-    double sin_a = std::sin(angle);
-    double extent_x = circular ? half_x : std::abs(cos_a) * half_x + std::abs(sin_a) * half_y;
-    double extent_y = circular ? half_y : std::abs(sin_a) * half_x + std::abs(cos_a) * half_y;
-    double boundary_band = std::max(pitch_ * 0.5, 1e-6);
-    double inner_half_x = std::max(half_x - boundary_band, 0.0);
-    double inner_half_y = std::max(half_y - boundary_band, 0.0);
+    std::unordered_set<std::size_t> inside_indices;
+    inside_indices.reserve(inside.size() * 2);
+    for (const auto& point : inside) {
+        inside_indices.insert(flatten(point));
+    }
 
-    int min_x = std::max(0, static_cast<int>(std::floor((pad.center.x - extent_x - origin_x_) / pitch_)));
-    int max_x = std::min(nx_ - 1, static_cast<int>(std::ceil((pad.center.x + extent_x - origin_x_) / pitch_)));
-    int min_y = std::max(0, static_cast<int>(std::floor((pad.center.y - extent_y - origin_y_) / pitch_)));
-    int max_y = std::min(ny_ - 1, static_cast<int>(std::ceil((pad.center.y + extent_y - origin_y_) / pitch_)));
+    const int kPlanarNeighbors[8][2] = {
+        {1, 0}, {-1, 0}, {0, 1}, {0, -1},
+        {1, 1}, {1, -1}, {-1, 1}, {-1, -1},
+    };
 
-    for (int y = min_y; y <= max_y; ++y) {
-        for (int x = min_x; x <= max_x; ++x) {
-            Point2D physical = gridToPhysical({x, y, layer_index});
-            double dx = physical.x - pad.center.x;
-            double dy = physical.y - pad.center.y;
-            double local_x = dx * cos_a + dy * sin_a;
-            double local_y = -dx * sin_a + dy * cos_a;
-            bool inside_outer = pointInsidePadShape(local_x, local_y, half_x, half_y, elliptical);
-            if (!inside_outer) {
-                continue;
-            }
-            bool inside_inner = pointInsidePadShape(local_x, local_y, inner_half_x, inner_half_y, elliptical);
-            if (!inside_inner) {
-                vertices.push_back({x, y, layer_index});
+    std::vector<GridPoint> boundary;
+    boundary.reserve(inside.size());
+    for (const auto& point : inside) {
+        bool is_boundary = false;
+        for (const auto& delta : kPlanarNeighbors) {
+            GridPoint neighbor{point.x + delta[0], point.y + delta[1], point.z};
+            if (!inBounds(neighbor) || inside_indices.find(flatten(neighbor)) == inside_indices.end()) {
+                is_boundary = true;
+                break;
             }
         }
+        if (is_boundary) {
+            boundary.push_back(point);
+        }
     }
-    return vertices;
+    return boundary;
 }
 
 double distancePointToSegment(Point2D point, Point2D start, Point2D end) {

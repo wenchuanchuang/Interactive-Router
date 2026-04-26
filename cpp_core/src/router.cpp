@@ -3,7 +3,9 @@
 
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstdlib>
 #include <deque>
 #include <functional>
 #include <future>
@@ -56,6 +58,304 @@ constexpr unsigned int kShuffleSeed = 777;
 const int kPlanarRayDirs[8][2] = {
    {1, 0}, {1, 1}, {0, 1}, {-1, 1}, {-1, 0}, {-1, -1}, {0, -1}, {1, -1},
 };
+
+constexpr double kPi = 3.14159265358979323846;
+
+bool samePoint(const GridPoint& a, const GridPoint& b);
+
+bool isLineOfSightClear(
+   const Grid3D& grid,
+   int x0,
+   int y0,
+   int z,
+   int x1,
+   int y1,
+   const std::unordered_set<std::size_t>& goal_indices
+);
+
+struct BoundarySeed {
+   GridPoint origin;
+   unsigned int dir_mask = 0;
+};
+
+struct FirstRayCandidate {
+   GridPoint boundary_start;
+   GridPoint next;
+};
+
+Point2D rotateLocalToWorld(double local_x, double local_y, double cos_a, double sin_a) {
+   return {
+       local_x * cos_a - local_y * sin_a,
+       local_x * sin_a + local_y * cos_a,
+   };
+}
+
+double dot2D(const Point2D& a, const Point2D& b) {
+   return a.x * b.x + a.y * b.y;
+}
+
+unsigned int dirMaskForClosestPlanarDir(const Point2D& world_dir) {
+   double best_dot = -std::numeric_limits<double>::infinity();
+   int best_index = -1;
+   double norm = std::sqrt(world_dir.x * world_dir.x + world_dir.y * world_dir.y);
+   if (norm <= 1e-12) {
+       return 0;
+   }
+   Point2D unit{world_dir.x / norm, world_dir.y / norm};
+   for (int i = 0; i < 8; ++i) {
+       double dx = static_cast<double>(kPlanarRayDirs[i][0]);
+       double dy = static_cast<double>(kPlanarRayDirs[i][1]);
+       double dnorm = std::sqrt(dx * dx + dy * dy);
+       double score = (unit.x * dx + unit.y * dy) / dnorm;
+       if (score > best_dot) {
+           best_dot = score;
+           best_index = i;
+       }
+   }
+   return best_index >= 0 ? (1U << static_cast<unsigned int>(best_index)) : 0U;
+}
+
+unsigned int dirMaskForCornerCone(const Point2D& normal1, const Point2D& normal2) {
+   unsigned int mask = 0;
+   for (int i = 0; i < 8; ++i) {
+       Point2D d{
+           static_cast<double>(kPlanarRayDirs[i][0]),
+           static_cast<double>(kPlanarRayDirs[i][1]),
+       };
+       if (dot2D(d, normal1) >= -1e-9 && dot2D(d, normal2) >= -1e-9) {
+           mask |= (1U << static_cast<unsigned int>(i));
+       }
+   }
+   if (mask == 0) {
+       Point2D blended{normal1.x + normal2.x, normal1.y + normal2.y};
+       mask = dirMaskForClosestPlanarDir(blended);
+   }
+   return mask;
+}
+
+void addBoundarySeed(
+   std::vector<BoundarySeed>& seeds,
+   const GridPoint& point,
+   unsigned int dir_mask
+) {
+   if (dir_mask == 0U) {
+       return;
+   }
+   for (auto& existing : seeds) {
+       if (samePoint(existing.origin, point)) {
+           existing.dir_mask |= dir_mask;
+           return;
+       }
+   }
+   seeds.push_back({point, dir_mask});
+}
+
+std::vector<BoundarySeed> startPadBoundarySeeds(
+   const Grid3D& grid,
+   const GridPoint& start,
+   const PadGeometry& pad
+) {
+   std::vector<BoundarySeed> seeds;
+   if (!grid.inBounds(start)) {
+       return seeds;
+   }
+   if (!layerMatchesPad(pad, grid.layers()[start.z])) {
+       return seeds;
+   }
+   std::vector<GridPoint> boundary_ring = grid.verticesOnPadBoundary(pad, 0.0, start.z);
+   if (boundary_ring.empty()) {
+       return seeds;
+   }
+
+   double angle = pad.rotation_degrees * kPi / 180.0;
+   double cos_a = std::cos(angle);
+   double sin_a = std::sin(angle);
+   auto nearest_boundary_vertex = [&](const Point2D& world_point, GridPoint* out_point) -> bool {
+       double best_dist_sq = std::numeric_limits<double>::infinity();
+       bool found = false;
+       GridPoint best{};
+       for (const auto& vertex : boundary_ring) {
+           Point2D physical = grid.gridToPhysical(vertex);
+           double dx = physical.x - world_point.x;
+           double dy = physical.y - world_point.y;
+           double dist_sq = dx * dx + dy * dy;
+           if (dist_sq < best_dist_sq) {
+               best_dist_sq = dist_sq;
+               best = vertex;
+               found = true;
+           }
+       }
+       if (!found) {
+           return false;
+       }
+       *out_point = best;
+       return true;
+   };
+   auto add_sample = [&](double local_x, double local_y, unsigned int dir_mask) {
+       Point2D world_offset = rotateLocalToWorld(local_x, local_y, cos_a, sin_a);
+       Point2D world_point{pad.center.x + world_offset.x, pad.center.y + world_offset.y};
+       GridPoint candidate{};
+       if (nearest_boundary_vertex(world_point, &candidate)) {
+           addBoundarySeed(seeds, candidate, dir_mask);
+       }
+   };
+
+   double half_x = pad.size_x * 0.5;
+   double half_y = pad.size_y * 0.5;
+   bool is_fine_lead = std::min(pad.size_x, pad.size_y) <= 0.4 + 1e-9;
+   if (is_fine_lead) {
+       bool short_dim_is_x = pad.size_x <= pad.size_y;
+       // short edge centers lie on the axis perpendicular to the short dimension:
+       // if short dimension is x, short edges are at y = +/-half_y; else at x = +/-half_x.
+       Point2D short_edge_normal = short_dim_is_x ? rotateLocalToWorld(0.0, 1.0, cos_a, sin_a)
+                                                  : rotateLocalToWorld(1.0, 0.0, cos_a, sin_a);
+       double half_to_short_edge = short_dim_is_x ? half_y : half_x;
+       Point2D p_pos{
+           pad.center.x + short_edge_normal.x * half_to_short_edge,
+           pad.center.y + short_edge_normal.y * half_to_short_edge,
+       };
+       Point2D p_neg{
+           pad.center.x - short_edge_normal.x * half_to_short_edge,
+           pad.center.y - short_edge_normal.y * half_to_short_edge,
+       };
+       double d_pos_sq = (p_pos.x - pad.footprint_center.x) * (p_pos.x - pad.footprint_center.x)
+           + (p_pos.y - pad.footprint_center.y) * (p_pos.y - pad.footprint_center.y);
+       double d_neg_sq = (p_neg.x - pad.footprint_center.x) * (p_neg.x - pad.footprint_center.x)
+           + (p_neg.y - pad.footprint_center.y) * (p_neg.y - pad.footprint_center.y);
+       double sign = d_pos_sq >= d_neg_sq ? 1.0 : -1.0;
+       Point2D outward{short_edge_normal.x * sign, short_edge_normal.y * sign};
+       unsigned int mask = dirMaskForClosestPlanarDir(outward);
+       add_sample(
+           short_dim_is_x ? 0.0 : sign * half_x,
+           short_dim_is_x ? sign * half_y : 0.0,
+           mask
+       );
+       return seeds;
+   }
+
+   if (pad.shape == "circle" || pad.shape == "oval") {
+       double rx = std::max(half_x, 1e-9);
+       double ry = std::max(half_y, 1e-9);
+       for (int i = 0; i < 16; ++i) {
+           double theta = (2.0 * kPi * static_cast<double>(i)) / 16.0;
+           double lx = rx * std::cos(theta);
+           double ly = ry * std::sin(theta);
+           Point2D local_normal{lx / (rx * rx), ly / (ry * ry)};
+           Point2D world_normal = rotateLocalToWorld(local_normal.x, local_normal.y, cos_a, sin_a);
+           add_sample(lx, ly, dirMaskForClosestPlanarDir(world_normal));
+       }
+       return seeds;
+   }
+
+   auto side_normal_world = [&](double nx, double ny) {
+       return rotateLocalToWorld(nx, ny, cos_a, sin_a);
+   };
+   auto corner_mask = [&](double sx, double sy) {
+       Point2D n1 = side_normal_world(sx, 0.0);
+       Point2D n2 = side_normal_world(0.0, sy);
+       return dirMaskForCornerCone(n1, n2);
+   };
+   auto side_mask = [&](double nx, double ny) {
+       return dirMaskForClosestPlanarDir(side_normal_world(nx, ny));
+   };
+
+   add_sample( half_x,  half_y, corner_mask( 1.0,  1.0));
+   add_sample( half_x, -half_y, corner_mask( 1.0, -1.0));
+   add_sample(-half_x,  half_y, corner_mask(-1.0,  1.0));
+   add_sample(-half_x, -half_y, corner_mask(-1.0, -1.0));
+
+   add_sample(-half_x * 0.5,  half_y, side_mask(0.0, 1.0));
+   add_sample( 0.0,           half_y, side_mask(0.0, 1.0));
+   add_sample( half_x * 0.5,  half_y, side_mask(0.0, 1.0));
+
+   add_sample(-half_x * 0.5, -half_y, side_mask(0.0, -1.0));
+   add_sample( 0.0,          -half_y, side_mask(0.0, -1.0));
+   add_sample( half_x * 0.5, -half_y, side_mask(0.0, -1.0));
+
+   add_sample( half_x, -half_y * 0.5, side_mask(1.0, 0.0));
+   add_sample( half_x,  0.0,          side_mask(1.0, 0.0));
+   add_sample( half_x,  half_y * 0.5, side_mask(1.0, 0.0));
+
+   add_sample(-half_x, -half_y * 0.5, side_mask(-1.0, 0.0));
+   add_sample(-half_x,  0.0,          side_mask(-1.0, 0.0));
+   add_sample(-half_x,  half_y * 0.5, side_mask(-1.0, 0.0));
+   return seeds;
+}
+
+std::vector<FirstRayCandidate> castRaysFromBoundarySeeds(
+   const Grid3D& grid,
+   const std::vector<BoundarySeed>& seeds,
+   const std::unordered_set<std::size_t>& goal_indices
+) {
+   std::vector<FirstRayCandidate> candidates;
+   struct RayKey {
+       std::size_t start_index = 0;
+       std::size_t next_index = 0;
+       bool operator==(const RayKey& other) const {
+           return start_index == other.start_index && next_index == other.next_index;
+       }
+   };
+   struct RayKeyHasher {
+       std::size_t operator()(const RayKey& key) const {
+           return std::hash<std::size_t>{}(key.start_index) ^ (std::hash<std::size_t>{}(key.next_index) << 1);
+       }
+   };
+   std::unordered_set<RayKey, RayKeyHasher> seen;
+   for (const auto& seed : seeds) {
+       for (int dir_index = 0; dir_index < 8; ++dir_index) {
+           if ((seed.dir_mask & (1U << static_cast<unsigned int>(dir_index))) == 0U) {
+               continue;
+           }
+           int dx = kPlanarRayDirs[dir_index][0];
+           int dy = kPlanarRayDirs[dir_index][1];
+           int curr_x = seed.origin.x + dx;
+           int curr_y = seed.origin.y + dy;
+           while (grid.inBounds({curr_x, curr_y, seed.origin.z})) {
+               if (!isLineOfSightClear(grid, seed.origin.x, seed.origin.y, seed.origin.z, curr_x, curr_y, goal_indices)) {
+                   break;
+               }
+               GridPoint point{curr_x, curr_y, seed.origin.z};
+               if (samePoint(point, seed.origin)) {
+                   curr_x += dx;
+                   curr_y += dy;
+                   continue;
+               }
+               RayKey key{grid.flatten(seed.origin), grid.flatten(point)};
+               if (seen.insert(key).second) {
+                   candidates.push_back({seed.origin, point});
+               }
+               curr_x += dx;
+               curr_y += dy;
+           }
+       }
+   }
+   return candidates;
+}
+
+void blockStartPadAsObstacle(
+   Grid3D& grid,
+   const PadGeometry& pad,
+   const std::vector<GridPoint>& allowed_points
+) {
+   std::unordered_set<std::size_t> allowed_indices;
+   allowed_indices.reserve(allowed_points.size());
+   for (const auto& point : allowed_points) {
+       if (grid.inBounds(point)) {
+           allowed_indices.insert(grid.flatten(point));
+       }
+   }
+   for (int z = 0; z < grid.nz(); ++z) {
+       if (!layerMatchesPad(pad, grid.layers()[z])) {
+           continue;
+       }
+       auto inside_vertices = grid.verticesInsidePad(pad, 0.0, z);
+       for (const auto& vertex : inside_vertices) {
+           if (allowed_indices.find(grid.flatten(vertex)) == allowed_indices.end()) {
+               grid.setBlocked(vertex, true);
+           }
+       }
+   }
+}
 
 
 const int kDijkstraDeltas[10][3] = {
@@ -1146,6 +1446,7 @@ std::vector<std::vector<GridPoint>> dfsRangeSegmentPathsToAnyGoal(
 std::vector<std::vector<GridPoint>> findAllExactSegmentPathsToAnyGoal(
    const Grid3D& grid,
    const GridPoint& start,
+   const PadGeometry* start_pad,
    const std::vector<GridPoint>& goal_vertices,
    int min_target_segments,
    int max_target_segments,
@@ -1168,21 +1469,46 @@ std::vector<std::vector<GridPoint>> findAllExactSegmentPathsToAnyGoal(
 
 
    std::vector<std::vector<GridPoint>> paths;
-   if (min_target_segments <= 1) {
-       for (const auto& goal : sortedGoalVertices(goal_vertices, start)) {
-           if (isValidFinalMove(start, goal, 0, 0, 0) && isClearFinalMove(grid, start, goal, goal_indices)) {
-               paths.push_back({start, goal});
-               if (paths.size() >= max_results) {
-                   break;
-               }
-           }
+   std::vector<BoundarySeed> boundary_seeds;
+   std::vector<FirstRayCandidate> first_candidates;
+   if (start_pad != nullptr) {
+       boundary_seeds = startPadBoundarySeeds(grid, start, *start_pad);
+       first_candidates = castRaysFromBoundarySeeds(grid, boundary_seeds, goal_indices);
+   } else {
+       auto first_points = castRays360(grid, start, goal_indices, 0, 0, 0);
+       first_candidates.reserve(first_points.size());
+       for (const auto& point : first_points) {
+           first_candidates.push_back({start, point});
        }
    }
 
-
-   auto first_points = castRays360(grid, start, goal_indices, 0, 0, 0);
+   if (min_target_segments <= 1) {
+       std::vector<GridPoint> direct_starts;
+       if (start_pad != nullptr) {
+           direct_starts.reserve(boundary_seeds.size());
+           for (const auto& seed : boundary_seeds) {
+               direct_starts.push_back(seed.origin);
+           }
+       } else {
+           direct_starts.push_back(start);
+       }
+       for (const auto& direct_start : direct_starts) {
+           for (const auto& goal : sortedGoalVertices(goal_vertices, direct_start)) {
+               if (isValidFinalMove(direct_start, goal, 0, 0, 0) && isClearFinalMove(grid, direct_start, goal, goal_indices)) {
+                   paths.push_back({direct_start, goal});
+                   if (paths.size() >= max_results) {
+                       break;
+                   }
+               }
+           }
+           if (paths.size() >= max_results) {
+               break;
+           }
+       }
+   }
    GridPoint guide_goal = sortedGoalVertices(goal_vertices, start).front();
-   auto score = [&](const GridPoint& p) {
+   auto score = [&](const FirstRayCandidate& candidate) {
+       const GridPoint& p = candidate.next;
        double base = std::numeric_limits<double>::infinity();
        for (int target_segment = std::max(1, min_target_segments); target_segment <= max_target_segments; ++target_segment) {
            double progress = 0.0;
@@ -1191,9 +1517,9 @@ std::vector<std::vector<GridPoint>> findAllExactSegmentPathsToAnyGoal(
            double ty = 0.0;
            double tz = 0.0;
            if (uniform_heuristic) {
-               tx = start.x + (guide_goal.x - start.x) / static_cast<double>(remaining);
-               ty = start.y + (guide_goal.y - start.y) / static_cast<double>(remaining);
-               tz = start.z + (guide_goal.z - start.z) * progress;
+               tx = candidate.boundary_start.x + (guide_goal.x - candidate.boundary_start.x) / static_cast<double>(remaining);
+               ty = candidate.boundary_start.y + (guide_goal.y - candidate.boundary_start.y) / static_cast<double>(remaining);
+               tz = candidate.boundary_start.z + (guide_goal.z - candidate.boundary_start.z) * progress;
            } else {
                tx = guide_goal.x;
                ty = guide_goal.y;
@@ -1210,39 +1536,58 @@ std::vector<std::vector<GridPoint>> findAllExactSegmentPathsToAnyGoal(
        unsigned int base_seed = uniform_heuristic ? kRandomSeed : (kRandomSeed ^ 0x9e3779b9U);
        return base + (base + 1.0) * spatialNoise(p.x, p.y, p.z, base_seed ^ heuristic_seed_salt);
    };
-   std::sort(first_points.begin(), first_points.end(), [&](const GridPoint& a, const GridPoint& b) {
+   std::sort(first_candidates.begin(), first_candidates.end(), [&](const FirstRayCandidate& a, const FirstRayCandidate& b) {
        double score_a = score(a);
        double score_b = score(b);
        if (std::abs(score_a - score_b) > 1e-9) {
            return score_a < score_b;
        }
-       if (a.x != b.x) {
-           return a.x < b.x;
+       if (a.next.x != b.next.x) {
+           return a.next.x < b.next.x;
        }
-       if (a.y != b.y) {
-           return a.y < b.y;
+       if (a.next.y != b.next.y) {
+           return a.next.y < b.next.y;
        }
-       return a.z < b.z;
+       if (a.next.z != b.next.z) {
+           return a.next.z < b.next.z;
+       }
+       if (a.boundary_start.x != b.boundary_start.x) {
+           return a.boundary_start.x < b.boundary_start.x;
+       }
+       if (a.boundary_start.y != b.boundary_start.y) {
+           return a.boundary_start.y < b.boundary_start.y;
+       }
+       return a.boundary_start.z < b.boundary_start.z;
    });
 
 
-   std::size_t branch_limit = std::min<std::size_t>(first_points.size(), 48);
+   std::size_t branch_limit = std::min<std::size_t>(first_candidates.size(), 480);
+   Grid3D dfs_grid = grid;
+   if (start_pad != nullptr) {
+       std::vector<GridPoint> allowed_points;
+       allowed_points.reserve(boundary_seeds.size());
+       for (const auto& seed : boundary_seeds) {
+           allowed_points.push_back(seed.origin);
+       }
+       blockStartPadAsObstacle(dfs_grid, *start_pad, allowed_points);
+   }
    std::vector<std::future<std::vector<std::vector<GridPoint>>>> futures;
    futures.reserve(branch_limit);
    for (std::size_t i = 0; i < branch_limit; ++i) {
-       GridPoint next = first_points[i];
+       const auto candidate = first_candidates[i];
+       GridPoint next = candidate.next;
        if (isGoalPoint(grid, next, goal_indices)) {
            continue;
        }
        bool debug_branch = i == 0;
-       futures.push_back(std::async(std::launch::async, [&, next, debug_branch]() {
+       futures.push_back(std::async(std::launch::async, [&, candidate, debug_branch]() {
            return dfsRangeSegmentPathsToAnyGoal(
-               grid,
-               next,
+               dfs_grid,
+               candidate.next,
                goal_vertices,
                goal_indices,
                1,
-               {start, next},
+               {candidate.boundary_start, candidate.next},
                min_target_segments,
                max_target_segments,
                dynamic_step_limit,
@@ -1297,6 +1642,7 @@ void printSegmentPathHistogram(const std::vector<std::vector<GridPoint>>& paths,
 std::vector<std::vector<GridPoint>> generateCandidatePaths(
    const Grid3D& grid,
    const GridPoint& start,
+   const PadGeometry* start_pad,
    const std::vector<GridPoint>& goals,
    std::size_t max_results,
    int max_candidate_segments,
@@ -1315,6 +1661,13 @@ std::vector<std::vector<GridPoint>> generateCandidatePaths(
    } else {
        dynamic_step_limit = kDijkstraStepBase + static_cast<int>(real_dist) * 60;
        std::cout << "  dynamic_step_limit use dijkstraShortest " << std::endl;
+   }
+   if (const char* env = std::getenv("ROUTER_TEST_DYNAMIC_STEP_LIMIT")) {
+       int forced_limit = std::atoi(env);
+       if (forced_limit > 0) {
+           dynamic_step_limit = forced_limit;
+           std::cout << "  dynamic_step_limit override " << dynamic_step_limit << std::endl;
+       }
    }
    std::cout << "  dynamic_step_limit " << dynamic_step_limit << std::endl;
 
@@ -1340,31 +1693,49 @@ std::vector<std::vector<GridPoint>> generateCandidatePaths(
 
    std::vector<std::vector<GridPoint>> uniform;
    std::vector<std::vector<GridPoint>> greedy;
+   bool run_uniform = true;
+   bool run_greedy = true;
+   if (const char* env = std::getenv("ROUTER_TEST_ONLY_MODE")) {
+       std::string mode(env);
+       if (mode == "uniform") {
+           run_greedy = false;
+       } else if (mode == "greedy") {
+           run_uniform = false;
+       }
+   }
    constexpr int kHeuristicSeedRounds = 4;
    for (int round = 0; round < kHeuristicSeedRounds; ++round) {
        unsigned int seed_salt = 0x9e3779b9U * static_cast<unsigned int>(round + 1);
-       auto uniform_round = findAllExactSegmentPathsToAnyGoal(
-           grid,
-           start,
-           goals,
-           std::max(1, minimum_segments),
-           max_candidate_segments,
-           dynamic_step_limit,
-           max_results,
-           true,
-           seed_salt
-       );
-       auto greedy_round = findAllExactSegmentPathsToAnyGoal(
-           grid,
-           start,
-           goals,
-           std::max(1, minimum_segments),
-           max_candidate_segments,
-           dynamic_step_limit,
-           max_results,
-           false,
-           seed_salt
-       );
+       std::vector<std::vector<GridPoint>> uniform_round;
+       std::vector<std::vector<GridPoint>> greedy_round;
+       if (run_uniform) {
+           uniform_round = findAllExactSegmentPathsToAnyGoal(
+               grid,
+               start,
+               start_pad,
+               goals,
+               std::max(1, minimum_segments),
+               max_candidate_segments,
+               dynamic_step_limit,
+               max_results,
+               true,
+               seed_salt
+           );
+       }
+       if (run_greedy) {
+           greedy_round = findAllExactSegmentPathsToAnyGoal(
+               grid,
+               start,
+               start_pad,
+               goals,
+               std::max(1, minimum_segments),
+               max_candidate_segments,
+               dynamic_step_limit,
+               max_results,
+               false,
+               seed_salt
+           );
+       }
        uniform.insert(uniform.end(), uniform_round.begin(), uniform_round.end());
        greedy.insert(greedy.end(), greedy_round.begin(), greedy_round.end());
        if (!uniform.empty() || !greedy.empty()) {
@@ -1671,7 +2042,14 @@ RouteResult runDijkstraTest(const RouteRequest& request) {
            result.goal_vertices,
            pad_entry_bloat
        );
-       auto paths = generateCandidatePaths(search_grid, start, result.goal_vertices, 100, max_candidate_segments);
+       auto paths = generateCandidatePaths(
+           search_grid,
+           start,
+           pad_terminal_groups[0].pad,
+           result.goal_vertices,
+           100,
+           max_candidate_segments
+       );
        candidate_paths.insert(candidate_paths.end(), paths.begin(), paths.end());
    }
    for (const auto& backward_start : pad_terminal_groups[1].center_vertices) {
@@ -1685,6 +2063,7 @@ RouteResult runDijkstraTest(const RouteRequest& request) {
        auto paths = generateCandidatePaths(
            search_grid,
            backward_start,
+           pad_terminal_groups[1].pad,
            pad_terminal_groups[0].goal_vertices,
            100,
            max_candidate_segments,
