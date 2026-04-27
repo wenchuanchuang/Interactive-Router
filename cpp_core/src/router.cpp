@@ -49,6 +49,12 @@ const int kNeighborDeltas[6][3] = {
 constexpr double kViaPenalty = 50.0;
 constexpr double kMinDiscount = 0.2;
 constexpr double kDefaultGridStepsPerMm = 10.0;
+constexpr double kCos45 = 0.7071067811865476;
+constexpr double kProgressPenaltyWeightUniform = 0.35;
+constexpr double kProgressPenaltyWeightGreedy = 0.25;
+constexpr double kSegmentLengthPenaltyWeightUniform = 0.18;
+constexpr double kSegmentLengthPenaltyWeightGreedy = 0.15;
+constexpr double kIdealSegmentLengthFraction = 0.55;
 constexpr int kBaseStepLimit = 1000;
 constexpr int kDijkstraStepBase = 15000;
 constexpr unsigned int kRandomSeed = 88;
@@ -90,8 +96,19 @@ Point2D rotateLocalToWorld(double local_x, double local_y, double cos_a, double 
    };
 }
 
+Point2D rotateWorldToLocal(double world_x, double world_y, double cos_a, double sin_a) {
+   return {
+       world_x * cos_a + world_y * sin_a,
+       -world_x * sin_a + world_y * cos_a,
+   };
+}
+
 double dot2D(const Point2D& a, const Point2D& b) {
    return a.x * b.x + a.y * b.y;
+}
+
+double norm2D(const Point2D& p) {
+   return std::sqrt(dot2D(p, p));
 }
 
 unsigned int dirMaskForClosestPlanarDir(const Point2D& world_dir) {
@@ -489,8 +506,108 @@ bool isObstacleForPath(const Grid3D& grid, const GridPoint& point, const std::un
    return grid.isBlocked(point);
 }
 
+bool isGoalPadEntryDirectionValid(
+   const Grid3D& grid,
+   const GridPoint& curr,
+   const GridPoint& goal,
+   const PadGeometry& goal_pad
+) {
+   if (!grid.inBounds(curr) || !grid.inBounds(goal)) {
+       return false;
+   }
 
-bool isValidFinalMove(const GridPoint& curr, const GridPoint& goal, int prev_dx, int prev_dy, int prev_dz);
+   Point2D goal_physical = grid.gridToPhysical(goal);
+   Point2D curr_physical = grid.gridToPhysical(curr);
+   Point2D entry_world{
+       curr_physical.x - goal_physical.x,
+       curr_physical.y - goal_physical.y,
+   };
+   double entry_norm = norm2D(entry_world);
+   if (entry_norm <= 1e-9) {
+       return false;
+   }
+
+   double angle = goal_pad.rotation_degrees * kPi / 180.0;
+   double cos_a = std::cos(angle);
+   double sin_a = std::sin(angle);
+   Point2D local_goal = rotateWorldToLocal(
+       goal_physical.x - goal_pad.center.x,
+       goal_physical.y - goal_pad.center.y,
+       cos_a,
+       sin_a
+   );
+   Point2D local_entry = rotateWorldToLocal(entry_world.x, entry_world.y, cos_a, sin_a);
+   double half_x = goal_pad.size_x * 0.5;
+   double half_y = goal_pad.size_y * 0.5;
+   double boundary_tolerance = std::max(grid.pitch() * 0.75, 1e-6);
+
+   auto entryAlignedWithOutwardNormal = [&](const Point2D& outward_normal) {
+       double normal_norm = norm2D(outward_normal);
+       if (normal_norm <= 1e-9) {
+           return false;
+       }
+       double cosine = dot2D(local_entry, outward_normal) / (entry_norm * normal_norm);
+       return cosine >= kCos45 - 1e-9;
+   };
+
+   if (goal_pad.shape == "circle" || goal_pad.shape == "oval") {
+       double radius_x = std::max(half_x, 1e-9);
+       double radius_y = std::max(half_y, 1e-9);
+       Point2D outward_normal{
+           local_goal.x / (radius_x * radius_x),
+           local_goal.y / (radius_y * radius_y),
+       };
+       return entryAlignedWithOutwardNormal(outward_normal);
+   }
+
+   bool is_fine_lead = std::min(goal_pad.size_x, goal_pad.size_y) <= 0.4 + 1e-9;
+   if (is_fine_lead) {
+       bool short_dim_is_x = goal_pad.size_x <= goal_pad.size_y;
+       if (short_dim_is_x) {
+           bool on_top = std::abs(local_goal.y - half_y) <= boundary_tolerance;
+           bool on_bottom = std::abs(local_goal.y + half_y) <= boundary_tolerance;
+           if (!on_top && !on_bottom) {
+               return false;
+           }
+           return entryAlignedWithOutwardNormal({0.0, on_top ? 1.0 : -1.0});
+       }
+       bool on_right = std::abs(local_goal.x - half_x) <= boundary_tolerance;
+       bool on_left = std::abs(local_goal.x + half_x) <= boundary_tolerance;
+       if (!on_right && !on_left) {
+           return false;
+       }
+       return entryAlignedWithOutwardNormal({on_right ? 1.0 : -1.0, 0.0});
+   }
+
+   bool on_right = std::abs(local_goal.x - half_x) <= boundary_tolerance;
+   bool on_left = std::abs(local_goal.x + half_x) <= boundary_tolerance;
+   bool on_top = std::abs(local_goal.y - half_y) <= boundary_tolerance;
+   bool on_bottom = std::abs(local_goal.y + half_y) <= boundary_tolerance;
+
+   if ((on_right || on_left) && (on_top || on_bottom)) {
+       Point2D normal1{on_right ? 1.0 : -1.0, 0.0};
+       Point2D normal2{0.0, on_top ? 1.0 : -1.0};
+       return dot2D(local_entry, normal1) >= -1e-9 && dot2D(local_entry, normal2) >= -1e-9;
+   }
+   if (on_right || on_left) {
+       return entryAlignedWithOutwardNormal({on_right ? 1.0 : -1.0, 0.0});
+   }
+   if (on_top || on_bottom) {
+       return entryAlignedWithOutwardNormal({0.0, on_top ? 1.0 : -1.0});
+   }
+   return false;
+}
+
+
+bool isValidFinalMove(
+   const Grid3D& grid,
+   const GridPoint& curr,
+   const GridPoint& goal,
+   const PadGeometry* goal_pad,
+   int prev_dx,
+   int prev_dy,
+   int prev_dz
+);
 
 
 bool isClearFinalMove(
@@ -738,7 +855,8 @@ bool isLineOfSightClear(
 int minimumSegmentCountToAnyGoal(
    const Grid3D& grid,
    const GridPoint& start,
-   const std::vector<GridPoint>& goal_vertices
+   const std::vector<GridPoint>& goal_vertices,
+   const PadGeometry* goal_pad
 ) {
    if (!grid.inBounds(start) || goal_vertices.empty()) {
        return -1;
@@ -806,7 +924,7 @@ int minimumSegmentCountToAnyGoal(
 
 
        for (const auto& goal : goal_vertices) {
-           if (!isValidFinalMove(current, goal, prev_dx, prev_dy, prev_dz)) {
+           if (!isValidFinalMove(grid, current, goal, goal_pad, prev_dx, prev_dy, prev_dz)) {
                continue;
            }
            if (!isClearFinalMove(grid, current, goal, goal_indices)) {
@@ -950,7 +1068,15 @@ double spatialNoise(int x, int y, int z, unsigned int seed) {
 }
 
 
-bool isValidFinalMove(const GridPoint& curr, const GridPoint& goal, int prev_dx, int prev_dy, int prev_dz) {
+bool isValidFinalMove(
+   const Grid3D& grid,
+   const GridPoint& curr,
+   const GridPoint& goal,
+   const PadGeometry* goal_pad,
+   int prev_dx,
+   int prev_dy,
+   int prev_dz
+) {
     int final_dx = goal.x - curr.x;
     int final_dy = goal.y - curr.y;
     int final_dz = goal.z - curr.z;
@@ -962,7 +1088,13 @@ bool isValidFinalMove(const GridPoint& curr, const GridPoint& goal, int prev_dx,
     if (abs_dx != 0 && abs_dy != 0 && abs_dx != abs_dy) {
         return false;
     }
-    return isAngleValid(prev_dx, prev_dy, prev_dz, final_dx, final_dy, final_dz);
+    if (!isAngleValid(prev_dx, prev_dy, prev_dz, final_dx, final_dy, final_dz)) {
+        return false;
+    }
+    if (goal_pad != nullptr && !isGoalPadEntryDirectionValid(grid, curr, goal, *goal_pad)) {
+        return false;
+    }
+    return true;
 }
 
 
@@ -1016,6 +1148,205 @@ std::vector<GridPoint> sortedGoalVertices(const std::vector<GridPoint>& goals, c
        sorted.resize(64);
    }
    return sorted;
+}
+
+std::array<int, 3> normalizedSegmentDirection(const GridPoint& from, const GridPoint& to) {
+   int dx = to.x - from.x;
+   int dy = to.y - from.y;
+   int dz = to.z - from.z;
+   if (dz != 0) {
+       return {0, 0, dz > 0 ? 1 : -1};
+   }
+   int gcd = std::gcd(std::abs(dx), std::abs(dy));
+   if (gcd <= 0) {
+       return {0, 0, 0};
+   }
+   return {dx / gcd, dy / gcd, 0};
+}
+
+double goalAxisLength(const GridPoint& start, const GridPoint& guide_goal) {
+   double dx = static_cast<double>(guide_goal.x - start.x);
+   double dy = static_cast<double>(guide_goal.y - start.y);
+   double dz = static_cast<double>(guide_goal.z - start.z);
+   return std::sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+double projectedDistanceAlongGoalAxis(
+   const GridPoint& start,
+   const GridPoint& guide_goal,
+   const GridPoint& point
+) {
+   double axis_dx = static_cast<double>(guide_goal.x - start.x);
+   double axis_dy = static_cast<double>(guide_goal.y - start.y);
+   double axis_dz = static_cast<double>(guide_goal.z - start.z);
+   double axis_len_sq = axis_dx * axis_dx + axis_dy * axis_dy + axis_dz * axis_dz;
+   if (axis_len_sq <= 1e-9) {
+       return 0.0;
+   }
+   double point_dx = static_cast<double>(point.x - start.x);
+   double point_dy = static_cast<double>(point.y - start.y);
+   double point_dz = static_cast<double>(point.z - start.z);
+   return (point_dx * axis_dx + point_dy * axis_dy + point_dz * axis_dz) / std::sqrt(axis_len_sq);
+}
+
+double progressPenaltyForTarget(
+   const GridPoint& path_start,
+   const GridPoint& guide_goal,
+   const GridPoint& candidate,
+   int next_depth,
+   double target_segments
+) {
+   double total_progress = goalAxisLength(path_start, guide_goal);
+   if (total_progress <= 1e-9 || target_segments <= 0.0) {
+       return 0.0;
+   }
+   double ideal_progress = total_progress * (static_cast<double>(next_depth) / target_segments);
+   double actual_progress = projectedDistanceAlongGoalAxis(path_start, guide_goal, candidate);
+   actual_progress = std::max(0.0, std::min(actual_progress, total_progress));
+   double delta = actual_progress - ideal_progress;
+   return delta * delta;
+}
+
+double segmentLengthPenaltyForTarget(
+   const GridPoint& path_start,
+   const GridPoint& guide_goal,
+   const GridPoint& curr,
+   const GridPoint& candidate,
+   int current_depth,
+   double target_segments
+) {
+   double total_progress = goalAxisLength(path_start, guide_goal);
+   if (total_progress <= 1e-9) {
+       return 0.0;
+   }
+   double progress_now = projectedDistanceAlongGoalAxis(path_start, guide_goal, curr);
+   progress_now = std::max(0.0, std::min(progress_now, total_progress));
+   double remaining_segments = std::max(1.0, target_segments - static_cast<double>(current_depth));
+   double remaining_progress = std::max(0.0, total_progress - progress_now);
+   double ideal_len = remaining_progress / remaining_segments;
+   double actual_len = pathSegmentLength(curr, candidate);
+   double shortfall = std::max(0.0, kIdealSegmentLengthFraction * ideal_len - actual_len);
+   return shortfall * shortfall;
+}
+
+bool isSingleSegmentGeometryValid(const GridPoint& from, const GridPoint& to) {
+   int dx = to.x - from.x;
+   int dy = to.y - from.y;
+   int dz = to.z - from.z;
+   if (dx == 0 && dy == 0 && dz == 0) {
+       return false;
+   }
+   if (dz != 0) {
+       return dx == 0 && dy == 0;
+   }
+   int abs_dx = std::abs(dx);
+   int abs_dy = std::abs(dy);
+   return abs_dx == 0 || abs_dy == 0 || abs_dx == abs_dy;
+}
+
+bool shortcutSegmentIntersectsPath(
+   const std::vector<GridPoint>& path,
+   const GridPoint& from,
+   const GridPoint& to,
+   std::size_t keep_start_index,
+   std::size_t keep_end_index
+) {
+   if (from.z != to.z) {
+       return false;
+   }
+   if (path.size() < 2) {
+       return false;
+   }
+
+   std::size_t skip_begin = keep_start_index > 0 ? keep_start_index - 1 : 0;
+   std::size_t skip_end = std::min(path.size() - 2, keep_end_index);
+   for (std::size_t index = 0; index + 1 < path.size(); ++index) {
+       if (index >= skip_begin && index <= skip_end) {
+           continue;
+       }
+       if (path[index].z != path[index + 1].z || path[index].z != from.z) {
+           continue;
+       }
+       if (doSegmentsIntersect(path[index], path[index + 1], from, to)) {
+           return true;
+       }
+   }
+   return false;
+}
+
+bool canShortcutPathRange(
+   const Grid3D& grid,
+   const std::vector<GridPoint>& path,
+   std::size_t keep_start_index,
+   std::size_t keep_end_index,
+   const std::unordered_set<std::size_t>& goal_indices
+) {
+   if (keep_start_index + 1 >= keep_end_index || keep_end_index >= path.size()) {
+       return false;
+   }
+
+   const GridPoint& from = path[keep_start_index];
+   const GridPoint& to = path[keep_end_index];
+   if (!isSingleSegmentGeometryValid(from, to)) {
+       return false;
+   }
+
+   auto new_dir = normalizedSegmentDirection(from, to);
+   if (keep_start_index > 0) {
+       auto prev_dir = normalizedSegmentDirection(path[keep_start_index - 1], from);
+       if (!isAngleValid(prev_dir[0], prev_dir[1], prev_dir[2], new_dir[0], new_dir[1], new_dir[2])) {
+           return false;
+       }
+   }
+   if (keep_end_index + 1 < path.size()) {
+       auto next_dir = normalizedSegmentDirection(to, path[keep_end_index + 1]);
+       if (!isAngleValid(new_dir[0], new_dir[1], new_dir[2], next_dir[0], next_dir[1], next_dir[2])) {
+           return false;
+       }
+   }
+
+   if (to.z != from.z) {
+       if (!isViaClear(grid, from.x, from.y, from.z, to.z, goal_indices)) {
+           return false;
+       }
+   } else if (!isLineOfSightClear(grid, from.x, from.y, from.z, to.x, to.y, goal_indices)) {
+       return false;
+   }
+
+   if (shortcutSegmentIntersectsPath(path, from, to, keep_start_index, keep_end_index)) {
+       return false;
+   }
+   return true;
+}
+
+std::vector<GridPoint> simplifyCandidatePath(
+   const Grid3D& grid,
+   std::vector<GridPoint> path,
+   const std::unordered_set<std::size_t>& goal_indices
+) {
+   if (path.size() <= 2) {
+       return path;
+   }
+
+   bool changed = true;
+   while (changed) {
+       changed = false;
+       for (std::size_t start_index = 0; start_index + 2 < path.size() && !changed; ++start_index) {
+           for (std::size_t end_index = path.size() - 1; end_index >= start_index + 2; --end_index) {
+               if (!canShortcutPathRange(grid, path, start_index, end_index, goal_indices)) {
+                   if (end_index == start_index + 2) {
+                       break;
+                   }
+                   continue;
+               }
+               path.erase(path.begin() + static_cast<std::ptrdiff_t>(start_index + 1),
+                          path.begin() + static_cast<std::ptrdiff_t>(end_index));
+               changed = true;
+               break;
+           }
+       }
+   }
+   return path;
 }
 
 
@@ -1152,6 +1483,7 @@ std::vector<std::vector<GridPoint>> dfsRangeSegmentPathsToAnyGoal(
    const Grid3D& grid,
    const GridPoint& initial_curr,
    const std::vector<GridPoint>& goal_vertices,
+   const PadGeometry* goal_pad,
    const std::unordered_set<std::size_t>& goal_indices,
    int initial_depth,
    std::vector<GridPoint> initial_path,
@@ -1227,7 +1559,7 @@ std::vector<std::vector<GridPoint>> dfsRangeSegmentPathsToAnyGoal(
            std::size_t bucket_index = static_cast<std::size_t>(completed_segments - min_target_segments);
            if (buckets[bucket_index].found_count < max_results) {
                for (const auto& goal : sortedGoalVertices(goal_vertices, curr)) {
-                   if (!isValidFinalMove(curr, goal, prev_dx, prev_dy, prev_dz)) {
+                   if (!isValidFinalMove(grid, curr, goal, goal_pad, prev_dx, prev_dy, prev_dz)) {
                        continue;
                    }
                    if (!isClearFinalMove(grid, curr, goal, goal_indices)) {
@@ -1367,8 +1699,18 @@ std::vector<std::vector<GridPoint>> dfsRangeSegmentPathsToAnyGoal(
                double dy = p.y - ty;
                double dz = p.z - tz;
                double target_base = dx * dx + dy * dy + dz * dz * dynamic_via_penalty;
-               if (target_base < base) {
-                   base = target_base;
+               double progress_penalty = progressPenaltyForTarget(path.front(), guide_goal, p, state.depth + 1, target);
+               double length_penalty = segmentLengthPenaltyForTarget(path.front(), guide_goal, curr, p, state.depth, target);
+               double heuristic_score = target_base;
+               if (uniform_heuristic) {
+                   heuristic_score += kProgressPenaltyWeightUniform * progress_penalty;
+                   heuristic_score += kSegmentLengthPenaltyWeightUniform * length_penalty;
+               } else {
+                   heuristic_score += kProgressPenaltyWeightGreedy * progress_penalty;
+                   heuristic_score += kSegmentLengthPenaltyWeightGreedy * length_penalty;
+               }
+               if (heuristic_score < base) {
+                   base = heuristic_score;
                }
            }
            unsigned int noise_seed = kRandomSeed
@@ -1397,7 +1739,7 @@ std::vector<std::vector<GridPoint>> dfsRangeSegmentPathsToAnyGoal(
        });
 
 
-       std::size_t branch_limit = state.depth == 0 ? std::min<std::size_t>(next_points.size(), 48) : next_points.size();
+       std::size_t branch_limit = state.depth == 0 ? std::min<std::size_t>(next_points.size(), 480) : next_points.size();
        for (std::size_t i = 0; i < branch_limit; ++i) {
            const auto& next = next_points[i];
            if (isGoalPoint(grid, next, goal_indices) || pointInPath(path, next)) {
@@ -1448,6 +1790,7 @@ std::vector<std::vector<GridPoint>> findAllExactSegmentPathsToAnyGoal(
    const GridPoint& start,
    const PadGeometry* start_pad,
    const std::vector<GridPoint>& goal_vertices,
+   const PadGeometry* goal_pad,
    int min_target_segments,
    int max_target_segments,
    int dynamic_step_limit,
@@ -1494,7 +1837,8 @@ std::vector<std::vector<GridPoint>> findAllExactSegmentPathsToAnyGoal(
        }
        for (const auto& direct_start : direct_starts) {
            for (const auto& goal : sortedGoalVertices(goal_vertices, direct_start)) {
-               if (isValidFinalMove(direct_start, goal, 0, 0, 0) && isClearFinalMove(grid, direct_start, goal, goal_indices)) {
+               if (isValidFinalMove(grid, direct_start, goal, goal_pad, 0, 0, 0)
+                   && isClearFinalMove(grid, direct_start, goal, goal_indices)) {
                    paths.push_back({direct_start, goal});
                    if (paths.size() >= max_results) {
                        break;
@@ -1529,8 +1873,31 @@ std::vector<std::vector<GridPoint>> findAllExactSegmentPathsToAnyGoal(
            double dy = p.y - ty;
            double dz = p.z - tz;
            double target_base = dx * dx + dy * dy + dz * dz * kViaPenalty;
-           if (target_base < base) {
-               base = target_base;
+           double progress_penalty = progressPenaltyForTarget(
+               candidate.boundary_start,
+               guide_goal,
+               p,
+               1,
+               target_segment
+           );
+           double length_penalty = segmentLengthPenaltyForTarget(
+               candidate.boundary_start,
+               guide_goal,
+               candidate.boundary_start,
+               p,
+               0,
+               target_segment
+           );
+           double heuristic_score = target_base;
+           if (uniform_heuristic) {
+               heuristic_score += kProgressPenaltyWeightUniform * progress_penalty;
+               heuristic_score += kSegmentLengthPenaltyWeightUniform * length_penalty;
+           } else {
+               heuristic_score += kProgressPenaltyWeightGreedy * progress_penalty;
+               heuristic_score += kSegmentLengthPenaltyWeightGreedy * length_penalty;
+           }
+           if (heuristic_score < base) {
+               base = heuristic_score;
            }
        }
        unsigned int base_seed = uniform_heuristic ? kRandomSeed : (kRandomSeed ^ 0x9e3779b9U);
@@ -1585,6 +1952,7 @@ std::vector<std::vector<GridPoint>> findAllExactSegmentPathsToAnyGoal(
                dfs_grid,
                candidate.next,
                goal_vertices,
+               goal_pad,
                goal_indices,
                1,
                {candidate.boundary_start, candidate.next},
@@ -1644,6 +2012,7 @@ std::vector<std::vector<GridPoint>> generateCandidatePaths(
    const GridPoint& start,
    const PadGeometry* start_pad,
    const std::vector<GridPoint>& goals,
+   const PadGeometry* goal_pad,
    std::size_t max_results,
    int max_candidate_segments,
    bool backward_search = false
@@ -1672,7 +2041,7 @@ std::vector<std::vector<GridPoint>> generateCandidatePaths(
    std::cout << "  dynamic_step_limit " << dynamic_step_limit << std::endl;
 
 
-   int minimum_segments = minimumSegmentCountToAnyGoal(grid, start, goals);
+   int minimum_segments = minimumSegmentCountToAnyGoal(grid, start, goals, goal_pad);
    if (minimum_segments < 0) {
        std::cout << "  minimum_segment_presearch found no reachable grid path" << std::endl;
        return {};
@@ -1714,6 +2083,7 @@ std::vector<std::vector<GridPoint>> generateCandidatePaths(
                start,
                start_pad,
                goals,
+               goal_pad,
                std::max(1, minimum_segments),
                max_candidate_segments,
                dynamic_step_limit,
@@ -1728,6 +2098,7 @@ std::vector<std::vector<GridPoint>> generateCandidatePaths(
                start,
                start_pad,
                goals,
+               goal_pad,
                std::max(1, minimum_segments),
                max_candidate_segments,
                dynamic_step_limit,
@@ -1743,6 +2114,43 @@ std::vector<std::vector<GridPoint>> generateCandidatePaths(
        }
    }
 
+
+   std::unordered_set<std::size_t> simplify_goal_indices;
+   for (const auto& goal : goals) {
+       if (grid.inBounds(goal)) {
+           simplify_goal_indices.insert(grid.flatten(goal));
+       }
+   }
+   bool debug_simplify = false;
+   if (const char* env = std::getenv("ROUTER_DEBUG_SIMPLIFY")) {
+       debug_simplify = env[0] != '\0' && env[0] != '0';
+   }
+   std::size_t simplified_path_count = 0;
+   std::size_t simplified_vertex_reduction = 0;
+   std::size_t simplified_segment_reduction = 0;
+   auto apply_simplify = [&](std::vector<std::vector<GridPoint>>& paths) {
+       for (auto& path : paths) {
+           std::size_t before_vertices = path.size();
+           std::size_t before_segments = before_vertices > 1 ? before_vertices - 1 : 0;
+           auto simplified = simplifyCandidatePath(grid, std::move(path), simplify_goal_indices);
+           std::size_t after_vertices = simplified.size();
+           std::size_t after_segments = after_vertices > 1 ? after_vertices - 1 : 0;
+           if (after_vertices < before_vertices) {
+               ++simplified_path_count;
+               simplified_vertex_reduction += before_vertices - after_vertices;
+               simplified_segment_reduction += before_segments - after_segments;
+           }
+           path = std::move(simplified);
+       }
+   };
+   apply_simplify(uniform);
+   apply_simplify(greedy);
+   if (debug_simplify) {
+       std::cout << "          simplify changed " << simplified_path_count
+                 << " paths, removed " << simplified_vertex_reduction
+                 << " vertices and " << simplified_segment_reduction
+                 << " segments" << std::endl;
+   }
 
    std::size_t paths_f_uni = backward_search ? 0 : uniform.size();
    std::size_t paths_f_gre = backward_search ? 0 : greedy.size();
@@ -2047,6 +2455,7 @@ RouteResult runDijkstraTest(const RouteRequest& request) {
            start,
            pad_terminal_groups[0].pad,
            result.goal_vertices,
+           pad_terminal_groups[1].pad,
            100,
            max_candidate_segments
        );
@@ -2065,6 +2474,7 @@ RouteResult runDijkstraTest(const RouteRequest& request) {
            backward_start,
            pad_terminal_groups[1].pad,
            pad_terminal_groups[0].goal_vertices,
+           pad_terminal_groups[0].pad,
            100,
            max_candidate_segments,
            true
