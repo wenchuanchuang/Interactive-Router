@@ -55,6 +55,8 @@ constexpr double kProgressPenaltyWeightGreedy = 0.25;
 constexpr double kSegmentLengthPenaltyWeightUniform = 0.18;
 constexpr double kSegmentLengthPenaltyWeightGreedy = 0.15;
 constexpr double kIdealSegmentLengthFraction = 0.55;
+constexpr std::size_t kDiversifiedPrefixCount = 64;
+constexpr double kDiversifiedRankPower = 1.3;
 constexpr int kBaseStepLimit = 1000;
 constexpr int kDijkstraStepBase = 15000;
 constexpr unsigned int kRandomSeed = 88;
@@ -1349,6 +1351,53 @@ std::vector<GridPoint> simplifyCandidatePath(
    return path;
 }
 
+template <typename Candidate>
+void diversifyRankedCandidates(
+   std::vector<Candidate>& candidates,
+   std::size_t deterministic_prefix_count,
+   double rank_power,
+   unsigned int seed
+) {
+   if (candidates.size() <= 2 || rank_power <= 0.0) {
+       return;
+   }
+
+   deterministic_prefix_count = std::min(deterministic_prefix_count, candidates.size());
+   if (deterministic_prefix_count >= candidates.size()) {
+       return;
+   }
+
+   std::vector<Candidate> diversified;
+   diversified.reserve(candidates.size());
+   diversified.insert(
+       diversified.end(),
+       std::make_move_iterator(candidates.begin()),
+       std::make_move_iterator(candidates.begin() + static_cast<std::ptrdiff_t>(deterministic_prefix_count))
+   );
+
+   std::vector<std::size_t> remaining_positions;
+   remaining_positions.reserve(candidates.size() - deterministic_prefix_count);
+   for (std::size_t position = deterministic_prefix_count; position < candidates.size(); ++position) {
+       remaining_positions.push_back(position);
+   }
+
+   std::mt19937 rng(seed);
+   while (!remaining_positions.empty()) {
+       std::vector<double> weights;
+       weights.reserve(remaining_positions.size());
+       for (std::size_t position : remaining_positions) {
+           weights.push_back(1.0 / std::pow(static_cast<double>(position + 1), rank_power));
+       }
+       std::discrete_distribution<std::size_t> dist(weights.begin(), weights.end());
+       std::size_t selected_slot = dist(rng);
+       std::size_t selected_position = remaining_positions[selected_slot];
+       diversified.push_back(std::move(candidates[selected_position]));
+       remaining_positions.erase(remaining_positions.begin() + static_cast<std::ptrdiff_t>(selected_slot));
+   }
+
+   candidates = std::move(diversified);
+}
+
 
 struct DfsState {
    GridPoint curr;
@@ -1737,6 +1786,16 @@ std::vector<std::vector<GridPoint>> dfsRangeSegmentPathsToAnyGoal(
            }
            return a.z > b.z;
        });
+       unsigned int diversify_seed = heuristic_seed_salt
+           ^ static_cast<unsigned int>((state.depth + 1) * 2246822519U)
+           ^ (uniform_heuristic ? 0xA511E9B3U : 0x63D83595U)
+           ^ static_cast<unsigned int>(grid.flatten(curr));
+       diversifyRankedCandidates(
+           next_points,
+           kDiversifiedPrefixCount,
+           kDiversifiedRankPower,
+           diversify_seed
+       );
 
 
        std::size_t branch_limit = state.depth == 0 ? std::min<std::size_t>(next_points.size(), 480) : next_points.size();
@@ -1926,8 +1985,12 @@ std::vector<std::vector<GridPoint>> findAllExactSegmentPathsToAnyGoal(
        }
        return a.boundary_start.z < b.boundary_start.z;
    });
-
-
+   diversifyRankedCandidates(
+       first_candidates,
+       kDiversifiedPrefixCount,
+       kDiversifiedRankPower,
+       (uniform_heuristic ? 0xC0FFEE11U : 0xBAD5EEDU) ^ heuristic_seed_salt ^ kShuffleSeed
+   );
    std::size_t branch_limit = std::min<std::size_t>(first_candidates.size(), 480);
    Grid3D dfs_grid = grid;
    if (start_pad != nullptr) {
