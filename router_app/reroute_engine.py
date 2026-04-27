@@ -94,6 +94,7 @@ def _run_single_dijkstra_reroute_test(
     request.min_x, request.min_y, request.max_x, request.max_y = _board_bounds(board)
     request.min_trace_width = _min_trace_width(board)
     request.min_clearance = _min_clearance(board)
+    request.generated_via_diameter = _generated_via_diameter(board, ordered_ripped_net_ids[0])
     request.grid_steps_per_mm = grid_steps_per_mm
 
     track_items = []
@@ -205,3 +206,33 @@ def _clearance_for_net(board: BoardData, net_id: int) -> float:
     if board.net_clearances and net_id in board.net_clearances:
         return board.net_clearances[net_id]
     return _min_clearance(board)
+
+
+def _generated_via_diameter(board: BoardData, net_id: int) -> float:
+    trace_width = _trace_width_for_net(board, net_id)
+    if board.design_rules and board.design_rules.get("via_diameter"):
+        return max(float(board.design_rules["via_diameter"]), trace_width)
+
+    net_diameters = [via.diameter for via in board.vias if via.net_id == net_id and via.diameter > 0]
+    if net_diameters:
+        counts: dict[float, int] = {}
+        for diameter in net_diameters:
+            counts[diameter] = counts.get(diameter, 0) + 1
+        chosen_via_diameter = max(counts.items(), key=lambda item: (item[1], item[0]))[0]
+        return max(chosen_via_diameter, trace_width)
+
+    diameters = [via.diameter for via in board.vias if via.diameter > 0]
+    if diameters:
+        counts: dict[float, int] = {}
+        for diameter in diameters:
+            counts[diameter] = counts.get(diameter, 0) + 1
+        chosen_via_diameter = max(counts.items(), key=lambda item: (item[1], item[0]))[0]
+        return max(chosen_via_diameter, trace_width)
+    return max(0.6, trace_width)
+
+
+def _trace_width_for_net(board: BoardData, net_id: int) -> float:
+    widths = [track.width for track in board.tracks if track.net_id == net_id and track.width > 0]
+    if widths:
+        return max(widths)
+    return _min_trace_width(board)

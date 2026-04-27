@@ -736,8 +736,26 @@ bool isViaClear(
    int y,
    int z1,
    int z2,
-   const std::unordered_set<std::size_t>& goal_indices
+   const std::unordered_set<std::size_t>& goal_indices,
+   const std::vector<PadGeometry>* pads,
+   double via_diameter
 ) {
+   if (pads != nullptr && via_diameter > 0.0) {
+       Point2D via_center = grid.gridToPhysical({x, y, z1});
+       double via_radius = via_diameter * 0.5;
+       int step = z2 > z1 ? 1 : -1;
+       for (int z = z1; z != z2 + step; z += step) {
+           const std::string& layer = grid.layers()[z];
+           for (const auto& pad : *pads) {
+               if (!layerMatchesPad(pad, layer)) {
+                   continue;
+               }
+               if (pointInsidePad(pad, via_center, via_radius)) {
+                   return false;
+               }
+           }
+       }
+   }
    int step = z2 > z1 ? 1 : -1;
    for (int z = z1; z != z2 + step; z += step) {
        GridPoint point{x, y, z};
@@ -858,7 +876,9 @@ int minimumSegmentCountToAnyGoal(
    const Grid3D& grid,
    const GridPoint& start,
    const std::vector<GridPoint>& goal_vertices,
-   const PadGeometry* goal_pad
+   const PadGeometry* goal_pad,
+   const std::vector<PadGeometry>* pads,
+   double via_diameter
 ) {
    if (!grid.inBounds(start) || goal_vertices.empty()) {
        return -1;
@@ -960,7 +980,7 @@ int minimumSegmentCountToAnyGoal(
                if (!isLineOfSightClear(grid, current.x, current.y, current.z, next.x, next.y, goal_indices)) {
                    continue;
                }
-           } else if (!isViaClear(grid, current.x, current.y, current.z, next.z, goal_indices)) {
+           } else if (!isViaClear(grid, current.x, current.y, current.z, next.z, goal_indices, pads, via_diameter)) {
                continue;
            }
 
@@ -1005,6 +1025,8 @@ std::vector<GridPoint> castRays360(
    const Grid3D& grid,
    const GridPoint& origin,
    const std::unordered_set<std::size_t>& goal_indices,
+   const std::vector<PadGeometry>* pads,
+   double via_diameter,
    int prev_dx = 0,
    int prev_dy = 0,
    int prev_dz = 0
@@ -1035,7 +1057,7 @@ std::vector<GridPoint> castRays360(
        }
        int dz = target_z - origin.z;
        if (isAngleValid(prev_dx, prev_dy, prev_dz, 0, 0, dz)
-           && isViaClear(grid, origin.x, origin.y, origin.z, target_z, goal_indices)) {
+           && isViaClear(grid, origin.x, origin.y, origin.z, target_z, goal_indices, pads, via_diameter)) {
            candidates.push_back({origin.x, origin.y, target_z});
        }
    }
@@ -1281,7 +1303,9 @@ bool canShortcutPathRange(
    const std::vector<GridPoint>& path,
    std::size_t keep_start_index,
    std::size_t keep_end_index,
-   const std::unordered_set<std::size_t>& goal_indices
+   const std::unordered_set<std::size_t>& goal_indices,
+   const std::vector<PadGeometry>* pads,
+   double via_diameter
 ) {
    if (keep_start_index + 1 >= keep_end_index || keep_end_index >= path.size()) {
        return false;
@@ -1308,7 +1332,7 @@ bool canShortcutPathRange(
    }
 
    if (to.z != from.z) {
-       if (!isViaClear(grid, from.x, from.y, from.z, to.z, goal_indices)) {
+       if (!isViaClear(grid, from.x, from.y, from.z, to.z, goal_indices, pads, via_diameter)) {
            return false;
        }
    } else if (!isLineOfSightClear(grid, from.x, from.y, from.z, to.x, to.y, goal_indices)) {
@@ -1324,7 +1348,9 @@ bool canShortcutPathRange(
 std::vector<GridPoint> simplifyCandidatePath(
    const Grid3D& grid,
    std::vector<GridPoint> path,
-   const std::unordered_set<std::size_t>& goal_indices
+   const std::unordered_set<std::size_t>& goal_indices,
+   const std::vector<PadGeometry>* pads,
+   double via_diameter
 ) {
    if (path.size() <= 2) {
        return path;
@@ -1335,7 +1361,7 @@ std::vector<GridPoint> simplifyCandidatePath(
        changed = false;
        for (std::size_t start_index = 0; start_index + 2 < path.size() && !changed; ++start_index) {
            for (std::size_t end_index = path.size() - 1; end_index >= start_index + 2; --end_index) {
-               if (!canShortcutPathRange(grid, path, start_index, end_index, goal_indices)) {
+               if (!canShortcutPathRange(grid, path, start_index, end_index, goal_indices, pads, via_diameter)) {
                    if (end_index == start_index + 2) {
                        break;
                    }
@@ -1533,6 +1559,8 @@ std::vector<std::vector<GridPoint>> dfsRangeSegmentPathsToAnyGoal(
    const GridPoint& initial_curr,
    const std::vector<GridPoint>& goal_vertices,
    const PadGeometry* goal_pad,
+   const std::vector<PadGeometry>* pads,
+   double via_diameter,
    const std::unordered_set<std::size_t>& goal_indices,
    int initial_depth,
    std::vector<GridPoint> initial_path,
@@ -1724,7 +1752,7 @@ std::vector<std::vector<GridPoint>> dfsRangeSegmentPathsToAnyGoal(
        }
 
 
-       auto next_points = castRays360(grid, curr, goal_indices, prev_dx, prev_dy, prev_dz);
+       auto next_points = castRays360(grid, curr, goal_indices, pads, via_diameter, prev_dx, prev_dy, prev_dz);
        auto score = [&](const GridPoint& p) {
            double base = std::numeric_limits<double>::infinity();
            for (int target : score_targets) {
@@ -1850,6 +1878,8 @@ std::vector<std::vector<GridPoint>> findAllExactSegmentPathsToAnyGoal(
    const PadGeometry* start_pad,
    const std::vector<GridPoint>& goal_vertices,
    const PadGeometry* goal_pad,
+   const std::vector<PadGeometry>* pads,
+   double via_diameter,
    int min_target_segments,
    int max_target_segments,
    int dynamic_step_limit,
@@ -1877,7 +1907,7 @@ std::vector<std::vector<GridPoint>> findAllExactSegmentPathsToAnyGoal(
        boundary_seeds = startPadBoundarySeeds(grid, start, *start_pad);
        first_candidates = castRaysFromBoundarySeeds(grid, boundary_seeds, goal_indices);
    } else {
-       auto first_points = castRays360(grid, start, goal_indices, 0, 0, 0);
+       auto first_points = castRays360(grid, start, goal_indices, pads, via_diameter, 0, 0, 0);
        first_candidates.reserve(first_points.size());
        for (const auto& point : first_points) {
            first_candidates.push_back({start, point});
@@ -2016,6 +2046,8 @@ std::vector<std::vector<GridPoint>> findAllExactSegmentPathsToAnyGoal(
                candidate.next,
                goal_vertices,
                goal_pad,
+               pads,
+               via_diameter,
                goal_indices,
                1,
                {candidate.boundary_start, candidate.next},
@@ -2076,6 +2108,8 @@ std::vector<std::vector<GridPoint>> generateCandidatePaths(
    const PadGeometry* start_pad,
    const std::vector<GridPoint>& goals,
    const PadGeometry* goal_pad,
+   const std::vector<PadGeometry>* pads,
+   double via_diameter,
    std::size_t max_results,
    int max_candidate_segments,
    bool backward_search = false
@@ -2104,7 +2138,7 @@ std::vector<std::vector<GridPoint>> generateCandidatePaths(
    std::cout << "  dynamic_step_limit " << dynamic_step_limit << std::endl;
 
 
-   int minimum_segments = minimumSegmentCountToAnyGoal(grid, start, goals, goal_pad);
+   int minimum_segments = minimumSegmentCountToAnyGoal(grid, start, goals, goal_pad, pads, via_diameter);
    if (minimum_segments < 0) {
        std::cout << "  minimum_segment_presearch found no reachable grid path" << std::endl;
        return {};
@@ -2147,6 +2181,8 @@ std::vector<std::vector<GridPoint>> generateCandidatePaths(
                start_pad,
                goals,
                goal_pad,
+               pads,
+               via_diameter,
                std::max(1, minimum_segments),
                max_candidate_segments,
                dynamic_step_limit,
@@ -2162,6 +2198,8 @@ std::vector<std::vector<GridPoint>> generateCandidatePaths(
                start_pad,
                goals,
                goal_pad,
+               pads,
+               via_diameter,
                std::max(1, minimum_segments),
                max_candidate_segments,
                dynamic_step_limit,
@@ -2195,7 +2233,7 @@ std::vector<std::vector<GridPoint>> generateCandidatePaths(
        for (auto& path : paths) {
            std::size_t before_vertices = path.size();
            std::size_t before_segments = before_vertices > 1 ? before_vertices - 1 : 0;
-           auto simplified = simplifyCandidatePath(grid, std::move(path), simplify_goal_indices);
+           auto simplified = simplifyCandidatePath(grid, std::move(path), simplify_goal_indices, pads, via_diameter);
            std::size_t after_vertices = simplified.size();
            std::size_t after_segments = after_vertices > 1 ? after_vertices - 1 : 0;
            if (after_vertices < before_vertices) {
@@ -2519,6 +2557,8 @@ RouteResult runDijkstraTest(const RouteRequest& request) {
            pad_terminal_groups[0].pad,
            result.goal_vertices,
            pad_terminal_groups[1].pad,
+           &request.pads,
+           request.generated_via_diameter,
            100,
            max_candidate_segments
        );
@@ -2538,6 +2578,8 @@ RouteResult runDijkstraTest(const RouteRequest& request) {
            pad_terminal_groups[1].pad,
            pad_terminal_groups[0].goal_vertices,
            pad_terminal_groups[0].pad,
+           &request.pads,
+           request.generated_via_diameter,
            100,
            max_candidate_segments,
            true

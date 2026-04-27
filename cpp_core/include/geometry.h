@@ -59,6 +59,7 @@ struct RouteRequest {
     double max_y = 0.0;
     double min_trace_width = 0.2;
     double min_clearance = 0.2;
+    double generated_via_diameter = 0.6;
     double grid_steps_per_mm = 10.0;
 };
 

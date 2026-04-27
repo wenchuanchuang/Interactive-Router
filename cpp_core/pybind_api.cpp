@@ -62,6 +62,7 @@ PYBIND11_MODULE(router_core, m) {
         .def_readwrite("max_y", &RouteRequest::max_y)
         .def_readwrite("min_trace_width", &RouteRequest::min_trace_width)
         .def_readwrite("min_clearance", &RouteRequest::min_clearance)
+        .def_readwrite("generated_via_diameter", &RouteRequest::generated_via_diameter)
         .def_readwrite("grid_steps_per_mm", &RouteRequest::grid_steps_per_mm);
 
     py::class_<RouteResult>(m, "RouteResult")
