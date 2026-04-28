@@ -387,20 +387,20 @@ class RoutePreviewCanvas(QGraphicsView):
 
         ripped_net_ids = ripped_net_ids or set()
         scale = 22.0
-        all_points = [point for _, _, points in route_paths for point in points]
+        all_points = [point for _, _, points, _ in route_paths for point in points]
         min_x, min_y = _preview_origin(all_points, board)
 
         if board is not None:
             self._draw_preview_board(board, ripped_net_ids, scale, min_x, min_y)
 
         halo_pen = QPen(QColor("#111318"), 9.0, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
-        for route_result, candidate_index, points in route_paths:
+        for route_result, candidate_index, points, path_grid in route_paths:
             candidate_alpha = 255 if candidate_index == 0 else 120
             for index, (start, end) in enumerate(zip(points, points[1:])):
                 x1, y1 = _preview_point(start, scale, min_x, min_y)
                 x2, y2 = _preview_point(end, scale, min_x, min_y)
                 self._scene.addLine(x1, y1, x2, y2, halo_pen).setZValue(40)
-                layer = _route_layer_for_segment(route_result, board, index)
+                layer = _route_layer_for_segment(route_result, board, path_grid, index)
                 route_color = _layer_highlight_color(layer)
                 route_color.setAlpha(candidate_alpha)
                 route_pen = QPen(
@@ -411,7 +411,7 @@ class RoutePreviewCanvas(QGraphicsView):
                     Qt.RoundJoin,
                 )
                 self._scene.addLine(x1, y1, x2, y2, route_pen).setZValue(_layer_z_value(layer) + 41)
-                if _route_changes_layer(route_result, index):
+                if _route_changes_layer(path_grid, index):
                     self._draw_route_layer_change_marker(x2, y2, layer)
 
         net_ids = ", ".join(str(int(getattr(result, "net_id", 0))) for result in route_results)
@@ -614,25 +614,27 @@ def _rotated_pad_bounds(pad: Pad) -> tuple[float, float, float, float]:
     return (x - extent_x, y - extent_y, x + extent_x, y + extent_y)
 
 
-def _preview_route_paths(route_results) -> list[tuple[object, int, list[object]]]:
-    route_paths: list[tuple[object, int, list[object]]] = []
+def _preview_route_paths(route_results) -> list[tuple[object, int, list[object], list[object]]]:
+    route_paths: list[tuple[object, int, list[object], list[object]]] = []
     for route_result in route_results:
         candidate_paths = list(getattr(route_result, "candidate_paths_mm", []))
+        candidate_paths_grid = list(getattr(route_result, "candidate_paths_grid", []))
         if candidate_paths:
             for index, path in enumerate(candidate_paths):
                 points = list(path)
                 if len(points) >= 2:
-                    route_paths.append((route_result, index, points))
+                    grid_path = list(candidate_paths_grid[index]) if index < len(candidate_paths_grid) else []
+                    route_paths.append((route_result, index, points, grid_path))
         else:
             points = list(getattr(route_result, "path_mm", []))
             if len(points) >= 2:
-                route_paths.append((route_result, 0, points))
+                grid_path = list(getattr(route_result, "path_grid", []))
+                route_paths.append((route_result, 0, points, grid_path))
     return route_paths
 
 
-def _route_layer_for_segment(route_result: object, board: BoardData | None, index: int) -> str:
+def _route_layer_for_segment(route_result: object, board: BoardData | None, path_grid: list[object], index: int) -> str:
     layers = board.copper_layers if board is not None else []
-    path_grid = list(getattr(route_result, "path_grid", []))
     if layers and index < len(path_grid):
         z = int(getattr(path_grid[index], "z", 0))
         if 0 <= z < len(layers):
@@ -646,8 +648,7 @@ def _route_layer_for_segment(route_result: object, board: BoardData | None, inde
     return "F.Cu"
 
 
-def _route_changes_layer(route_result: object, index: int) -> bool:
-    path_grid = list(getattr(route_result, "path_grid", []))
+def _route_changes_layer(path_grid: list[object], index: int) -> bool:
     if index + 1 >= len(path_grid):
         return False
     return int(getattr(path_grid[index], "z", 0)) != int(getattr(path_grid[index + 1], "z", 0))
