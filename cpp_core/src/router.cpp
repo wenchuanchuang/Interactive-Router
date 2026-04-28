@@ -731,21 +731,20 @@ int directionIndexForDelta(int dx, int dy, int dz) {
 
 
 bool isViaClear(
-   const Grid3D& grid,
+   const Grid3D& via_grid,
    int x,
    int y,
    int z1,
    int z2,
-   const std::unordered_set<std::size_t>& goal_indices,
    const std::vector<PadGeometry>* pads,
    double via_diameter
 ) {
    if (pads != nullptr && via_diameter > 0.0) {
-       Point2D via_center = grid.gridToPhysical({x, y, z1});
+       Point2D via_center = via_grid.gridToPhysical({x, y, z1});
        double via_radius = via_diameter * 0.5;
        int step = z2 > z1 ? 1 : -1;
        for (int z = z1; z != z2 + step; z += step) {
-           const std::string& layer = grid.layers()[z];
+           const std::string& layer = via_grid.layers()[z];
            for (const auto& pad : *pads) {
                if (!layerMatchesPad(pad, layer)) {
                    continue;
@@ -759,7 +758,7 @@ bool isViaClear(
    int step = z2 > z1 ? 1 : -1;
    for (int z = z1; z != z2 + step; z += step) {
        GridPoint point{x, y, z};
-       if (isObstacleForPath(grid, point, goal_indices)) {
+        if (!via_grid.inBounds(point) || via_grid.isBlocked(point)) {
            return false;
        }
    }
@@ -873,28 +872,29 @@ bool isLineOfSightClear(
 
 
 int minimumSegmentCountToAnyGoal(
-   const Grid3D& grid,
+   const Grid3D& trace_grid,
+   const Grid3D& via_grid,
    const GridPoint& start,
    const std::vector<GridPoint>& goal_vertices,
    const PadGeometry* goal_pad,
    const std::vector<PadGeometry>* pads,
    double via_diameter
 ) {
-   if (!grid.inBounds(start) || goal_vertices.empty()) {
+   if (!trace_grid.inBounds(start) || goal_vertices.empty()) {
        return -1;
    }
 
 
    std::unordered_set<std::size_t> goal_indices;
    for (const auto& goal : goal_vertices) {
-       if (grid.inBounds(goal)) {
-           goal_indices.insert(grid.flatten(goal));
+       if (trace_grid.inBounds(goal)) {
+           goal_indices.insert(trace_grid.flatten(goal));
        }
    }
    if (goal_indices.empty()) {
        return -1;
    }
-   if (isGoalPoint(grid, start, goal_indices)) {
+   if (isGoalPoint(trace_grid, start, goal_indices)) {
        return 0;
    }
 
@@ -905,11 +905,11 @@ int minimumSegmentCountToAnyGoal(
 
 
    auto stateIndex = [&](const GridPoint& point, int dir_index) {
-       return grid.flatten(point) * kDirectionStates + static_cast<std::size_t>(dir_index);
+       return trace_grid.flatten(point) * kDirectionStates + static_cast<std::size_t>(dir_index);
    };
 
 
-   std::size_t grid_size = static_cast<std::size_t>(grid.nx()) * grid.ny() * grid.nz();
+   std::size_t grid_size = static_cast<std::size_t>(trace_grid.nx()) * trace_grid.ny() * trace_grid.nz();
    std::vector<int> dist(grid_size * kDirectionStates, kInfSegments);
    std::deque<std::pair<GridPoint, int>> queue;
    int best_goal_segments = kInfSegments;
@@ -926,7 +926,7 @@ int minimumSegmentCountToAnyGoal(
        int current_segments = dist[stateIndex(current, prev_dir_index)];
 
 
-       if (isGoalPoint(grid, current, goal_indices)) {
+       if (isGoalPoint(trace_grid, current, goal_indices)) {
            best_goal_segments = std::min(best_goal_segments, current_segments);
            continue;
        }
@@ -946,10 +946,10 @@ int minimumSegmentCountToAnyGoal(
 
 
        for (const auto& goal : goal_vertices) {
-           if (!isValidFinalMove(grid, current, goal, goal_pad, prev_dx, prev_dy, prev_dz)) {
+           if (!isValidFinalMove(trace_grid, current, goal, goal_pad, prev_dx, prev_dy, prev_dz)) {
                continue;
            }
-           if (!isClearFinalMove(grid, current, goal, goal_indices)) {
+           if (!isClearFinalMove(trace_grid, current, goal, goal_indices)) {
                continue;
            }
 
@@ -973,14 +973,14 @@ int minimumSegmentCountToAnyGoal(
 
        for (const auto& delta : kDijkstraDeltas) {
            GridPoint next{current.x + delta[0], current.y + delta[1], current.z + delta[2]};
-           if (isObstacleForPath(grid, next, goal_indices)) {
+           if (isObstacleForPath(trace_grid, next, goal_indices)) {
                continue;
            }
            if (delta[2] == 0) {
-               if (!isLineOfSightClear(grid, current.x, current.y, current.z, next.x, next.y, goal_indices)) {
+               if (!isLineOfSightClear(trace_grid, current.x, current.y, current.z, next.x, next.y, goal_indices)) {
                    continue;
                }
-           } else if (!isViaClear(grid, current.x, current.y, current.z, next.z, goal_indices, pads, via_diameter)) {
+           } else if (!isViaClear(via_grid, current.x, current.y, current.z, next.z, pads, via_diameter)) {
                continue;
            }
 
@@ -1022,7 +1022,8 @@ int minimumSegmentCountToAnyGoal(
 
 
 std::vector<GridPoint> castRays360(
-   const Grid3D& grid,
+   const Grid3D& trace_grid,
+   const Grid3D& via_grid,
    const GridPoint& origin,
    const std::unordered_set<std::size_t>& goal_indices,
    const std::vector<PadGeometry>* pads,
@@ -1040,8 +1041,8 @@ std::vector<GridPoint> castRays360(
        }
        int curr_x = origin.x + dx;
        int curr_y = origin.y + dy;
-       while (grid.inBounds({curr_x, curr_y, origin.z})) {
-           if (!isLineOfSightClear(grid, origin.x, origin.y, origin.z, curr_x, curr_y, goal_indices)) {
+       while (trace_grid.inBounds({curr_x, curr_y, origin.z})) {
+           if (!isLineOfSightClear(trace_grid, origin.x, origin.y, origin.z, curr_x, curr_y, goal_indices)) {
                break;
            }
            candidates.push_back({curr_x, curr_y, origin.z});
@@ -1051,13 +1052,13 @@ std::vector<GridPoint> castRays360(
    }
 
 
-   for (int target_z = 0; target_z < grid.nz(); ++target_z) {
+   for (int target_z = 0; target_z < trace_grid.nz(); ++target_z) {
        if (target_z == origin.z) {
            continue;
        }
        int dz = target_z - origin.z;
        if (isAngleValid(prev_dx, prev_dy, prev_dz, 0, 0, dz)
-           && isViaClear(grid, origin.x, origin.y, origin.z, target_z, goal_indices, pads, via_diameter)) {
+           && isViaClear(via_grid, origin.x, origin.y, origin.z, target_z, pads, via_diameter)) {
            candidates.push_back({origin.x, origin.y, target_z});
        }
    }
@@ -1150,7 +1151,6 @@ bool segmentIntersectsPath(const std::vector<GridPoint>& path, const GridPoint& 
    }
    return false;
 }
-
 
 std::vector<GridPoint> sortedGoalVertices(const std::vector<GridPoint>& goals, const GridPoint& curr) {
    std::vector<GridPoint> sorted = goals;
@@ -1299,7 +1299,8 @@ bool shortcutSegmentIntersectsPath(
 }
 
 bool canShortcutPathRange(
-   const Grid3D& grid,
+   const Grid3D& trace_grid,
+   const Grid3D& via_grid,
    const std::vector<GridPoint>& path,
    std::size_t keep_start_index,
    std::size_t keep_end_index,
@@ -1332,10 +1333,10 @@ bool canShortcutPathRange(
    }
 
    if (to.z != from.z) {
-       if (!isViaClear(grid, from.x, from.y, from.z, to.z, goal_indices, pads, via_diameter)) {
+       if (!isViaClear(via_grid, from.x, from.y, from.z, to.z, pads, via_diameter)) {
            return false;
        }
-   } else if (!isLineOfSightClear(grid, from.x, from.y, from.z, to.x, to.y, goal_indices)) {
+   } else if (!isLineOfSightClear(trace_grid, from.x, from.y, from.z, to.x, to.y, goal_indices)) {
        return false;
    }
 
@@ -1346,7 +1347,8 @@ bool canShortcutPathRange(
 }
 
 std::vector<GridPoint> simplifyCandidatePath(
-   const Grid3D& grid,
+   const Grid3D& trace_grid,
+   const Grid3D& via_grid,
    std::vector<GridPoint> path,
    const std::unordered_set<std::size_t>& goal_indices,
    const std::vector<PadGeometry>* pads,
@@ -1361,7 +1363,7 @@ std::vector<GridPoint> simplifyCandidatePath(
        changed = false;
        for (std::size_t start_index = 0; start_index + 2 < path.size() && !changed; ++start_index) {
            for (std::size_t end_index = path.size() - 1; end_index >= start_index + 2; --end_index) {
-               if (!canShortcutPathRange(grid, path, start_index, end_index, goal_indices, pads, via_diameter)) {
+               if (!canShortcutPathRange(trace_grid, via_grid, path, start_index, end_index, goal_indices, pads, via_diameter)) {
                    if (end_index == start_index + 2) {
                        break;
                    }
@@ -1555,7 +1557,8 @@ bool pathAlreadyCollected(
 
 
 std::vector<std::vector<GridPoint>> dfsRangeSegmentPathsToAnyGoal(
-   const Grid3D& grid,
+   const Grid3D& trace_grid,
+   const Grid3D& via_grid,
    const GridPoint& initial_curr,
    const std::vector<GridPoint>& goal_vertices,
    const PadGeometry* goal_pad,
@@ -1636,10 +1639,10 @@ std::vector<std::vector<GridPoint>> dfsRangeSegmentPathsToAnyGoal(
            std::size_t bucket_index = static_cast<std::size_t>(completed_segments - min_target_segments);
            if (buckets[bucket_index].found_count < max_results) {
                for (const auto& goal : sortedGoalVertices(goal_vertices, curr)) {
-                   if (!isValidFinalMove(grid, curr, goal, goal_pad, prev_dx, prev_dy, prev_dz)) {
+                   if (!isValidFinalMove(trace_grid, curr, goal, goal_pad, prev_dx, prev_dy, prev_dz)) {
                        continue;
                    }
-                   if (!isClearFinalMove(grid, curr, goal, goal_indices)) {
+                   if (!isClearFinalMove(trace_grid, curr, goal, goal_indices)) {
                        continue;
                    }
                    if (segmentIntersectsPath(path, curr, goal)) {
@@ -1752,7 +1755,7 @@ std::vector<std::vector<GridPoint>> dfsRangeSegmentPathsToAnyGoal(
        }
 
 
-       auto next_points = castRays360(grid, curr, goal_indices, pads, via_diameter, prev_dx, prev_dy, prev_dz);
+       auto next_points = castRays360(trace_grid, via_grid, curr, goal_indices, pads, via_diameter, prev_dx, prev_dy, prev_dz);
        auto score = [&](const GridPoint& p) {
            double base = std::numeric_limits<double>::infinity();
            for (int target : score_targets) {
@@ -1817,7 +1820,7 @@ std::vector<std::vector<GridPoint>> dfsRangeSegmentPathsToAnyGoal(
        unsigned int diversify_seed = heuristic_seed_salt
            ^ static_cast<unsigned int>((state.depth + 1) * 2246822519U)
            ^ (uniform_heuristic ? 0xA511E9B3U : 0x63D83595U)
-           ^ static_cast<unsigned int>(grid.flatten(curr));
+           ^ static_cast<unsigned int>(trace_grid.flatten(curr));
        diversifyRankedCandidates(
            next_points,
            kDiversifiedPrefixCount,
@@ -1829,7 +1832,7 @@ std::vector<std::vector<GridPoint>> dfsRangeSegmentPathsToAnyGoal(
        std::size_t branch_limit = state.depth == 0 ? std::min<std::size_t>(next_points.size(), 480) : next_points.size();
        for (std::size_t i = 0; i < branch_limit; ++i) {
            const auto& next = next_points[i];
-           if (isGoalPoint(grid, next, goal_indices) || pointInPath(path, next)) {
+           if (isGoalPoint(trace_grid, next, goal_indices) || pointInPath(path, next)) {
                continue;
            }
 
@@ -1873,7 +1876,8 @@ std::vector<std::vector<GridPoint>> dfsRangeSegmentPathsToAnyGoal(
 
 
 std::vector<std::vector<GridPoint>> findAllExactSegmentPathsToAnyGoal(
-   const Grid3D& grid,
+   const Grid3D& trace_grid,
+   const Grid3D& via_grid,
    const GridPoint& start,
    const PadGeometry* start_pad,
    const std::vector<GridPoint>& goal_vertices,
@@ -1894,8 +1898,8 @@ std::vector<std::vector<GridPoint>> findAllExactSegmentPathsToAnyGoal(
 
    std::unordered_set<std::size_t> goal_indices;
    for (const auto& goal : goal_vertices) {
-       if (grid.inBounds(goal)) {
-           goal_indices.insert(grid.flatten(goal));
+       if (trace_grid.inBounds(goal)) {
+           goal_indices.insert(trace_grid.flatten(goal));
        }
    }
 
@@ -1904,10 +1908,10 @@ std::vector<std::vector<GridPoint>> findAllExactSegmentPathsToAnyGoal(
    std::vector<BoundarySeed> boundary_seeds;
    std::vector<FirstRayCandidate> first_candidates;
    if (start_pad != nullptr) {
-       boundary_seeds = startPadBoundarySeeds(grid, start, *start_pad);
-       first_candidates = castRaysFromBoundarySeeds(grid, boundary_seeds, goal_indices);
+       boundary_seeds = startPadBoundarySeeds(trace_grid, start, *start_pad);
+       first_candidates = castRaysFromBoundarySeeds(trace_grid, boundary_seeds, goal_indices);
    } else {
-       auto first_points = castRays360(grid, start, goal_indices, pads, via_diameter, 0, 0, 0);
+       auto first_points = castRays360(trace_grid, via_grid, start, goal_indices, pads, via_diameter, 0, 0, 0);
        first_candidates.reserve(first_points.size());
        for (const auto& point : first_points) {
            first_candidates.push_back({start, point});
@@ -1926,8 +1930,8 @@ std::vector<std::vector<GridPoint>> findAllExactSegmentPathsToAnyGoal(
        }
        for (const auto& direct_start : direct_starts) {
            for (const auto& goal : sortedGoalVertices(goal_vertices, direct_start)) {
-               if (isValidFinalMove(grid, direct_start, goal, goal_pad, 0, 0, 0)
-                   && isClearFinalMove(grid, direct_start, goal, goal_indices)) {
+               if (isValidFinalMove(trace_grid, direct_start, goal, goal_pad, 0, 0, 0)
+                   && isClearFinalMove(trace_grid, direct_start, goal, goal_indices)) {
                    paths.push_back({direct_start, goal});
                    if (paths.size() >= max_results) {
                        break;
@@ -2022,7 +2026,7 @@ std::vector<std::vector<GridPoint>> findAllExactSegmentPathsToAnyGoal(
        (uniform_heuristic ? 0xC0FFEE11U : 0xBAD5EEDU) ^ heuristic_seed_salt ^ kShuffleSeed
    );
    std::size_t branch_limit = std::min<std::size_t>(first_candidates.size(), 480);
-   Grid3D dfs_grid = grid;
+   Grid3D dfs_grid = trace_grid;
    if (start_pad != nullptr) {
        std::vector<GridPoint> allowed_points;
        allowed_points.reserve(boundary_seeds.size());
@@ -2036,13 +2040,14 @@ std::vector<std::vector<GridPoint>> findAllExactSegmentPathsToAnyGoal(
    for (std::size_t i = 0; i < branch_limit; ++i) {
        const auto candidate = first_candidates[i];
        GridPoint next = candidate.next;
-       if (isGoalPoint(grid, next, goal_indices)) {
+       if (isGoalPoint(trace_grid, next, goal_indices)) {
            continue;
        }
        bool debug_branch = i == 0;
        futures.push_back(std::async(std::launch::async, [&, candidate, debug_branch]() {
            return dfsRangeSegmentPathsToAnyGoal(
                dfs_grid,
+               via_grid,
                candidate.next,
                goal_vertices,
                goal_pad,
@@ -2103,7 +2108,8 @@ void printSegmentPathHistogram(const std::vector<std::vector<GridPoint>>& paths,
 
 
 std::vector<std::vector<GridPoint>> generateCandidatePaths(
-   const Grid3D& grid,
+   const Grid3D& trace_grid,
+   const Grid3D& via_grid,
    const GridPoint& start,
    const PadGeometry* start_pad,
    const std::vector<GridPoint>& goals,
@@ -2119,7 +2125,7 @@ std::vector<std::vector<GridPoint>> generateCandidatePaths(
    for (const auto& goal : goals) {
        nearest = std::min(nearest, std::abs(goal.x - start.x) + std::abs(goal.y - start.y) + std::abs(goal.z - start.z));
    }
-   double real_dist = dijkstraShortestDistanceToAnyGoal(grid, start, goals);
+   double real_dist = dijkstraShortestDistanceToAnyGoal(trace_grid, start, goals);
    int dynamic_step_limit = 0;
    if (real_dist < 0.0) {
        dynamic_step_limit = kBaseStepLimit + (nearest == std::numeric_limits<int>::max() ? 0 : nearest * 60);
@@ -2138,7 +2144,7 @@ std::vector<std::vector<GridPoint>> generateCandidatePaths(
    std::cout << "  dynamic_step_limit " << dynamic_step_limit << std::endl;
 
 
-   int minimum_segments = minimumSegmentCountToAnyGoal(grid, start, goals, goal_pad, pads, via_diameter);
+   int minimum_segments = minimumSegmentCountToAnyGoal(trace_grid, via_grid, start, goals, goal_pad, pads, via_diameter);
    if (minimum_segments < 0) {
        std::cout << "  minimum_segment_presearch found no reachable grid path" << std::endl;
        return {};
@@ -2176,7 +2182,8 @@ std::vector<std::vector<GridPoint>> generateCandidatePaths(
        std::vector<std::vector<GridPoint>> greedy_round;
        if (run_uniform) {
            uniform_round = findAllExactSegmentPathsToAnyGoal(
-               grid,
+               trace_grid,
+               via_grid,
                start,
                start_pad,
                goals,
@@ -2193,7 +2200,8 @@ std::vector<std::vector<GridPoint>> generateCandidatePaths(
        }
        if (run_greedy) {
            greedy_round = findAllExactSegmentPathsToAnyGoal(
-               grid,
+               trace_grid,
+               via_grid,
                start,
                start_pad,
                goals,
@@ -2218,8 +2226,8 @@ std::vector<std::vector<GridPoint>> generateCandidatePaths(
 
    std::unordered_set<std::size_t> simplify_goal_indices;
    for (const auto& goal : goals) {
-       if (grid.inBounds(goal)) {
-           simplify_goal_indices.insert(grid.flatten(goal));
+       if (trace_grid.inBounds(goal)) {
+           simplify_goal_indices.insert(trace_grid.flatten(goal));
        }
    }
    bool debug_simplify = false;
@@ -2233,7 +2241,7 @@ std::vector<std::vector<GridPoint>> generateCandidatePaths(
        for (auto& path : paths) {
            std::size_t before_vertices = path.size();
            std::size_t before_segments = before_vertices > 1 ? before_vertices - 1 : 0;
-           auto simplified = simplifyCandidatePath(grid, std::move(path), simplify_goal_indices, pads, via_diameter);
+           auto simplified = simplifyCandidatePath(trace_grid, via_grid, std::move(path), simplify_goal_indices, pads, via_diameter);
            std::size_t after_vertices = simplified.size();
            std::size_t after_segments = after_vertices > 1 ? after_vertices - 1 : 0;
            if (after_vertices < before_vertices) {
@@ -2408,6 +2416,48 @@ Grid3D buildObstacleGridForNet(const RouteRequest& request, int net_id, double n
 }
 
 
+Grid3D buildViaObstacleGridForNet(const RouteRequest& request, int net_id, double via_diameter, double clearance) {
+   double grid_steps_per_mm = request.grid_steps_per_mm > 0.0 ? request.grid_steps_per_mm : kDefaultGridStepsPerMm;
+   double pitch = 1.0 / grid_steps_per_mm;
+   double via_radius = std::max(0.0, via_diameter * 0.5);
+   double margin = std::max(2.0 * pitch, via_radius + clearance + pitch);
+
+   Grid3D grid(
+       request.min_x - margin,
+       request.min_y - margin,
+       request.max_x + margin,
+       request.max_y + margin,
+       pitch,
+       request.layers
+   );
+   grid.markBoardBoundary();
+
+   for (const auto& track : request.tracks) {
+       if (track.net_id == net_id || containsNet(request.ripped_net_ids, track.net_id)) {
+           continue;
+       }
+       double track_clearance = std::max(clearance, track.clearance);
+       markTrack(grid, track, via_radius + track_clearance);
+   }
+
+   for (const auto& via : request.vias) {
+       if (via.net_id == net_id || containsNet(request.ripped_net_ids, via.net_id)) {
+           continue;
+       }
+       markVia(grid, via, via_radius + clearance);
+   }
+
+   for (const auto& pad : request.pads) {
+       if (pad.net_id == net_id) {
+           continue;
+       }
+       grid.markPad(pad, via_radius + clearance);
+   }
+
+   return grid;
+}
+
+
 std::vector<GridPoint> collectTerminalVertices(
    const Grid3D& grid,
    const RouteRequest& request,
@@ -2472,10 +2522,11 @@ RouteResult runDijkstraTest(const RouteRequest& request) {
    std::cout << "Rerouting net " << net_id << "..." << std::endl;
    double net_width = widthForNet(request, net_id);
    double clearance = clearanceForNet(request, net_id);
-   Grid3D grid = buildObstacleGridForNet(request, net_id, net_width, clearance);
+   Grid3D trace_grid = buildObstacleGridForNet(request, net_id, net_width, clearance);
+   Grid3D via_grid = buildViaObstacleGridForNet(request, net_id, request.generated_via_diameter, clearance);
    // 最大segment數 ： net原本的繞線的segment數＋ min(1+ board layer數, 5)
    int original_segment_count = originalRouteSegmentCount(request, net_id);
-   int segment_margin = std::min(1 + grid.nz(), 5);
+   int segment_margin = std::min(1 + trace_grid.nz(), 5);
    int max_candidate_segments = std::max(1, original_segment_count + segment_margin);
    std::cout << "  original_route_segments " << original_segment_count << std::endl;
    std::cout << "  segment_margin " << segment_margin << std::endl;
@@ -2483,12 +2534,12 @@ RouteResult runDijkstraTest(const RouteRequest& request) {
 
 
    result.net_id = net_id;
-   result.grid_pitch = grid.pitch();
-   result.origin_x = grid.origin_x();
-   result.origin_y = grid.origin_y();
-   result.nx = grid.nx();
-   result.ny = grid.ny();
-   result.nz = grid.nz();
+   result.grid_pitch = trace_grid.pitch();
+   result.origin_x = trace_grid.origin_x();
+   result.origin_y = trace_grid.origin_y();
+   result.nx = trace_grid.nx();
+   result.ny = trace_grid.ny();
+   result.nz = trace_grid.nz();
 
 
    struct PadTerminals {
@@ -2505,21 +2556,21 @@ RouteResult runDijkstraTest(const RouteRequest& request) {
        PadTerminals terminals;
        terminals.pad = &pad;
        //先決定這顆 pad 的 center 要取哪一層
-       int preferred_z = preferredPadStartLayer(request, pad, net_id, grid);
-       for (int z = 0; z < grid.nz(); ++z) {
-           if (!layerMatchesPad(pad, grid.layers()[z])) {
+       int preferred_z = preferredPadStartLayer(request, pad, net_id, trace_grid);
+       for (int z = 0; z < trace_grid.nz(); ++z) {
+           if (!layerMatchesPad(pad, trace_grid.layers()[z])) {
                continue;
            }
            //如果這一層是 preferred_z，就把 pad center 放進 start 用的 center_vertices
            if (z == preferred_z) {
-               auto center = grid.physicalToGrid(pad.center, z);
-               if (grid.inBounds(center)) {
+               auto center = trace_grid.physicalToGrid(pad.center, z);
+               if (trace_grid.inBounds(center)) {
                    terminals.center_vertices.push_back(center);
                }
            }
-           auto vertices = grid.verticesOnPadBoundary(pad, std::max(grid.pitch() * 0.25, net_width * 0.25), z);
+           auto vertices = trace_grid.verticesOnPadBoundary(pad, std::max(trace_grid.pitch() * 0.25, net_width * 0.25), z);
            for (const auto& vertex : vertices) {
-               if (!grid.isBlocked(vertex)) {
+               if (!trace_grid.isBlocked(vertex)) {
                    terminals.goal_vertices.push_back(vertex);
                }
            }
@@ -2540,11 +2591,10 @@ RouteResult runDijkstraTest(const RouteRequest& request) {
    result.start_vertices = pad_terminal_groups[0].center_vertices;
    result.goal_vertices = pad_terminal_groups[1].goal_vertices;
 
-
    std::vector<std::vector<GridPoint>> candidate_paths;
-   double pad_entry_bloat = std::max(grid.pitch() * 0.25, net_width * 0.25);
+   double pad_entry_bloat = std::max(trace_grid.pitch() * 0.25, net_width * 0.25);
    for (const auto& start : result.start_vertices) { // if center of start has multi layer
-       Grid3D search_grid = grid;
+       Grid3D search_grid = trace_grid;
        blockGoalPadInteriorExceptBoundary(
            search_grid,
            *pad_terminal_groups[1].pad,
@@ -2553,6 +2603,7 @@ RouteResult runDijkstraTest(const RouteRequest& request) {
        );
        auto paths = generateCandidatePaths(
            search_grid,
+           via_grid,
            start,
            pad_terminal_groups[0].pad,
            result.goal_vertices,
@@ -2565,7 +2616,7 @@ RouteResult runDijkstraTest(const RouteRequest& request) {
        candidate_paths.insert(candidate_paths.end(), paths.begin(), paths.end());
    }
    for (const auto& backward_start : pad_terminal_groups[1].center_vertices) {
-       Grid3D search_grid = grid;
+       Grid3D search_grid = trace_grid;
        blockGoalPadInteriorExceptBoundary(
            search_grid,
            *pad_terminal_groups[0].pad,
@@ -2574,6 +2625,7 @@ RouteResult runDijkstraTest(const RouteRequest& request) {
        );
        auto paths = generateCandidatePaths(
            search_grid,
+           via_grid,
            backward_start,
            pad_terminal_groups[1].pad,
            pad_terminal_groups[0].goal_vertices,
@@ -2625,7 +2677,7 @@ RouteResult runDijkstraTest(const RouteRequest& request) {
        std::vector<Point2D> physical_path;
        physical_path.reserve(path.size());
        for (const auto& point : path) {
-           physical_path.push_back(grid.gridToPhysical(point));
+           physical_path.push_back(trace_grid.gridToPhysical(point));
        }
        result.candidate_paths_mm.push_back(std::move(physical_path));
    }
