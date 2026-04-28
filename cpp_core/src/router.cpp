@@ -57,6 +57,14 @@ constexpr double kSegmentLengthPenaltyWeightGreedy = 0.15;
 constexpr double kIdealSegmentLengthFraction = 0.55;
 constexpr std::size_t kDiversifiedPrefixCount = 64;
 constexpr double kDiversifiedRankPower = 1.3;
+constexpr double kUniformEarlyPenaltyFloor = 0.2;
+constexpr double kUniformPenaltyRampStart = 0.15;
+constexpr double kUniformPenaltyRampSpan = 0.45;
+constexpr double kUniformEarlyViaPenaltyFloor = 0.4;
+constexpr double kUniformLayerGuideStart = 0.45;
+constexpr double kUniformLayerGuideSpan = 0.35;
+constexpr std::size_t kUniformLateBranchReserve = 24;
+constexpr double kPerSegmentRoleReserveFraction = 0.25;
 constexpr int kBaseStepLimit = 1000;
 constexpr int kDijkstraStepBase = 15000;
 constexpr unsigned int kRandomSeed = 88;
@@ -898,7 +906,6 @@ int minimumSegmentCountToAnyGoal(
        return 0;
    }
 
-
    constexpr int kNoDirection = 10;
    constexpr int kDirectionStates = 11;
    constexpr int kInfSegments = std::numeric_limits<int>::max() / 4;
@@ -1426,6 +1433,88 @@ void diversifyRankedCandidates(
    candidates = std::move(diversified);
 }
 
+template <typename Candidate>
+void injectLateCandidatesIntoPrefix(
+   std::vector<Candidate>& candidates,
+   std::size_t cutoff,
+   std::size_t reserve_count
+) {
+   if (cutoff == 0 || reserve_count == 0 || candidates.size() <= cutoff) {
+       return;
+   }
+   cutoff = std::min(cutoff, candidates.size());
+   reserve_count = std::min(reserve_count, cutoff);
+   std::size_t tail_count = candidates.size() - cutoff;
+   reserve_count = std::min(reserve_count, tail_count);
+   if (reserve_count == 0) {
+       return;
+   }
+
+   std::vector<std::size_t> late_indices;
+   late_indices.reserve(reserve_count);
+   for (std::size_t slot = 0; slot < reserve_count; ++slot) {
+       std::size_t numerator = (slot + 1) * tail_count;
+       std::size_t offset = std::min(tail_count - 1, numerator / (reserve_count + 1));
+       late_indices.push_back(cutoff + offset);
+   }
+
+   std::vector<Candidate> selected;
+   selected.reserve(reserve_count);
+   for (std::size_t index : late_indices) {
+       selected.push_back(std::move(candidates[index]));
+   }
+   for (std::size_t slot = 0; slot < reserve_count; ++slot) {
+       candidates[cutoff - reserve_count + slot] = std::move(selected[slot]);
+   }
+}
+
+template <typename Candidate>
+void moveLateCandidatesToBackForLifo(
+   std::vector<Candidate>& candidates,
+   std::size_t reserve_count
+) {
+   if (reserve_count == 0 || candidates.size() <= reserve_count + 1) {
+       return;
+   }
+
+   std::size_t pool_begin = candidates.size() / 2;
+   if (pool_begin >= candidates.size() - 1) {
+       return;
+   }
+
+   std::size_t pool_count = candidates.size() - pool_begin;
+   reserve_count = std::min(reserve_count, pool_count);
+   if (reserve_count == 0) {
+       return;
+   }
+
+   std::vector<std::size_t> selected_indices;
+   selected_indices.reserve(reserve_count);
+   for (std::size_t slot = 0; slot < reserve_count; ++slot) {
+       std::size_t numerator = (slot + 1) * pool_count;
+       std::size_t offset = std::min(pool_count - 1, numerator / (reserve_count + 1));
+       selected_indices.push_back(pool_begin + offset);
+   }
+
+   std::vector<bool> selected_mask(candidates.size(), false);
+   for (std::size_t index : selected_indices) {
+       selected_mask[index] = true;
+   }
+
+   std::vector<Candidate> reordered;
+   reordered.reserve(candidates.size());
+   for (std::size_t index = 0; index < candidates.size(); ++index) {
+       if (!selected_mask[index]) {
+           reordered.push_back(std::move(candidates[index]));
+       }
+   }
+   for (std::size_t index : selected_indices) {
+       reordered.push_back(std::move(candidates[index]));
+   }
+
+   candidates = std::move(reordered);
+}
+
 
 struct DfsState {
    GridPoint curr;
@@ -1443,6 +1532,38 @@ struct SegmentBucketState {
 
 double clampValue(double value, double low, double high) {
    return std::max(low, std::min(high, value));
+}
+
+double smoothstep01(double t) {
+   t = clampValue(t, 0.0, 1.0);
+   return t * t * (3.0 - 2.0 * t);
+}
+
+double targetProgressFraction(int next_depth, double target_segments) {
+   if (target_segments <= 0.0) {
+       return 0.0;
+   }
+   return clampValue(static_cast<double>(next_depth) / target_segments, 0.0, 1.0);
+}
+
+double uniformPenaltyScale(int next_depth, double target_segments) {
+   double progress = targetProgressFraction(next_depth, target_segments);
+   double ramp_t = (progress - kUniformPenaltyRampStart) / kUniformPenaltyRampSpan;
+   return kUniformEarlyPenaltyFloor
+       + (1.0 - kUniformEarlyPenaltyFloor) * smoothstep01(ramp_t);
+}
+
+double uniformViaPenaltyScale(int next_depth, double target_segments) {
+   double progress = targetProgressFraction(next_depth, target_segments);
+   return kUniformEarlyViaPenaltyFloor
+       + (1.0 - kUniformEarlyViaPenaltyFloor) * smoothstep01(progress);
+}
+
+double uniformGuideLayerTarget(const GridPoint& curr, const GridPoint& guide_goal, int next_depth, double target_segments) {
+   double progress = targetProgressFraction(next_depth, target_segments);
+   double layer_t = (progress - kUniformLayerGuideStart) / kUniformLayerGuideSpan;
+   return static_cast<double>(curr.z)
+       + static_cast<double>(guide_goal.z - curr.z) * smoothstep01(layer_t);
 }
 
 
@@ -1531,7 +1652,6 @@ bool hasRemainingDemand(const std::vector<SegmentBucketState>& buckets, std::siz
        return bucket.found_count < max_results;
    });
 }
-
 
 bool pathAlreadyCollected(
    const std::vector<std::vector<GridPoint>>& bucket_paths,
@@ -1753,8 +1873,6 @@ std::vector<std::vector<GridPoint>> dfsRangeSegmentPathsToAnyGoal(
        for (int index : active) {
            score_targets.push_back(buckets[static_cast<std::size_t>(index)].segment);
        }
-
-
        auto next_points = castRays360(trace_grid, via_grid, curr, goal_indices, pads, via_diameter, prev_dx, prev_dy, prev_dz);
        auto score = [&](const GridPoint& p) {
            double base = std::numeric_limits<double>::infinity();
@@ -1762,6 +1880,7 @@ std::vector<std::vector<GridPoint>> dfsRangeSegmentPathsToAnyGoal(
                double progress = static_cast<double>(state.depth) / std::max(1, target - 1);
                double curve_factor = 4.0 * (progress - 0.5) * (progress - 0.5);
                double dynamic_via_penalty = kViaPenalty * (curve_factor * (1.0 - kMinDiscount) + kMinDiscount);
+               double uniform_penalty_scale = 1.0;
                double tx = 0.0;
                double ty = 0.0;
                double tz = 0.0;
@@ -1769,7 +1888,9 @@ std::vector<std::vector<GridPoint>> dfsRangeSegmentPathsToAnyGoal(
                    int remaining_segments = std::max(1, target - state.depth);
                    tx = curr.x + (guide_goal.x - curr.x) / static_cast<double>(remaining_segments);
                    ty = curr.y + (guide_goal.y - curr.y) / static_cast<double>(remaining_segments);
-                   tz = path.front().z + (guide_goal.z - path.front().z) * progress;
+                   tz = uniformGuideLayerTarget(curr, guide_goal, state.depth + 1, target);
+                   uniform_penalty_scale = uniformPenaltyScale(state.depth + 1, target);
+                   dynamic_via_penalty *= uniformViaPenaltyScale(state.depth + 1, target);
                } else {
                    tx = guide_goal.x;
                    ty = guide_goal.y;
@@ -1783,8 +1904,8 @@ std::vector<std::vector<GridPoint>> dfsRangeSegmentPathsToAnyGoal(
                double length_penalty = segmentLengthPenaltyForTarget(path.front(), guide_goal, curr, p, state.depth, target);
                double heuristic_score = target_base;
                if (uniform_heuristic) {
-                   heuristic_score += kProgressPenaltyWeightUniform * progress_penalty;
-                   heuristic_score += kSegmentLengthPenaltyWeightUniform * length_penalty;
+                   heuristic_score += uniform_penalty_scale * kProgressPenaltyWeightUniform * progress_penalty;
+                   heuristic_score += uniform_penalty_scale * kSegmentLengthPenaltyWeightUniform * length_penalty;
                } else {
                    heuristic_score += kProgressPenaltyWeightGreedy * progress_penalty;
                    heuristic_score += kSegmentLengthPenaltyWeightGreedy * length_penalty;
@@ -1801,22 +1922,34 @@ std::vector<std::vector<GridPoint>> dfsRangeSegmentPathsToAnyGoal(
        };
 
 
-       std::sort(next_points.begin(), next_points.end(), [&](const GridPoint& a, const GridPoint& b) {
-           double score_a = score(a);
-           double score_b = score(b);
-           long long scaled_a = std::llround(score_a * 1000000.0);
-           long long scaled_b = std::llround(score_b * 1000000.0);
+       struct ScoredGridPoint {
+           GridPoint point;
+           double score;
+       };
+       std::vector<ScoredGridPoint> scored_next_points;
+       scored_next_points.reserve(next_points.size());
+       for (auto& point : next_points) {
+           scored_next_points.push_back({point, score(point)});
+       }
+       std::sort(scored_next_points.begin(), scored_next_points.end(), [&](const ScoredGridPoint& a, const ScoredGridPoint& b) {
+           long long scaled_a = std::llround(a.score * 1000000.0);
+           long long scaled_b = std::llround(b.score * 1000000.0);
            if (scaled_a != scaled_b) {
                return scaled_a > scaled_b;
            }
-           if (a.x != b.x) {
-               return a.x > b.x;
+           if (a.point.x != b.point.x) {
+               return a.point.x > b.point.x;
            }
-           if (a.y != b.y) {
-               return a.y > b.y;
+           if (a.point.y != b.point.y) {
+               return a.point.y > b.point.y;
            }
-           return a.z > b.z;
+           return a.point.z > b.point.z;
        });
+       next_points.clear();
+       next_points.reserve(scored_next_points.size());
+       for (auto& scored_point : scored_next_points) {
+           next_points.push_back(scored_point.point);
+       }
        unsigned int diversify_seed = heuristic_seed_salt
            ^ static_cast<unsigned int>((state.depth + 1) * 2246822519U)
            ^ (uniform_heuristic ? 0xA511E9B3U : 0x63D83595U)
@@ -1827,6 +1960,9 @@ std::vector<std::vector<GridPoint>> dfsRangeSegmentPathsToAnyGoal(
            kDiversifiedRankPower,
            diversify_seed
        );
+       if (uniform_heuristic) {
+           moveLateCandidatesToBackForLifo(next_points, kUniformLateBranchReserve);
+       }
 
 
        std::size_t branch_limit = state.depth == 0 ? std::min<std::size_t>(next_points.size(), 480) : next_points.size();
@@ -1950,13 +2086,17 @@ std::vector<std::vector<GridPoint>> findAllExactSegmentPathsToAnyGoal(
        for (int target_segment = std::max(1, min_target_segments); target_segment <= max_target_segments; ++target_segment) {
            double progress = 0.0;
            int remaining = std::max(1, target_segment);
+           double dynamic_via_penalty = kViaPenalty;
+           double uniform_penalty_scale = 1.0;
            double tx = 0.0;
            double ty = 0.0;
            double tz = 0.0;
            if (uniform_heuristic) {
                tx = candidate.boundary_start.x + (guide_goal.x - candidate.boundary_start.x) / static_cast<double>(remaining);
                ty = candidate.boundary_start.y + (guide_goal.y - candidate.boundary_start.y) / static_cast<double>(remaining);
-               tz = candidate.boundary_start.z + (guide_goal.z - candidate.boundary_start.z) * progress;
+               tz = uniformGuideLayerTarget(candidate.boundary_start, guide_goal, 1, target_segment);
+               uniform_penalty_scale = uniformPenaltyScale(1, target_segment);
+               dynamic_via_penalty *= uniformViaPenaltyScale(1, target_segment);
            } else {
                tx = guide_goal.x;
                ty = guide_goal.y;
@@ -1965,7 +2105,7 @@ std::vector<std::vector<GridPoint>> findAllExactSegmentPathsToAnyGoal(
            double dx = p.x - tx;
            double dy = p.y - ty;
            double dz = p.z - tz;
-           double target_base = dx * dx + dy * dy + dz * dz * kViaPenalty;
+           double target_base = dx * dx + dy * dy + dz * dz * dynamic_via_penalty;
            double progress_penalty = progressPenaltyForTarget(
                candidate.boundary_start,
                guide_goal,
@@ -1983,8 +2123,8 @@ std::vector<std::vector<GridPoint>> findAllExactSegmentPathsToAnyGoal(
            );
            double heuristic_score = target_base;
            if (uniform_heuristic) {
-               heuristic_score += kProgressPenaltyWeightUniform * progress_penalty;
-               heuristic_score += kSegmentLengthPenaltyWeightUniform * length_penalty;
+               heuristic_score += uniform_penalty_scale * kProgressPenaltyWeightUniform * progress_penalty;
+               heuristic_score += uniform_penalty_scale * kSegmentLengthPenaltyWeightUniform * length_penalty;
            } else {
                heuristic_score += kProgressPenaltyWeightGreedy * progress_penalty;
                heuristic_score += kSegmentLengthPenaltyWeightGreedy * length_penalty;
@@ -1996,35 +2136,50 @@ std::vector<std::vector<GridPoint>> findAllExactSegmentPathsToAnyGoal(
        unsigned int base_seed = uniform_heuristic ? kRandomSeed : (kRandomSeed ^ 0x9e3779b9U);
        return base + (base + 1.0) * spatialNoise(p.x, p.y, p.z, base_seed ^ heuristic_seed_salt);
    };
-   std::sort(first_candidates.begin(), first_candidates.end(), [&](const FirstRayCandidate& a, const FirstRayCandidate& b) {
-       double score_a = score(a);
-       double score_b = score(b);
-       if (std::abs(score_a - score_b) > 1e-9) {
-           return score_a < score_b;
+   struct ScoredFirstRayCandidate {
+       FirstRayCandidate candidate;
+       double score;
+   };
+   std::vector<ScoredFirstRayCandidate> scored_first_candidates;
+   scored_first_candidates.reserve(first_candidates.size());
+   for (auto& candidate : first_candidates) {
+       scored_first_candidates.push_back({candidate, score(candidate)});
+   }
+   std::sort(scored_first_candidates.begin(), scored_first_candidates.end(), [&](const ScoredFirstRayCandidate& a, const ScoredFirstRayCandidate& b) {
+       if (std::abs(a.score - b.score) > 1e-9) {
+           return a.score < b.score;
        }
-       if (a.next.x != b.next.x) {
-           return a.next.x < b.next.x;
+       if (a.candidate.next.x != b.candidate.next.x) {
+           return a.candidate.next.x < b.candidate.next.x;
        }
-       if (a.next.y != b.next.y) {
-           return a.next.y < b.next.y;
+       if (a.candidate.next.y != b.candidate.next.y) {
+           return a.candidate.next.y < b.candidate.next.y;
        }
-       if (a.next.z != b.next.z) {
-           return a.next.z < b.next.z;
+       if (a.candidate.next.z != b.candidate.next.z) {
+           return a.candidate.next.z < b.candidate.next.z;
        }
-       if (a.boundary_start.x != b.boundary_start.x) {
-           return a.boundary_start.x < b.boundary_start.x;
+       if (a.candidate.boundary_start.x != b.candidate.boundary_start.x) {
+           return a.candidate.boundary_start.x < b.candidate.boundary_start.x;
        }
-       if (a.boundary_start.y != b.boundary_start.y) {
-           return a.boundary_start.y < b.boundary_start.y;
+       if (a.candidate.boundary_start.y != b.candidate.boundary_start.y) {
+           return a.candidate.boundary_start.y < b.candidate.boundary_start.y;
        }
-       return a.boundary_start.z < b.boundary_start.z;
+       return a.candidate.boundary_start.z < b.candidate.boundary_start.z;
    });
+   first_candidates.clear();
+   first_candidates.reserve(scored_first_candidates.size());
+   for (auto& scored_candidate : scored_first_candidates) {
+       first_candidates.push_back(scored_candidate.candidate);
+   }
    diversifyRankedCandidates(
        first_candidates,
        kDiversifiedPrefixCount,
        kDiversifiedRankPower,
        (uniform_heuristic ? 0xC0FFEE11U : 0xBAD5EEDU) ^ heuristic_seed_salt ^ kShuffleSeed
    );
+   if (uniform_heuristic) {
+       injectLateCandidatesIntoPrefix(first_candidates, 480, kUniformLateBranchReserve);
+   }
    std::size_t branch_limit = std::min<std::size_t>(first_candidates.size(), 480);
    Grid3D dfs_grid = trace_grid;
    if (start_pad != nullptr) {
@@ -2086,6 +2241,10 @@ double routeLength(const std::vector<GridPoint>& path) {
        length += pathSegmentLength(path[i - 1], path[i]);
    }
    return length;
+}
+
+int pathSegmentCount(const std::vector<GridPoint>& path) {
+   return path.size() > 1 ? static_cast<int>(path.size()) - 1 : 0;
 }
 
 
@@ -2289,10 +2448,6 @@ std::vector<std::vector<GridPoint>> generateCandidatePaths(
    }
 
 
-   all_paths.insert(all_paths.end(), uniform.begin(), uniform.end());
-   all_paths.insert(all_paths.end(), greedy.begin(), greedy.end());
-
-
    auto path_less = [](const auto& a, const auto& b) {
        if (a.size() != b.size()) {
            return a.size() < b.size();
@@ -2321,12 +2476,92 @@ std::vector<std::vector<GridPoint>> generateCandidatePaths(
        }
        return true;
    };
-   std::sort(all_paths.begin(), all_paths.end(), path_less);
-   all_paths.erase(std::unique(all_paths.begin(), all_paths.end(), path_equal), all_paths.end());
-   std::sort(all_paths.begin(), all_paths.end(), [](const auto& a, const auto& b) {
-       return routeLength(a) < routeLength(b);
-   });
    std::size_t total_result_cap = static_cast<std::size_t>(max_candidate_segments - std::max(1, minimum_segments) + 1) * max_results;
+   auto normalize_paths = [&](std::vector<std::vector<GridPoint>>& paths) {
+       std::sort(paths.begin(), paths.end(), path_less);
+       paths.erase(std::unique(paths.begin(), paths.end(), path_equal), paths.end());
+       std::sort(paths.begin(), paths.end(), [](const auto& a, const auto& b) {
+           double len_a = routeLength(a);
+           double len_b = routeLength(b);
+           if (std::abs(len_a - len_b) > 1e-9) {
+               return len_a < len_b;
+           }
+           return a.size() < b.size();
+       });
+   };
+   normalize_paths(uniform);
+   normalize_paths(greedy);
+
+   std::map<int, std::vector<std::vector<GridPoint>>> uniform_by_segment;
+   std::map<int, std::vector<std::vector<GridPoint>>> greedy_by_segment;
+   for (auto& path : uniform) {
+       uniform_by_segment[pathSegmentCount(path)].push_back(std::move(path));
+   }
+   for (auto& path : greedy) {
+       greedy_by_segment[pathSegmentCount(path)].push_back(std::move(path));
+   }
+
+   std::size_t per_role_reserve = std::max<std::size_t>(
+       1,
+       static_cast<std::size_t>(std::llround(static_cast<double>(max_results) * kPerSegmentRoleReserveFraction))
+   );
+
+   auto maybe_add_path = [&](const std::vector<GridPoint>& candidate) {
+       if (!pathAlreadyCollected(all_paths, candidate)) {
+           all_paths.push_back(candidate);
+       }
+   };
+
+   for (int segment = std::max(1, minimum_segments); segment <= max_candidate_segments; ++segment) {
+       static const std::vector<std::vector<GridPoint>> kEmptyPaths;
+       const auto uniform_it = uniform_by_segment.find(segment);
+       const auto greedy_it = greedy_by_segment.find(segment);
+       const auto& uniform_paths = uniform_it != uniform_by_segment.end() ? uniform_it->second : kEmptyPaths;
+       const auto& greedy_paths = greedy_it != greedy_by_segment.end() ? greedy_it->second : kEmptyPaths;
+
+       std::size_t uniform_keep = std::min(per_role_reserve, uniform_paths.size());
+       std::size_t greedy_keep = std::min(per_role_reserve, greedy_paths.size());
+       for (std::size_t i = 0; i < uniform_keep; ++i) {
+           maybe_add_path(uniform_paths[i]);
+       }
+       for (std::size_t i = 0; i < greedy_keep; ++i) {
+           maybe_add_path(greedy_paths[i]);
+       }
+
+       std::vector<const std::vector<GridPoint>*> merged_candidates;
+       merged_candidates.reserve(uniform_paths.size() + greedy_paths.size());
+       for (const auto& path : uniform_paths) {
+           merged_candidates.push_back(&path);
+       }
+       for (const auto& path : greedy_paths) {
+           merged_candidates.push_back(&path);
+       }
+       std::sort(merged_candidates.begin(), merged_candidates.end(), [](const auto* a, const auto* b) {
+           double len_a = routeLength(*a);
+           double len_b = routeLength(*b);
+           if (std::abs(len_a - len_b) > 1e-9) {
+               return len_a < len_b;
+           }
+           return a->size() < b->size();
+       });
+
+       std::size_t before_segment_count = all_paths.size();
+       for (const auto* path : merged_candidates) {
+           if (all_paths.size() - before_segment_count >= max_results) {
+               break;
+           }
+           maybe_add_path(*path);
+       }
+   }
+
+   std::sort(all_paths.begin(), all_paths.end(), [](const auto& a, const auto& b) {
+       double len_a = routeLength(a);
+       double len_b = routeLength(b);
+       if (std::abs(len_a - len_b) > 1e-9) {
+           return len_a < len_b;
+       }
+       return a.size() < b.size();
+   });
    if (all_paths.size() > total_result_cap) {
        all_paths.resize(total_result_cap);
    }
