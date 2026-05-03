@@ -82,4 +82,35 @@ struct RouteResult {
     std::vector<std::vector<Point2D>> candidate_paths_mm;
 };
 
+struct NetCandidateSet {
+    int net_id = 0;
+    std::vector<std::vector<GridPoint>> candidate_paths_grid;
+    std::vector<std::vector<Point2D>> candidate_paths_mm;
+    std::vector<std::vector<GridPoint>> candidate_boundary_vertices;
+    std::vector<std::vector<GridPoint>> candidate_terminal_coords;
+    std::vector<std::vector<std::vector<GridPoint>>> candidate_terminal_groups;
+};
+
+struct SelectionRequest {
+    std::vector<NetCandidateSet> nets;
+    int max_paths_per_net = 1;
+    bool prefer_gurobi = true;
+    bool allow_fallback = true;
+};
+
+struct NetSelection {
+    int net_id = 0;
+    std::vector<int> selected_candidate_indices;
+    std::string solver;
+    double objective = 0.0;
+    bool has_objective = false;
+};
+
+struct SelectionResult {
+    bool ok = false;
+    std::string solver;
+    std::string message;
+    std::vector<NetSelection> selections;
+};
+
 }  // namespace interactive_router

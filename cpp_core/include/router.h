@@ -8,6 +8,7 @@
 namespace interactive_router {
 
 RouteResult runDijkstraTest(const RouteRequest& request);
+SelectionResult selectCandidatePaths(const SelectionRequest& request);
 
 Grid3D buildObstacleGridForNet(const RouteRequest& request, int net_id, double net_width, double clearance);
 

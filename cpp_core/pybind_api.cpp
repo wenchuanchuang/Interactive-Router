@@ -84,5 +84,37 @@ PYBIND11_MODULE(router_core, m) {
         .def_readonly("candidate_paths_grid", &RouteResult::candidate_paths_grid)
         .def_readonly("candidate_paths_mm", &RouteResult::candidate_paths_mm);
 
+    py::class_<NetCandidateSet>(m, "NetCandidateSet")
+        .def(py::init<>())
+        .def_readwrite("net_id", &NetCandidateSet::net_id)
+        .def_readwrite("candidate_paths_grid", &NetCandidateSet::candidate_paths_grid)
+        .def_readwrite("candidate_paths_mm", &NetCandidateSet::candidate_paths_mm)
+        .def_readwrite("candidate_boundary_vertices", &NetCandidateSet::candidate_boundary_vertices)
+        .def_readwrite("candidate_terminal_coords", &NetCandidateSet::candidate_terminal_coords)
+        .def_readwrite("candidate_terminal_groups", &NetCandidateSet::candidate_terminal_groups);
+
+    py::class_<SelectionRequest>(m, "SelectionRequest")
+        .def(py::init<>())
+        .def_readwrite("nets", &SelectionRequest::nets)
+        .def_readwrite("max_paths_per_net", &SelectionRequest::max_paths_per_net)
+        .def_readwrite("prefer_gurobi", &SelectionRequest::prefer_gurobi)
+        .def_readwrite("allow_fallback", &SelectionRequest::allow_fallback);
+
+    py::class_<NetSelection>(m, "NetSelection")
+        .def(py::init<>())
+        .def_readonly("net_id", &NetSelection::net_id)
+        .def_readonly("selected_candidate_indices", &NetSelection::selected_candidate_indices)
+        .def_readonly("solver", &NetSelection::solver)
+        .def_readonly("objective", &NetSelection::objective)
+        .def_readonly("has_objective", &NetSelection::has_objective);
+
+    py::class_<SelectionResult>(m, "SelectionResult")
+        .def(py::init<>())
+        .def_readonly("ok", &SelectionResult::ok)
+        .def_readonly("solver", &SelectionResult::solver)
+        .def_readonly("message", &SelectionResult::message)
+        .def_readonly("selections", &SelectionResult::selections);
+
     m.def("run_dijkstra_test", &runDijkstraTest, py::arg("request"));
+    m.def("select_candidate_paths", &selectCandidatePaths, py::arg("request"));
 }
