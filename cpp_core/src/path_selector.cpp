@@ -302,11 +302,33 @@ SelectionResult solveWithGurobi(const SelectionRequest& request, const std::vect
 
     for (std::size_t g = 0; g < records.size(); ++g) {
         if (!records[g].candidates.empty()) {
-            terminal_groups_by_net[g] = records[g].candidates.front().terminal_groups;
-            for (const auto& group : terminal_groups_by_net[g]) {
-                for (const auto& vertex : group) {
+            std::size_t max_group_count = 0;
+            for (const auto& candidate : records[g].candidates) {
+                max_group_count = std::max(max_group_count, candidate.terminal_groups.size());
+            }
+
+            std::vector<std::unordered_set<VertexKey, VertexKeyHash>> union_groups(max_group_count);
+            for (const auto& candidate : records[g].candidates) {
+                for (std::size_t gi = 0; gi < candidate.terminal_groups.size(); ++gi) {
+                    for (const auto& vertex : candidate.terminal_groups[gi]) {
+                        union_groups[gi].insert(vertex);
+                    }
+                }
+            }
+
+            terminal_groups_by_net[g].clear();
+            terminal_groups_by_net[g].reserve(union_groups.size());
+            for (auto& group_set : union_groups) {
+                if (group_set.empty()) {
+                    continue;
+                }
+                std::vector<VertexKey> group_vertices;
+                group_vertices.reserve(group_set.size());
+                for (const auto& vertex : group_set) {
+                    group_vertices.push_back(vertex);
                     terminal_vertices.insert(vertex);
                 }
+                terminal_groups_by_net[g].push_back(std::move(group_vertices));
             }
         }
         for (std::size_t p = 0; p < records[g].candidates.size(); ++p) {
