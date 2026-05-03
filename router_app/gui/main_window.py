@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
@@ -22,7 +23,11 @@ from PyQt5.QtWidgets import (
 )
 
 from router_app.kicad_parser import BoardData, TrackSegment, load_board
-from router_app.reroute_engine import minimum_grid_steps_per_mm, run_dijkstra_reroute_test
+from router_app.reroute_engine import (
+    minimum_grid_steps_per_mm,
+    run_dijkstra_reroute_test,
+    select_reroute_candidates,
+)
 from router_app.gui.pcb_canvas import PcbCanvas, RoutePreviewCanvas
 
 
@@ -30,6 +35,8 @@ class MainWindow(QMainWindow):
     def __init__(self, initial_file: str | None = None):
         super().__init__()
         self._board: BoardData | None = None
+        self._candidate_outcome = None
+        self._candidate_ripped_net_ids: set[int] = set()
 
         self.setWindowTitle("KiCad Auto Router Viewer")
         self.resize(1280, 820)
@@ -109,6 +116,11 @@ class MainWindow(QMainWindow):
         self.undo_rip_up_button.clicked.connect(self._undo_rip_up)
         toolbar.addWidget(self.undo_rip_up_button)
 
+        self.generate_candidates_button = QPushButton("Generate Candidates")
+        self.generate_candidates_button.setEnabled(False)
+        self.generate_candidates_button.clicked.connect(self._generate_candidates_for_ripped_nets)
+        toolbar.addWidget(self.generate_candidates_button)
+
         self.reroute_button = QPushButton("Reroute")
         self.reroute_button.setEnabled(False)
         self.reroute_button.clicked.connect(self._reroute_selected_removed_nets)
@@ -134,6 +146,7 @@ class MainWindow(QMainWindow):
             return
 
         self._board = board
+        self._reset_candidate_generation_state()
         self.canvas.load_board(board)
         self._set_layers(board.copper_layers)
         self.trace_panel.show_board(board)
@@ -156,12 +169,14 @@ class MainWindow(QMainWindow):
 
     def _rip_up_selected(self) -> None:
         if self.canvas.rip_up_selected() and self._board is not None:
+            self._reset_candidate_generation_state()
             self.trace_panel.show_selection(self._board, set())
             self.trace_panel.show_ripped_nets(self._board, self.canvas.ripped_net_ids)
             self._show_status_counts("Rip-up applied")
 
     def _undo_rip_up(self) -> None:
         if self.canvas.undo_rip_up():
+            self._reset_candidate_generation_state()
             if self._board is not None:
                 self.trace_panel.show_ripped_nets(self._board, self.canvas.ripped_net_ids)
             self._show_status_counts("Rip-up undone")
@@ -169,31 +184,72 @@ class MainWindow(QMainWindow):
     def _update_ripup_buttons(self, *_args) -> None:
         self.rip_up_button.setEnabled(bool(self.canvas.selected_net_ids))
         self.undo_rip_up_button.setEnabled(self.canvas.can_undo_rip_up)
-        self.reroute_button.setEnabled(bool(self.canvas.ripped_net_ids))
+        has_ripped = bool(self.canvas.ripped_net_ids)
+        self.generate_candidates_button.setEnabled(has_ripped)
+        can_reroute = (
+            has_ripped
+            and self._candidate_outcome is not None
+            and bool(getattr(self._candidate_outcome, "result", None))
+            and self._candidate_ripped_net_ids == set(self.canvas.ripped_net_ids)
+        )
+        self.reroute_button.setEnabled(can_reroute)
 
     def _show_ripped_nets(self, ripped_net_ids: set[int]) -> None:
+        if self._candidate_outcome is not None and self._candidate_ripped_net_ids != set(ripped_net_ids):
+            self._reset_candidate_generation_state()
         if self._board is not None:
             self.trace_panel.show_ripped_nets(self._board, ripped_net_ids)
         self._update_ripup_buttons()
 
-    def _reroute_selected_removed_nets(self) -> None:
+    def _generate_candidates_for_ripped_nets(self) -> None:
         if self._board is None:
+            return
+        if not self.canvas.ripped_net_ids:
+            self.statusBar().showMessage("No ripped-up nets to generate candidates.")
             return
         outcome = run_dijkstra_reroute_test(
             self._board,
             self.canvas.ripped_net_ids,
             self.trace_panel.grid_steps_per_mm,
         )
+        self._candidate_outcome = outcome if outcome.result else None
+        self._candidate_ripped_net_ids = set(self.canvas.ripped_net_ids) if outcome.result else set()
         elapsed = (
             f" Runtime: {outcome.elapsed_seconds:.3f} s"
             if outcome.elapsed_seconds is not None
             else ""
         )
-        self.statusBar().showMessage(f"{outcome.message}{elapsed}")
+        prefix = "Candidates generated." if outcome.result else "Candidate generation failed."
+        self.statusBar().showMessage(f"{prefix} {outcome.message}{elapsed}")
         if outcome.result:
             self.route_preview.show_routes(outcome.result, self._board, self.canvas.ripped_net_ids)
         else:
             self.route_preview.show_message(f"{outcome.message}{elapsed}")
+        self._update_ripup_buttons()
+
+    def _reroute_selected_removed_nets(self) -> None:
+        if self._board is None:
+            return
+        if self._candidate_outcome is None or not self._candidate_outcome.result:
+            self.statusBar().showMessage("Generate candidates first, then reroute.")
+            return
+        if self._candidate_ripped_net_ids != set(self.canvas.ripped_net_ids):
+            self.statusBar().showMessage("Ripped-up nets changed. Please generate candidates again.")
+            self._reset_candidate_generation_state()
+            self._update_ripup_buttons()
+            return
+
+        selection = select_reroute_candidates(self._candidate_outcome, max_paths_per_net=1, prefer_gurobi=True)
+        if not selection.ok:
+            self.statusBar().showMessage(f"Path selection failed: {selection.message}")
+            self.route_preview.show_message(f"Path selection failed: {selection.message}")
+            return
+
+        selected_preview = self._build_selected_preview_results(self._candidate_outcome.result, selection)
+        self.route_preview.show_routes(selected_preview, self._board, self.canvas.ripped_net_ids)
+        self.statusBar().showMessage(
+            f"Reroute selected by {selection.solver}. {selection.message}"
+        )
 
     def _show_status_counts(self, prefix: str) -> None:
         if self._board is None:
@@ -202,6 +258,37 @@ class MainWindow(QMainWindow):
             f"{prefix}: {len(self.canvas.selected_net_ids)} selected nets, "
             f"{len(self._board.tracks)} original traces"
         )
+
+    def _reset_candidate_generation_state(self) -> None:
+        self._candidate_outcome = None
+        self._candidate_ripped_net_ids = set()
+        self.route_preview.show_message("Generate candidates first")
+
+    def _build_selected_preview_results(self, route_results, selection) -> list[object]:
+        selected_by_net: dict[int, int] = {}
+        for net_selection in selection.selections:
+            if not net_selection.selected_candidate_indices:
+                continue
+            selected_by_net[int(net_selection.net_id)] = int(net_selection.selected_candidate_indices[0])
+
+        preview_results: list[object] = []
+        for route_result in route_results:
+            net_id = int(getattr(route_result, "net_id", 0))
+            candidate_grid = list(getattr(route_result, "candidate_paths_grid", []))
+            candidate_mm = list(getattr(route_result, "candidate_paths_mm", []))
+            selected_index = selected_by_net.get(net_id)
+            if selected_index is None or selected_index < 0:
+                continue
+            if selected_index >= len(candidate_grid) or selected_index >= len(candidate_mm):
+                continue
+            preview_results.append(
+                SimpleNamespace(
+                    net_id=net_id,
+                    candidate_paths_grid=[candidate_grid[selected_index]],
+                    candidate_paths_mm=[candidate_mm[selected_index]],
+                )
+            )
+        return preview_results
 
     def _set_layers(self, layers: list[str]) -> None:
         self.layer_combo.blockSignals(True)
