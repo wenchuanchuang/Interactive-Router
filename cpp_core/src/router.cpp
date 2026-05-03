@@ -2809,43 +2809,6 @@ std::vector<std::vector<GridPoint>> generateCandidatePaths(
    }
 
 
-   std::unordered_set<std::size_t> simplify_goal_indices;
-   for (const auto& goal : goals) {
-       if (trace_grid.inBounds(goal)) {
-           simplify_goal_indices.insert(trace_grid.flatten(goal));
-       }
-   }
-   bool debug_simplify = false;
-   if (const char* env = std::getenv("ROUTER_DEBUG_SIMPLIFY")) {
-       debug_simplify = env[0] != '\0' && env[0] != '0';
-   }
-   std::size_t simplified_path_count = 0;
-   std::size_t simplified_vertex_reduction = 0;
-   std::size_t simplified_segment_reduction = 0;
-   auto apply_simplify = [&](std::vector<std::vector<GridPoint>>& paths) {
-       for (auto& path : paths) {
-           std::size_t before_vertices = path.size();
-           std::size_t before_segments = before_vertices > 1 ? before_vertices - 1 : 0;
-           auto simplified = simplifyCandidatePath(trace_grid, via_grid, std::move(path), simplify_goal_indices, pads, via_diameter);
-           std::size_t after_vertices = simplified.size();
-           std::size_t after_segments = after_vertices > 1 ? after_vertices - 1 : 0;
-           if (after_vertices < before_vertices) {
-               ++simplified_path_count;
-               simplified_vertex_reduction += before_vertices - after_vertices;
-               simplified_segment_reduction += before_segments - after_segments;
-           }
-           path = std::move(simplified);
-       }
-   };
-   apply_simplify(uniform);
-   apply_simplify(greedy);
-   if (debug_simplify) {
-       std::cout << "          simplify changed " << simplified_path_count
-                 << " paths, removed " << simplified_vertex_reduction
-                 << " vertices and " << simplified_segment_reduction
-                 << " segments" << std::endl;
-   }
-
    std::size_t paths_f_uni = backward_search ? 0 : uniform.size();
    std::size_t paths_f_gre = backward_search ? 0 : greedy.size();
    std::size_t paths_b_uni = backward_search ? uniform.size() : 0;
@@ -2902,7 +2865,6 @@ std::vector<std::vector<GridPoint>> generateCandidatePaths(
        }
        return true;
    };
-   std::size_t total_result_cap = static_cast<std::size_t>(max_candidate_segments - std::max(1, minimum_segments) + 1) * max_results;
    auto normalize_paths = [&](std::vector<std::vector<GridPoint>>& paths) {
        std::sort(paths.begin(), paths.end(), path_less);
        paths.erase(std::unique(paths.begin(), paths.end(), path_equal), paths.end());
@@ -2927,17 +2889,14 @@ std::vector<std::vector<GridPoint>> generateCandidatePaths(
        greedy_by_segment[pathSegmentCount(path)].push_back(std::move(path));
    }
 
-   std::size_t per_role_reserve = std::max<std::size_t>(
-       1,
-       static_cast<std::size_t>(std::llround(static_cast<double>(max_results) * kPerSegmentRoleReserveFraction))
-   );
-
    auto maybe_add_path = [&](const std::vector<GridPoint>& candidate) {
        if (!pathAlreadyCollected(all_paths, candidate)) {
            all_paths.push_back(candidate);
        }
    };
 
+   std::map<int, std::vector<std::vector<GridPoint>>> segment_pools;
+   std::vector<int> active_segments;
    for (int segment = std::max(1, minimum_segments); segment <= max_candidate_segments; ++segment) {
        static const std::vector<std::vector<GridPoint>> kEmptyPaths;
        const auto uniform_it = uniform_by_segment.find(segment);
@@ -2945,38 +2904,51 @@ std::vector<std::vector<GridPoint>> generateCandidatePaths(
        const auto& uniform_paths = uniform_it != uniform_by_segment.end() ? uniform_it->second : kEmptyPaths;
        const auto& greedy_paths = greedy_it != greedy_by_segment.end() ? greedy_it->second : kEmptyPaths;
 
-       std::size_t uniform_keep = std::min(per_role_reserve, uniform_paths.size());
-       std::size_t greedy_keep = std::min(per_role_reserve, greedy_paths.size());
-       for (std::size_t i = 0; i < uniform_keep; ++i) {
-           maybe_add_path(uniform_paths[i]);
+       std::vector<std::vector<GridPoint>> merged_paths;
+       merged_paths.reserve(uniform_paths.size() + greedy_paths.size());
+       merged_paths.insert(merged_paths.end(), uniform_paths.begin(), uniform_paths.end());
+       merged_paths.insert(merged_paths.end(), greedy_paths.begin(), greedy_paths.end());
+       normalize_paths(merged_paths);
+       if (!merged_paths.empty()) {
+           active_segments.push_back(segment);
+           segment_pools.emplace(segment, std::move(merged_paths));
        }
-       for (std::size_t i = 0; i < greedy_keep; ++i) {
-           maybe_add_path(greedy_paths[i]);
-       }
+   }
 
-       std::vector<const std::vector<GridPoint>*> merged_candidates;
-       merged_candidates.reserve(uniform_paths.size() + greedy_paths.size());
-       for (const auto& path : uniform_paths) {
-           merged_candidates.push_back(&path);
-       }
-       for (const auto& path : greedy_paths) {
-           merged_candidates.push_back(&path);
-       }
-       std::sort(merged_candidates.begin(), merged_candidates.end(), [](const auto* a, const auto* b) {
-           double len_a = routeLength(*a);
-           double len_b = routeLength(*b);
-           if (std::abs(len_a - len_b) > 1e-9) {
-               return len_a < len_b;
-           }
-           return a->size() < b->size();
-       });
+   constexpr std::size_t kPerSegmentTarget = 100;
+   std::map<int, std::size_t> segment_quota;
+   std::size_t deficit = 0;
+   for (int segment : active_segments) {
+       const auto& pool = segment_pools[segment];
+       std::size_t base = std::min(kPerSegmentTarget, pool.size());
+       segment_quota[segment] = base;
+       deficit += (kPerSegmentTarget - base);
+   }
 
-       std::size_t before_segment_count = all_paths.size();
-       for (const auto* path : merged_candidates) {
-           if (all_paths.size() - before_segment_count >= max_results) {
-               break;
+   while (deficit > 0) {
+       bool progressed = false;
+       for (int segment : active_segments) {
+           std::size_t& quota = segment_quota[segment];
+           const auto& pool = segment_pools[segment];
+           if (quota < pool.size()) {
+               ++quota;
+               --deficit;
+               progressed = true;
+               if (deficit == 0) {
+                   break;
+               }
            }
-           maybe_add_path(*path);
+       }
+       if (!progressed) {
+           break;
+       }
+   }
+
+   for (int segment : active_segments) {
+       const auto& pool = segment_pools[segment];
+       std::size_t keep = std::min(segment_quota[segment], pool.size());
+       for (std::size_t i = 0; i < keep; ++i) {
+           maybe_add_path(pool[i]);
        }
    }
 
@@ -3305,6 +3277,16 @@ RouteResult runDijkstraTest(const RouteRequest& request) {
        }
    }
 
+   std::vector<GridPoint> original_route_candidate = buildOriginalRouteCandidate(
+       request,
+       net_id,
+       trace_grid,
+       pad_terminal_groups[0].pad,
+       pad_terminal_groups[1].pad
+   );
+   if (!original_route_candidate.empty() && !pathAlreadyCollected(candidate_paths, original_route_candidate)) {
+       candidate_paths.push_back(original_route_candidate);
+   }
 
    auto path_equal = [](const auto& a, const auto& b) {
        if (a.size() != b.size()) {
@@ -3321,8 +3303,148 @@ RouteResult runDijkstraTest(const RouteRequest& request) {
        return routeLength(a) < routeLength(b);
    });
    candidate_paths.erase(std::unique(candidate_paths.begin(), candidate_paths.end(), path_equal), candidate_paths.end());
-   if (candidate_paths.size() > 1000) {
-       candidate_paths.resize(1000);//
+
+   std::map<int, std::vector<std::vector<GridPoint>>> final_by_segment;
+   for (auto& path : candidate_paths) {
+       final_by_segment[pathSegmentCount(path)].push_back(std::move(path));
+   }
+   for (auto& [segment, paths] : final_by_segment) {
+       std::sort(paths.begin(), paths.end(), [](const auto& a, const auto& b) {
+           double len_a = routeLength(a);
+           double len_b = routeLength(b);
+           if (std::abs(len_a - len_b) > 1e-9) {
+               return len_a < len_b;
+           }
+           return a.size() < b.size();
+       });
+   }
+
+   constexpr std::size_t kFinalTotalCap = 1000;
+   constexpr std::size_t kPerSegmentBaseTarget = 100;
+
+   std::vector<int> segment_types;
+   segment_types.reserve(final_by_segment.size());
+   for (const auto& [segment, _paths] : final_by_segment) {
+       segment_types.push_back(segment);
+   }
+
+   std::map<int, std::size_t> quota;
+   for (int segment : segment_types) {
+       quota[segment] = 0;
+   }
+
+   auto total_quota = [&]() -> std::size_t {
+       std::size_t total = 0;
+       for (const auto& [segment, count] : quota) {
+           (void)segment;
+           total += count;
+       }
+       return total;
+   };
+
+   auto has_extra = [&](int segment) -> bool {
+       auto it = final_by_segment.find(segment);
+       if (it == final_by_segment.end()) {
+           return false;
+       }
+       return quota[segment] < it->second.size();
+   };
+
+   const std::size_t segment_type_count = segment_types.size();
+   if (segment_type_count > 0) {
+       if (segment_type_count * kPerSegmentBaseTarget > kFinalTotalCap) {
+           std::size_t even_target = kFinalTotalCap / segment_type_count;
+           for (int segment : segment_types) {
+               quota[segment] = std::min(even_target, final_by_segment[segment].size());
+           }
+           std::size_t remain = kFinalTotalCap - total_quota();
+           while (remain > 0) {
+               bool progressed = false;
+               for (int segment : segment_types) {
+                   if (remain == 0) {
+                       break;
+                   }
+                   if (has_extra(segment)) {
+                       ++quota[segment];
+                       --remain;
+                       progressed = true;
+                   }
+               }
+               if (!progressed) {
+                   break;
+               }
+           }
+       } else {
+           std::size_t deficit = 0;
+           for (int segment : segment_types) {
+               std::size_t base = std::min(kPerSegmentBaseTarget, final_by_segment[segment].size());
+               quota[segment] = base;
+               deficit += (kPerSegmentBaseTarget - base);
+           }
+
+           while (deficit > 0) {
+               bool progressed = false;
+               for (int segment : segment_types) {
+                   if (deficit == 0) {
+                       break;
+                   }
+                   if (quota[segment] >= kPerSegmentBaseTarget && has_extra(segment)) {
+                       ++quota[segment];
+                       --deficit;
+                       progressed = true;
+                   }
+               }
+               if (!progressed) {
+                   break;
+               }
+           }
+
+           std::size_t remain = kFinalTotalCap - std::min(kFinalTotalCap, total_quota());
+           while (remain > 0) {
+               bool progressed = false;
+               for (int segment : segment_types) {
+                   if (remain == 0) {
+                       break;
+                   }
+                   if (has_extra(segment)) {
+                       ++quota[segment];
+                       --remain;
+                       progressed = true;
+                   }
+               }
+               if (!progressed) {
+                   break;
+               }
+           }
+       }
+   }
+
+   std::vector<std::vector<GridPoint>> final_selected;
+   final_selected.reserve(kFinalTotalCap);
+   for (int segment : segment_types) {
+       const auto& pool = final_by_segment[segment];
+       std::size_t keep = std::min(quota[segment], pool.size());
+       for (std::size_t i = 0; i < keep; ++i) {
+           final_selected.push_back(pool[i]);
+       }
+   }
+
+   candidate_paths = std::move(final_selected);
+
+   if (!original_route_candidate.empty() && !pathAlreadyCollected(candidate_paths, original_route_candidate)) {
+       if (candidate_paths.size() < kFinalTotalCap) {
+           candidate_paths.push_back(original_route_candidate);
+       } else if (!candidate_paths.empty()) {
+           candidate_paths.back() = original_route_candidate;
+       }
+       std::sort(candidate_paths.begin(), candidate_paths.end(), [](const auto& a, const auto& b) {
+           double len_a = routeLength(a);
+           double len_b = routeLength(b);
+           if (std::abs(len_a - len_b) > 1e-9) {
+               return len_a < len_b;
+           }
+           return a.size() < b.size();
+       });
    }
    printSegmentPathHistogram(candidate_paths, "Final candidate");
 
