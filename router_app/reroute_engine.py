@@ -74,6 +74,11 @@ def select_reroute_candidates(
             item.candidate_paths_grid,
             boundary_payload,
         )
+        item.candidate_terminal_groups = _normalize_terminal_groups_for_net(
+            router_core,
+            item.candidate_terminal_groups,
+            item.candidate_terminal_coords,
+        )
         nets.append(item)
     request.nets = nets
 
@@ -93,6 +98,57 @@ def select_reroute_candidates(
         solver=str(cpp_result.solver),
         message=str(cpp_result.message),
     )
+
+
+def _normalize_terminal_groups_for_net(
+    router_core: Any,
+    candidate_terminal_groups: list[list[list[Any]]],
+    candidate_terminal_coords: list[list[Any]],
+) -> list[list[list[Any]]]:
+    if not candidate_terminal_groups:
+        return candidate_terminal_groups
+
+    net_group_unions: list[set[tuple[int, int, int]]] = []
+    for groups in candidate_terminal_groups:
+        for gi, group in enumerate(groups):
+            while len(net_group_unions) <= gi:
+                net_group_unions.append(set())
+            for point in group:
+                net_group_unions[gi].add((
+                    int(getattr(point, "x", 0)),
+                    int(getattr(point, "y", 0)),
+                    int(getattr(point, "z", 0)),
+                ))
+
+    if not net_group_unions:
+        return candidate_terminal_groups
+
+    # Keep path anchors reachable by terminal constraints even if they were not
+    # part of a path's boundary-derived group due to rasterization aliasing.
+    for terminals in candidate_terminal_coords:
+        for gi, point in enumerate(terminals):
+            while len(net_group_unions) <= gi:
+                net_group_unions.append(set())
+            net_group_unions[gi].add((
+                int(getattr(point, "x", 0)),
+                int(getattr(point, "y", 0)),
+                int(getattr(point, "z", 0)),
+            ))
+
+    canonical_groups: list[list[Any]] = []
+    for group_vertices in net_group_unions:
+        canonical_groups.append([
+            router_core.GridPoint(x, y, z)
+            for (x, y, z) in sorted(group_vertices)
+        ])
+
+    normalized: list[list[list[Any]]] = []
+    for _ in candidate_terminal_groups:
+        normalized.append([
+            list(group)
+            for group in canonical_groups
+        ])
+    return normalized
 
 
 def _load_exported_boundary_vertices(export_path: Path | None) -> dict[int, list[list[dict[str, Any]]]]:
@@ -630,7 +686,11 @@ def _export_candidate_path_manifest(
         "ripped_net_ids": list(ripped_net_ids),
         "grid_steps_per_mm": float(grid_steps_per_mm),
         "results": [
-            _serialize_route_result(board, result)
+            _serialize_route_result(
+                board,
+                result,
+                _max_ripped_clearance(board, ripped_net_ids),
+            )
             for result in results
         ],
     }
@@ -638,7 +698,11 @@ def _export_candidate_path_manifest(
     return export_path
 
 
-def _serialize_route_result(board: BoardData, result: Any) -> dict[str, Any]:
+def _serialize_route_result(
+    board: BoardData,
+    result: Any,
+    max_ripped_clearance: float,
+) -> dict[str, Any]:
     net_id = int(getattr(result, "net_id", 0))
     candidate_paths_grid = list(getattr(result, "candidate_paths_grid", []))
     candidate_paths_mm = list(getattr(result, "candidate_paths_mm", []))
@@ -653,6 +717,7 @@ def _serialize_route_result(board: BoardData, result: Any) -> dict[str, Any]:
             trace_width,
             clearance,
             generated_via_diameter,
+            max_ripped_clearance,
         )
         for path in candidate_paths_grid
     ]
@@ -703,6 +768,7 @@ def _serialize_boundary_vertex_set(
     trace_width: float,
     clearance: float,
     via_diameter: float,
+    max_ripped_clearance: float,
 ) -> list[dict[str, Any]]:
     if not path_grid:
         return []
@@ -713,11 +779,12 @@ def _serialize_boundary_vertex_set(
     start_pad = _closest_net_pad_for_vertex(board, result, net_id, start_anchor)
     goal_pad = _closest_net_pad_for_vertex(board, result, net_id, goal_anchor)
 
+    boundary_clearance = max(0.0, max_ripped_clearance) * 0.5
     occupied = _path_occupied_vertex_shell(
         result,
         path_grid,
-        trace_width * 0.5 + clearance,
-        via_diameter * 0.5 + clearance,
+        trace_width * 0.5 + boundary_clearance,
+        via_diameter * 0.5 + boundary_clearance,
     )
     filtered: set[tuple[int, int, int]] = set()
     for vertex in occupied:
@@ -742,6 +809,15 @@ def _serialize_boundary_vertex_set(
             continue
         serialized.append(_serialize_grid_vertex_tuple(board, vertex))
     return serialized
+
+
+def _max_ripped_clearance(board: BoardData, ripped_net_ids: list[int]) -> float:
+    if not ripped_net_ids:
+        return _min_clearance(board)
+    values = [_clearance_for_net(board, int(net_id)) for net_id in ripped_net_ids]
+    if not values:
+        return _min_clearance(board)
+    return max(values)
 
 
 def _serialize_grid_point(point: Any, board: BoardData) -> dict[str, Any]:
