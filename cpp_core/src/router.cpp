@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <deque>
 #include <functional>
@@ -16,6 +17,7 @@
 #include <queue>
 #include <random>
 #include <tuple>
+#include <unordered_map>
 #include <unordered_set>
 
 
@@ -49,6 +51,7 @@ const int kNeighborDeltas[6][3] = {
 constexpr double kViaPenalty = 50.0;
 constexpr double kMinDiscount = 0.2;
 constexpr double kDefaultGridStepsPerMm = 10.0;
+constexpr double kSqrt2 = 1.4142135623730951;
 constexpr double kCos45 = 0.7071067811865476;
 constexpr double kProgressPenaltyWeightUniform = 0.35;
 constexpr double kProgressPenaltyWeightGreedy = 0.25;
@@ -97,6 +100,12 @@ struct BoundarySeed {
 struct FirstRayCandidate {
    GridPoint boundary_start;
    GridPoint next;
+   double ray_len = 0.0;
+};
+
+struct RayCastCandidate {
+   GridPoint point;
+   double ray_len = 0.0;
 };
 
 Point2D rotateLocalToWorld(double local_x, double local_y, double cos_a, double sin_a) {
@@ -335,6 +344,8 @@ std::vector<FirstRayCandidate> castRaysFromBoundarySeeds(
            }
            int dx = kPlanarRayDirs[dir_index][0];
            int dy = kPlanarRayDirs[dir_index][1];
+           const double step_len = (std::abs(dx) + std::abs(dy) == 2) ? kSqrt2 : 1.0;
+           double ray_len = step_len;
            int curr_x = seed.origin.x + dx;
            int curr_y = seed.origin.y + dy;
            while (grid.inBounds({curr_x, curr_y, seed.origin.z})) {
@@ -349,10 +360,11 @@ std::vector<FirstRayCandidate> castRaysFromBoundarySeeds(
                }
                RayKey key{grid.flatten(seed.origin), grid.flatten(point)};
                if (seen.insert(key).second) {
-                   candidates.push_back({seed.origin, point});
+                   candidates.push_back({seed.origin, point, ray_len});
                }
                curr_x += dx;
                curr_y += dy;
+               ray_len += step_len;
            }
        }
    }
@@ -426,6 +438,211 @@ void markTrack(Grid3D& grid, const TrackGeometry& track, double bloat) {
 
 bool samePoint(const GridPoint& a, const GridPoint& b) {
    return a.x == b.x && a.y == b.y && a.z == b.z;
+}
+
+struct PhysicalPointKey {
+   std::int64_t x = 0;
+   std::int64_t y = 0;
+
+   bool operator==(const PhysicalPointKey& other) const {
+       return x == other.x && y == other.y;
+   }
+};
+
+struct PhysicalPointKeyHasher {
+   std::size_t operator()(const PhysicalPointKey& key) const {
+       return std::hash<std::int64_t>{}(key.x) ^ (std::hash<std::int64_t>{}(key.y) << 1);
+   }
+};
+
+struct LayeredNodeKey {
+   PhysicalPointKey point;
+   int z = 0;
+
+   bool operator==(const LayeredNodeKey& other) const {
+       return point == other.point && z == other.z;
+   }
+};
+
+struct LayeredNodeKeyHasher {
+   std::size_t operator()(const LayeredNodeKey& key) const {
+       std::size_t h = PhysicalPointKeyHasher{}(key.point);
+       return h ^ (std::hash<int>{}(key.z) << 1);
+   }
+};
+
+PhysicalPointKey makePhysicalPointKey(const Point2D& point) {
+   constexpr double kCoordScale = 1'000'000.0;
+   return {
+       static_cast<std::int64_t>(std::llround(point.x * kCoordScale)),
+       static_cast<std::int64_t>(std::llround(point.y * kCoordScale)),
+   };
+}
+
+struct GraphEdge {
+   int to = -1;
+   double weight = 0.0;
+};
+
+std::vector<GridPoint> buildOriginalRouteCandidate(
+   const RouteRequest& request,
+   int net_id,
+   const Grid3D& grid,
+   const PadGeometry* start_pad,
+   const PadGeometry* goal_pad
+) {
+   std::unordered_map<LayeredNodeKey, int, LayeredNodeKeyHasher> node_index;
+   std::vector<LayeredNodeKey> nodes;
+   std::vector<Point2D> node_physical_points;
+   std::vector<std::vector<GraphEdge>> adj;
+   std::unordered_map<PhysicalPointKey, std::vector<int>, PhysicalPointKeyHasher> nodes_by_point;
+
+   auto ensure_node = [&](const Point2D& point, int z) -> int {
+       LayeredNodeKey key{makePhysicalPointKey(point), z};
+       auto it = node_index.find(key);
+       if (it != node_index.end()) {
+           return it->second;
+       }
+       int idx = static_cast<int>(nodes.size());
+       node_index.emplace(key, idx);
+       nodes.push_back(key);
+       node_physical_points.push_back(point);
+       adj.emplace_back();
+       nodes_by_point[key.point].push_back(idx);
+       return idx;
+   };
+
+   bool has_track_or_via = false;
+   for (const auto& track : request.tracks) {
+       if (track.net_id != net_id) {
+           continue;
+       }
+       if (std::abs(track.start.x - track.end.x) <= 1e-12 && std::abs(track.start.y - track.end.y) <= 1e-12) {
+           continue;
+       }
+       int z = grid.layerIndex(track.layer);
+       if (z < 0 || z >= grid.nz()) {
+           continue;
+       }
+       int a = ensure_node(track.start, z);
+       int b = ensure_node(track.end, z);
+       double dx = track.end.x - track.start.x;
+       double dy = track.end.y - track.start.y;
+       double w = std::sqrt(dx * dx + dy * dy);
+       adj[a].push_back({b, w});
+       adj[b].push_back({a, w});
+       has_track_or_via = true;
+   }
+
+   for (const auto& via : request.vias) {
+       if (via.net_id != net_id) {
+           continue;
+       }
+       std::vector<int> layer_nodes;
+       layer_nodes.reserve(static_cast<std::size_t>(grid.nz()));
+       for (int z = 0; z < grid.nz(); ++z) {
+           layer_nodes.push_back(ensure_node(via.center, z));
+       }
+       for (int z = 0; z + 1 < grid.nz(); ++z) {
+           int a = layer_nodes[static_cast<std::size_t>(z)];
+           int b = layer_nodes[static_cast<std::size_t>(z + 1)];
+           adj[a].push_back({b, 1e-6});
+           adj[b].push_back({a, 1e-6});
+       }
+       has_track_or_via = true;
+   }
+
+   if (!has_track_or_via || nodes.empty() || start_pad == nullptr || goal_pad == nullptr) {
+       return {};
+   }
+
+   std::vector<int> start_nodes;
+   std::vector<int> goal_nodes;
+   start_nodes.reserve(nodes.size());
+   goal_nodes.reserve(nodes.size());
+   for (std::size_t i = 0; i < nodes.size(); ++i) {
+       int z = nodes[i].z;
+       if (z < 0 || z >= grid.nz()) {
+           continue;
+       }
+       const std::string& layer = grid.layers()[z];
+       const Point2D& point = node_physical_points[i];
+       if (layerMatchesPad(*start_pad, layer) && pointInsidePad(*start_pad, point, 1e-9)) {
+           start_nodes.push_back(static_cast<int>(i));
+       }
+       if (layerMatchesPad(*goal_pad, layer) && pointInsidePad(*goal_pad, point, 1e-9)) {
+           goal_nodes.push_back(static_cast<int>(i));
+       }
+   }
+   if (start_nodes.empty() || goal_nodes.empty()) {
+       return {};
+   }
+
+   std::vector<char> is_goal(nodes.size(), 0);
+   for (int idx : goal_nodes) {
+       is_goal[static_cast<std::size_t>(idx)] = 1;
+   }
+
+   const double kInf = std::numeric_limits<double>::infinity();
+   std::vector<double> dist(nodes.size(), kInf);
+   std::vector<int> prev(nodes.size(), -1);
+   using QueueItem = std::pair<double, int>;
+   std::priority_queue<QueueItem, std::vector<QueueItem>, std::greater<QueueItem>> pq;
+   for (int s : start_nodes) {
+       dist[static_cast<std::size_t>(s)] = 0.0;
+       pq.push({0.0, s});
+   }
+
+   int reached_goal = -1;
+   while (!pq.empty()) {
+       auto [d, u] = pq.top();
+       pq.pop();
+       if (d > dist[static_cast<std::size_t>(u)] + 1e-12) {
+           continue;
+       }
+       if (is_goal[static_cast<std::size_t>(u)]) {
+           reached_goal = u;
+           break;
+       }
+       for (const auto& edge : adj[static_cast<std::size_t>(u)]) {
+           int v = edge.to;
+           double nd = d + edge.weight;
+           if (nd + 1e-12 < dist[static_cast<std::size_t>(v)]) {
+               dist[static_cast<std::size_t>(v)] = nd;
+               prev[static_cast<std::size_t>(v)] = u;
+               pq.push({nd, v});
+           }
+       }
+   }
+   if (reached_goal < 0) {
+       return {};
+   }
+
+   std::vector<int> node_path;
+   for (int cur = reached_goal; cur >= 0; cur = prev[static_cast<std::size_t>(cur)]) {
+       node_path.push_back(cur);
+   }
+   std::reverse(node_path.begin(), node_path.end());
+   if (node_path.size() < 2) {
+       return {};
+   }
+
+   std::vector<GridPoint> path;
+   path.reserve(node_path.size());
+   for (int node_id : node_path) {
+       int z = nodes[static_cast<std::size_t>(node_id)].z;
+       GridPoint gp = grid.physicalToGrid(node_physical_points[static_cast<std::size_t>(node_id)], z);
+       if (!grid.inBounds(gp)) {
+           continue;
+       }
+       if (path.empty() || !samePoint(path.back(), gp)) {
+           path.push_back(gp);
+       }
+   }
+   if (path.size() < 2) {
+       return {};
+   }
+   return path;
 }
 
 
@@ -878,6 +1095,106 @@ bool isLineOfSightClear(
    }
 }
 
+struct MinimumSearchBounds {
+   int min_x = 0;
+   int max_x = 0;
+   int min_y = 0;
+   int max_y = 0;
+   int min_z = 0;
+   int max_z = 0;
+};
+
+MinimumSearchBounds buildMinimumSearchBounds(
+   const Grid3D& grid,
+   const GridPoint& start,
+   const std::vector<GridPoint>& goals,
+   const RouteRequest& request,
+   int net_id
+) {
+   int min_x = std::numeric_limits<int>::max();
+   int min_y = std::numeric_limits<int>::max();
+   int min_z = std::numeric_limits<int>::max();
+   int max_x = std::numeric_limits<int>::min();
+   int max_y = std::numeric_limits<int>::min();
+   int max_z = std::numeric_limits<int>::min();
+
+   auto include_point = [&](const GridPoint& point) {
+       min_x = std::min(min_x, point.x);
+       min_y = std::min(min_y, point.y);
+       min_z = std::min(min_z, point.z);
+       max_x = std::max(max_x, point.x);
+       max_y = std::max(max_y, point.y);
+       max_z = std::max(max_z, point.z);
+   };
+
+   if (grid.inBounds(start)) {
+       include_point(start);
+   }
+   for (const auto& goal : goals) {
+       if (grid.inBounds(goal)) {
+           include_point(goal);
+       }
+   }
+
+   for (const auto& track : request.tracks) {
+       if (track.net_id != net_id) {
+           continue;
+       }
+       int z = grid.layerIndex(track.layer);
+       if (z < 0 || z >= grid.nz()) {
+           continue;
+       }
+       GridPoint p0 = grid.physicalToGrid(track.start, z);
+       GridPoint p1 = grid.physicalToGrid(track.end, z);
+       if (grid.inBounds(p0)) {
+           include_point(p0);
+       }
+       if (grid.inBounds(p1)) {
+           include_point(p1);
+       }
+   }
+
+   for (const auto& via : request.vias) {
+       if (via.net_id != net_id) {
+           continue;
+       }
+       for (int z = 0; z < grid.nz(); ++z) {
+           GridPoint v = grid.physicalToGrid(via.center, z);
+           if (grid.inBounds(v)) {
+               include_point(v);
+           }
+       }
+   }
+
+   if (min_x > max_x || min_y > max_y || min_z > max_z) {
+       min_x = 0;
+       min_y = 0;
+       min_z = 0;
+       max_x = grid.nx() - 1;
+       max_y = grid.ny() - 1;
+       max_z = grid.nz() - 1;
+   }
+
+   // Double the previous local presearch margin.
+   constexpr int kMinSearchMarginXY = 4;
+   constexpr int kMinSearchMarginZ = 2;
+
+   min_x = std::max(0, min_x - kMinSearchMarginXY);
+   min_y = std::max(0, min_y - kMinSearchMarginXY);
+   min_z = std::max(0, min_z - kMinSearchMarginZ);
+   max_x = std::min(grid.nx() - 1, max_x + kMinSearchMarginXY);
+   max_y = std::min(grid.ny() - 1, max_y + kMinSearchMarginXY);
+   max_z = std::min(grid.nz() - 1, max_z + kMinSearchMarginZ);
+
+   return {min_x, max_x, min_y, max_y, min_z, max_z};
+}
+
+bool pointInMinimumSearchBounds(const GridPoint& point, const MinimumSearchBounds& bounds) {
+   return point.x >= bounds.min_x && point.x <= bounds.max_x
+       && point.y >= bounds.min_y && point.y <= bounds.max_y
+       && point.z >= bounds.min_z && point.z <= bounds.max_z;
+}
+
 
 int minimumSegmentCountToAnyGoal(
    const Grid3D& trace_grid,
@@ -886,7 +1203,9 @@ int minimumSegmentCountToAnyGoal(
    const std::vector<GridPoint>& goal_vertices,
    const PadGeometry* goal_pad,
    const std::vector<PadGeometry>* pads,
-   double via_diameter
+   double via_diameter,
+   const RouteRequest* request = nullptr,
+   int net_id = 0
 ) {
    if (!trace_grid.inBounds(start) || goal_vertices.empty()) {
        return -1;
@@ -904,6 +1223,15 @@ int minimumSegmentCountToAnyGoal(
    }
    if (isGoalPoint(trace_grid, start, goal_indices)) {
        return 0;
+   }
+
+   bool use_local_bounds = request != nullptr;
+   MinimumSearchBounds local_bounds;
+   if (use_local_bounds) {
+       local_bounds = buildMinimumSearchBounds(trace_grid, start, goal_vertices, *request, net_id);
+       if (!pointInMinimumSearchBounds(start, local_bounds)) {
+           return -1;
+       }
    }
 
    constexpr int kNoDirection = 10;
@@ -980,6 +1308,9 @@ int minimumSegmentCountToAnyGoal(
 
        for (const auto& delta : kDijkstraDeltas) {
            GridPoint next{current.x + delta[0], current.y + delta[1], current.z + delta[2]};
+           if (use_local_bounds && !pointInMinimumSearchBounds(next, local_bounds)) {
+               continue;
+           }
            if (isObstacleForPath(trace_grid, next, goal_indices)) {
                continue;
            }
@@ -1028,7 +1359,7 @@ int minimumSegmentCountToAnyGoal(
 }
 
 
-std::vector<GridPoint> castRays360(
+std::vector<RayCastCandidate> castRays360(
    const Grid3D& trace_grid,
    const Grid3D& via_grid,
    const GridPoint& origin,
@@ -1039,22 +1370,25 @@ std::vector<GridPoint> castRays360(
    int prev_dy = 0,
    int prev_dz = 0
 ) {
-   std::vector<GridPoint> candidates;
+   std::vector<RayCastCandidate> candidates;
    for (const auto& dir : kPlanarRayDirs) {
        int dx = dir[0];
        int dy = dir[1];
        if (!isAngleValid(prev_dx, prev_dy, prev_dz, dx, dy, 0)) {
            continue;
        }
+       const double step_len = (std::abs(dx) + std::abs(dy) == 2) ? kSqrt2 : 1.0;
+       double ray_len = step_len;
        int curr_x = origin.x + dx;
        int curr_y = origin.y + dy;
        while (trace_grid.inBounds({curr_x, curr_y, origin.z})) {
            if (!isLineOfSightClear(trace_grid, origin.x, origin.y, origin.z, curr_x, curr_y, goal_indices)) {
                break;
            }
-           candidates.push_back({curr_x, curr_y, origin.z});
+           candidates.push_back({{curr_x, curr_y, origin.z}, ray_len});
            curr_x += dx;
            curr_y += dy;
+           ray_len += step_len;
        }
    }
 
@@ -1066,7 +1400,7 @@ std::vector<GridPoint> castRays360(
        int dz = target_z - origin.z;
        if (isAngleValid(prev_dx, prev_dy, prev_dz, 0, 0, dz)
            && isViaClear(via_grid, origin.x, origin.y, origin.z, target_z, pads, via_diameter)) {
-           candidates.push_back({origin.x, origin.y, target_z});
+           candidates.push_back({{origin.x, origin.y, target_z}, static_cast<double>(std::abs(dz))});
        }
    }
    return candidates;
@@ -1242,9 +1576,9 @@ double segmentLengthPenaltyForTarget(
    const GridPoint& path_start,
    const GridPoint& guide_goal,
    const GridPoint& curr,
-   const GridPoint& candidate,
    int current_depth,
-   double target_segments
+   double target_segments,
+   double actual_len
 ) {
    double total_progress = goalAxisLength(path_start, guide_goal);
    if (total_progress <= 1e-9) {
@@ -1255,7 +1589,6 @@ double segmentLengthPenaltyForTarget(
    double remaining_segments = std::max(1.0, target_segments - static_cast<double>(current_depth));
    double remaining_progress = std::max(0.0, total_progress - progress_now);
    double ideal_len = remaining_progress / remaining_segments;
-   double actual_len = pathSegmentLength(curr, candidate);
    double shortfall = std::max(0.0, kIdealSegmentLengthFraction * ideal_len - actual_len);
    return shortfall * shortfall;
 }
@@ -2049,8 +2382,8 @@ std::vector<std::vector<GridPoint>> findAllExactSegmentPathsToAnyGoal(
    } else {
        auto first_points = castRays360(trace_grid, via_grid, start, goal_indices, pads, via_diameter, 0, 0, 0);
        first_candidates.reserve(first_points.size());
-       for (const auto& point : first_points) {
-           first_candidates.push_back({start, point});
+       for (const auto& candidate : first_points) {
+           first_candidates.push_back({start, candidate.point, candidate.ray_len});
        }
    }
 
@@ -2117,9 +2450,9 @@ std::vector<std::vector<GridPoint>> findAllExactSegmentPathsToAnyGoal(
                candidate.boundary_start,
                guide_goal,
                candidate.boundary_start,
-               p,
                0,
-               target_segment
+               target_segment,
+               candidate.ray_len
            );
            double heuristic_score = target_base;
            if (uniform_heuristic) {
@@ -2277,7 +2610,9 @@ std::vector<std::vector<GridPoint>> generateCandidatePaths(
    double via_diameter,
    std::size_t max_results,
    int max_candidate_segments,
-   bool backward_search = false
+   bool backward_search = false,
+   const RouteRequest* request = nullptr,
+   int net_id = 0
 ) {
    std::vector<std::vector<GridPoint>> all_paths;
    int nearest = std::numeric_limits<int>::max();
@@ -2562,9 +2897,6 @@ std::vector<std::vector<GridPoint>> generateCandidatePaths(
        }
        return a.size() < b.size();
    });
-   if (all_paths.size() > total_result_cap) {
-       all_paths.resize(total_result_cap);
-   }
    return all_paths;
 }
 
@@ -2846,7 +3178,10 @@ RouteResult runDijkstraTest(const RouteRequest& request) {
            &request.pads,
            request.generated_via_diameter,
            100,
-           max_candidate_segments
+           max_candidate_segments,
+           false,
+           &request,
+           net_id
        );
        candidate_paths.insert(candidate_paths.end(), paths.begin(), paths.end());
    }
@@ -2869,7 +3204,9 @@ RouteResult runDijkstraTest(const RouteRequest& request) {
            request.generated_via_diameter,
            100,
            max_candidate_segments,
-           true
+           true,
+           &request,
+           net_id
        );
        for (auto& path : paths) {
            std::reverse(path.begin(), path.end());
