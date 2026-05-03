@@ -68,6 +68,12 @@ constexpr double kUniformLayerGuideStart = 0.45;
 constexpr double kUniformLayerGuideSpan = 0.35;
 constexpr std::size_t kUniformLateBranchReserve = 24;
 constexpr double kPerSegmentRoleReserveFraction = 0.25;
+constexpr double kPathReusePenaltyWeightUniform = 0.45;
+constexpr double kPathReusePenaltyWeightGreedy = 0.30;
+constexpr double kPathReuseLocalNeighborScale = 0.35;
+constexpr double kPathReusePenaltyPerVertex = 1.0;
+constexpr std::size_t kPathPenaltyEndpointExemptionVertices = 6;
+constexpr double kForcedBacktrackDepthRatio = 0.55;
 constexpr int kBaseStepLimit = 1000;
 constexpr int kDijkstraStepBase = 15000;
 constexpr unsigned int kRandomSeed = 88;
@@ -1430,7 +1436,10 @@ unsigned int spatialHash(int x, int y, int z, unsigned int seed) {
 
 
 double spatialNoise(int x, int y, int z, unsigned int seed) {
-   return ((spatialHash(x, y, z, seed) % 10000) / 10000.0 - 0.5) * 0.1;
+   // Fast path: bitmask instead of modulo/divide in the hottest scoring loop.
+   constexpr double kInvMax16 = 1.0 / 65535.0;
+   unsigned int h = spatialHash(x, y, z, seed);
+   return ((static_cast<double>(h & 0xFFFFu) * kInvMax16) - 0.5) * 0.1;
 }
 
 
@@ -2047,6 +2056,12 @@ std::vector<std::vector<GridPoint>> dfsRangeSegmentPathsToAnyGoal(
    int last_logged_min_target = -1;
    int last_logged_max_target = -1;
    int debug_log_budget = debug_logs ? 24 : 0;
+   std::size_t total_found_paths = 0;
+   bool first_path_found = false;
+   const std::size_t penalty_grid_size = static_cast<std::size_t>(trace_grid.nx())
+       * static_cast<std::size_t>(trace_grid.ny())
+       * static_cast<std::size_t>(trace_grid.nz());
+   std::vector<double> path_penalty_grid(penalty_grid_size, 0.0);
    std::vector<DfsState> stack;
    stack.reserve(1000);
    stack.push_back({initial_curr, initial_depth, std::move(initial_path)});
@@ -2108,12 +2123,51 @@ std::vector<std::vector<GridPoint>> dfsRangeSegmentPathsToAnyGoal(
                    }
                    bucket_paths[bucket_index].push_back(finished);
                    ++buckets[bucket_index].found_count;
+                   ++total_found_paths;
                    buckets[bucket_index].hp = static_cast<double>(full_hp);
                    remaining_steps = full_hp;
+                   if (!first_path_found) {
+                       first_path_found = true;
+                   }
+
+                   auto accumulate_vertex_penalty = [&](const GridPoint& p, double amount) {
+                       if (!trace_grid.inBounds(p)) {
+                           return;
+                       }
+                       path_penalty_grid[trace_grid.flatten(p)] += amount;
+                   };
+                   std::size_t exemption = std::min(
+                       kPathPenaltyEndpointExemptionVertices,
+                       finished.size() / 2
+                   );
+                   for (std::size_t i = 0; i < finished.size(); ++i) {
+                       if (i < exemption || i + exemption >= finished.size()) {
+                           continue;
+                       }
+                       const auto& p = finished[i];
+                       accumulate_vertex_penalty(p, kPathReusePenaltyPerVertex);
+                       for (const auto& delta : kNeighborDeltas) {
+                           GridPoint neighbor{p.x + delta[0], p.y + delta[1], p.z + delta[2]};
+                           accumulate_vertex_penalty(neighbor, kPathReusePenaltyPerVertex * kPathReuseLocalNeighborScale);
+                       }
+                   }
+
+                   if (first_path_found && !stack.empty()) {
+                       int current_depth = state.depth;
+                       int keep_depth = std::max(
+                           initial_depth,
+                           static_cast<int>(std::floor(static_cast<double>(current_depth) * kForcedBacktrackDepthRatio))
+                       );
+                       while (!stack.empty() && stack.back().depth > keep_depth) {
+                           stack.pop_back();
+                       }
+                   }
+
                    if (debug_log_budget > 0) {
                        std::cout << "            bucket " << buckets[bucket_index].segment
                                  << " found path " << buckets[bucket_index].found_count
-                                 << "/" << max_results << " hp reset" << std::endl;
+                                 << "/" << max_results << " hp reset"
+                                 << " total_found=" << total_found_paths << std::endl;
                        --debug_log_budget;
                    }
                    if (buckets[bucket_index].found_count >= max_results) {
@@ -2207,42 +2261,69 @@ std::vector<std::vector<GridPoint>> dfsRangeSegmentPathsToAnyGoal(
            score_targets.push_back(buckets[static_cast<std::size_t>(index)].segment);
        }
        auto next_points = castRays360(trace_grid, via_grid, curr, goal_indices, pads, via_diameter, prev_dx, prev_dy, prev_dz);
-       auto score = [&](const GridPoint& p) {
+       struct ScoreTargetParams {
+           int target = 1;
+           double dynamic_via_penalty = kViaPenalty;
+           double uniform_penalty_scale = 1.0;
+           double tx = 0.0;
+           double ty = 0.0;
+           double tz = 0.0;
+       };
+       std::vector<ScoreTargetParams> score_target_params;
+       score_target_params.reserve(score_targets.size());
+       for (int target : score_targets) {
+           ScoreTargetParams params;
+           params.target = target;
+           double progress = static_cast<double>(state.depth) / std::max(1, target - 1);
+           double curve_factor = 4.0 * (progress - 0.5) * (progress - 0.5);
+           params.dynamic_via_penalty = kViaPenalty * (curve_factor * (1.0 - kMinDiscount) + kMinDiscount);
+           if (uniform_heuristic) {
+               int remaining_segments = std::max(1, target - state.depth);
+               params.tx = curr.x + (guide_goal.x - curr.x) / static_cast<double>(remaining_segments);
+               params.ty = curr.y + (guide_goal.y - curr.y) / static_cast<double>(remaining_segments);
+               params.tz = uniformGuideLayerTarget(curr, guide_goal, state.depth + 1, target);
+               params.uniform_penalty_scale = uniformPenaltyScale(state.depth + 1, target);
+               params.dynamic_via_penalty *= uniformViaPenaltyScale(state.depth + 1, target);
+           } else {
+               params.tx = guide_goal.x;
+               params.ty = guide_goal.y;
+               params.tz = guide_goal.z;
+           }
+           score_target_params.push_back(params);
+       }
+       const double path_reuse_penalty_weight = uniform_heuristic
+           ? kPathReusePenaltyWeightUniform
+           : kPathReusePenaltyWeightGreedy;
+       const GridPoint& path_start = path.front();
+       auto score = [&](const RayCastCandidate& candidate) {
+           const GridPoint& p = candidate.point;
            double base = std::numeric_limits<double>::infinity();
-           for (int target : score_targets) {
-               double progress = static_cast<double>(state.depth) / std::max(1, target - 1);
-               double curve_factor = 4.0 * (progress - 0.5) * (progress - 0.5);
-               double dynamic_via_penalty = kViaPenalty * (curve_factor * (1.0 - kMinDiscount) + kMinDiscount);
-               double uniform_penalty_scale = 1.0;
-               double tx = 0.0;
-               double ty = 0.0;
-               double tz = 0.0;
-               if (uniform_heuristic) {
-                   int remaining_segments = std::max(1, target - state.depth);
-                   tx = curr.x + (guide_goal.x - curr.x) / static_cast<double>(remaining_segments);
-                   ty = curr.y + (guide_goal.y - curr.y) / static_cast<double>(remaining_segments);
-                   tz = uniformGuideLayerTarget(curr, guide_goal, state.depth + 1, target);
-                   uniform_penalty_scale = uniformPenaltyScale(state.depth + 1, target);
-                   dynamic_via_penalty *= uniformViaPenaltyScale(state.depth + 1, target);
-               } else {
-                   tx = guide_goal.x;
-                   ty = guide_goal.y;
-                   tz = guide_goal.z;
-               }
-               double dx = p.x - tx;
-               double dy = p.y - ty;
-               double dz = p.z - tz;
-               double target_base = dx * dx + dy * dy + dz * dz * dynamic_via_penalty;
-               double progress_penalty = progressPenaltyForTarget(path.front(), guide_goal, p, state.depth + 1, target);
-               double length_penalty = segmentLengthPenaltyForTarget(path.front(), guide_goal, curr, p, state.depth, target);
+           const std::size_t p_index = trace_grid.flatten(p);
+           const double reuse_penalty = path_penalty_grid[p_index];
+           const double reuse_penalty_term = path_reuse_penalty_weight * reuse_penalty;
+           for (const auto& params : score_target_params) {
+               double dx = p.x - params.tx;
+               double dy = p.y - params.ty;
+               double dz = p.z - params.tz;
+               double target_base = dx * dx + dy * dy + dz * dz * params.dynamic_via_penalty;
+               double progress_penalty = progressPenaltyForTarget(path_start, guide_goal, p, state.depth + 1, params.target);
+               double length_penalty = segmentLengthPenaltyForTarget(
+                   path_start,
+                   guide_goal,
+                   curr,
+                   state.depth,
+                   params.target,
+                   candidate.ray_len
+               );
                double heuristic_score = target_base;
                if (uniform_heuristic) {
-                   heuristic_score += uniform_penalty_scale * kProgressPenaltyWeightUniform * progress_penalty;
-                   heuristic_score += uniform_penalty_scale * kSegmentLengthPenaltyWeightUniform * length_penalty;
+                   heuristic_score += params.uniform_penalty_scale * kProgressPenaltyWeightUniform * progress_penalty;
+                   heuristic_score += params.uniform_penalty_scale * kSegmentLengthPenaltyWeightUniform * length_penalty;
                } else {
                    heuristic_score += kProgressPenaltyWeightGreedy * progress_penalty;
                    heuristic_score += kSegmentLengthPenaltyWeightGreedy * length_penalty;
                }
+               heuristic_score += reuse_penalty_term;
                if (heuristic_score < base) {
                    base = heuristic_score;
                }
@@ -2256,13 +2337,13 @@ std::vector<std::vector<GridPoint>> dfsRangeSegmentPathsToAnyGoal(
 
 
        struct ScoredGridPoint {
-           GridPoint point;
+           RayCastCandidate candidate;
            double score;
        };
        std::vector<ScoredGridPoint> scored_next_points;
        scored_next_points.reserve(next_points.size());
-       for (auto& point : next_points) {
-           scored_next_points.push_back({point, score(point)});
+       for (auto& candidate : next_points) {
+           scored_next_points.push_back({candidate, score(candidate)});
        }
        std::sort(scored_next_points.begin(), scored_next_points.end(), [&](const ScoredGridPoint& a, const ScoredGridPoint& b) {
            long long scaled_a = std::llround(a.score * 1000000.0);
@@ -2270,18 +2351,18 @@ std::vector<std::vector<GridPoint>> dfsRangeSegmentPathsToAnyGoal(
            if (scaled_a != scaled_b) {
                return scaled_a > scaled_b;
            }
-           if (a.point.x != b.point.x) {
-               return a.point.x > b.point.x;
+           if (a.candidate.point.x != b.candidate.point.x) {
+               return a.candidate.point.x > b.candidate.point.x;
            }
-           if (a.point.y != b.point.y) {
-               return a.point.y > b.point.y;
+           if (a.candidate.point.y != b.candidate.point.y) {
+               return a.candidate.point.y > b.candidate.point.y;
            }
-           return a.point.z > b.point.z;
+           return a.candidate.point.z > b.candidate.point.z;
        });
        next_points.clear();
        next_points.reserve(scored_next_points.size());
        for (auto& scored_point : scored_next_points) {
-           next_points.push_back(scored_point.point);
+           next_points.push_back(std::move(scored_point.candidate));
        }
        unsigned int diversify_seed = heuristic_seed_salt
            ^ static_cast<unsigned int>((state.depth + 1) * 2246822519U)
@@ -2300,7 +2381,7 @@ std::vector<std::vector<GridPoint>> dfsRangeSegmentPathsToAnyGoal(
 
        std::size_t branch_limit = state.depth == 0 ? std::min<std::size_t>(next_points.size(), 480) : next_points.size();
        for (std::size_t i = 0; i < branch_limit; ++i) {
-           const auto& next = next_points[i];
+           const auto& next = next_points[i].point;
            if (isGoalPoint(trace_grid, next, goal_indices) || pointInPath(path, next)) {
                continue;
            }
@@ -2638,7 +2719,17 @@ std::vector<std::vector<GridPoint>> generateCandidatePaths(
    std::cout << "  dynamic_step_limit " << dynamic_step_limit << std::endl;
 
 
-   int minimum_segments = minimumSegmentCountToAnyGoal(trace_grid, via_grid, start, goals, goal_pad, pads, via_diameter);
+   int minimum_segments = minimumSegmentCountToAnyGoal(
+       trace_grid,
+       via_grid,
+       start,
+       goals,
+       goal_pad,
+       pads,
+       via_diameter,
+       request,
+       net_id
+   );
    if (minimum_segments < 0) {
        std::cout << "  minimum_segment_presearch found no reachable grid path" << std::endl;
        return {};
