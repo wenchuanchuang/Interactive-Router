@@ -380,6 +380,9 @@ class RoutePreviewCanvas(QGraphicsView):
         ripped_net_ids: set[int] | None = None,
     ) -> None:
         self._scene.clear()
+        if _looks_like_freerouting_ripup(route_results):
+            self._show_freerouting_ripup_routes(route_results, board, ripped_net_ids)
+            return
         route_paths = _preview_route_paths(route_results)
         if not route_paths:
             self.show_message("No route path")
@@ -416,6 +419,80 @@ class RoutePreviewCanvas(QGraphicsView):
 
         net_ids = ", ".join(str(int(getattr(result, "net_id", 0))) for result in route_results)
         label = QGraphicsTextItem(f"Nets {net_ids} | {len(route_paths)} candidates")
+        label.setDefaultTextColor(QColor("#ffffff"))
+        label.setPos(8, 8)
+        label.setZValue(10)
+        self._scene.addItem(label)
+        self._scene.setSceneRect(self._scene.itemsBoundingRect().adjusted(-40, -40, 40, 40))
+        self._zoom_level = 1.0
+        self.fitInView(self._scene.itemsBoundingRect().adjusted(-30, -30, 30, 30), Qt.KeepAspectRatio)
+
+    def _show_freerouting_ripup_routes(
+        self,
+        route_results,
+        board: BoardData | None,
+        ripped_net_ids: set[int] | None,
+    ) -> None:
+        all_points = []
+        for route_result in route_results:
+            for segment in getattr(route_result, "segments", []):
+                all_points.append(_SegmentPoint(segment.start))
+                all_points.append(_SegmentPoint(segment.end))
+            for via in getattr(route_result, "vias", []):
+                all_points.append(_SegmentPoint(via.center))
+        if not all_points:
+            self.show_message("No ripped route data")
+            return
+
+        ripped_net_ids = ripped_net_ids or set()
+        scale = 22.0
+        min_x, min_y = _preview_origin(all_points, board)
+        if board is not None:
+            self._draw_preview_board(board, ripped_net_ids, scale, min_x, min_y)
+
+        halo_pen = QPen(QColor("#111318"), 9.0, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+        overlay_net_ids = []
+        segment_count = 0
+        via_count = 0
+        for route_result in route_results:
+            net_id = int(getattr(route_result, "net_id", 0))
+            occurrence_index = int(getattr(route_result, "occurrence_index", 0))
+            if occurrence_index > 0:
+                overlay_net_ids.append(f"{net_id}@E{occurrence_index}")
+            else:
+                overlay_net_ids.append(str(net_id))
+            layer_hint = "F.Cu"
+            for segment in getattr(route_result, "segments", []):
+                segment_count += 1
+                layer_hint = getattr(segment, "layer", layer_hint)
+                x1, y1 = _preview_point(_SegmentPoint(segment.start), scale, min_x, min_y)
+                x2, y2 = _preview_point(_SegmentPoint(segment.end), scale, min_x, min_y)
+                self._scene.addLine(x1, y1, x2, y2, halo_pen).setZValue(40)
+                route_color = _layer_highlight_color(layer_hint)
+                route_pen = QPen(
+                    route_color,
+                    max(getattr(segment, "width", 0.2) * scale, 4.0),
+                    _layer_pen_style(layer_hint),
+                    Qt.RoundCap,
+                    Qt.RoundJoin,
+                )
+                self._scene.addLine(x1, y1, x2, y2, route_pen).setZValue(_layer_z_value(layer_hint) + 41)
+            for via in getattr(route_result, "vias", []):
+                via_count += 1
+                x, y = _preview_point(_SegmentPoint(via.center), scale, min_x, min_y)
+                diameter = max(getattr(via, "diameter", 0.6) * scale, 8.0)
+                marker = QGraphicsEllipseItem(x - diameter / 2, y - diameter / 2, diameter, diameter)
+                marker.setBrush(QBrush(_layer_highlight_color(layer_hint)))
+                pen = QPen(QColor("#ffffff"), 1.4)
+                pen.setCosmetic(True)
+                marker.setPen(pen)
+                marker.setZValue(60)
+                self._scene.addItem(marker)
+
+        label = QGraphicsTextItem(
+            f"Ripped-route preview | {len(route_results)} occurrences | "
+            f"{segment_count} segments | {via_count} vias"
+        )
         label.setDefaultTextColor(QColor("#ffffff"))
         label.setPos(8, 8)
         label.setZValue(10)
@@ -513,6 +590,7 @@ class RoutePreviewCanvas(QGraphicsView):
 
 
 def _layer_color(layer: str) -> QColor:
+    layer = _canonical_layer_name(layer)
     if layer == "F.Cu":
         return QColor("#f15a3b")
     if layer == "B.Cu":
@@ -525,6 +603,7 @@ def _layer_color(layer: str) -> QColor:
 
 
 def _layer_highlight_color(layer: str) -> QColor:
+    layer = _canonical_layer_name(layer)
     if layer == "F.Cu":
         return QColor("#ffd21f")
     if layer == "B.Cu":
@@ -537,6 +616,7 @@ def _layer_highlight_color(layer: str) -> QColor:
 
 
 def _two_pin_color(layer: str) -> QColor:
+    layer = _canonical_layer_name(layer)
     if layer == "F.Cu":
         return QColor("#ff9b2f")
     if layer == "B.Cu":
@@ -547,6 +627,7 @@ def _two_pin_color(layer: str) -> QColor:
 
 
 def _layer_pen_style(layer: str) -> Qt.PenStyle:
+    layer = _canonical_layer_name(layer)
     if layer == "B.Cu":
         return Qt.DashLine
     if layer.startswith("In") and layer.endswith(".Cu"):
@@ -555,6 +636,7 @@ def _layer_pen_style(layer: str) -> Qt.PenStyle:
 
 
 def _layer_z_value(layer: str) -> float:
+    layer = _canonical_layer_name(layer)
     if layer == "F.Cu":
         return 6
     if layer == "B.Cu":
@@ -662,8 +744,28 @@ def _point_y(point: object) -> float:
     return float(getattr(point, "y"))
 
 
+def _looks_like_freerouting_ripup(route_results) -> bool:
+    if not route_results:
+        return False
+    return any(hasattr(route_result, "segments") for route_result in route_results)
+
+
+class _SegmentPoint:
+    def __init__(self, point: tuple[float, float]):
+        self.x = float(point[0])
+        self.y = float(point[1])
+
+
 def _same_layer(layer: str, current_layer: str) -> bool:
-    return layer == current_layer
+    return _canonical_layer_name(layer) == _canonical_layer_name(current_layer)
+
+
+def _canonical_layer_name(layer: str) -> str:
+    if layer == "Top":
+        return "F.Cu"
+    if layer == "Bottom":
+        return "B.Cu"
+    return layer
 
 
 def _component_layers_from_footprint(layer: str) -> tuple[str, ...]:

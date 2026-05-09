@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from math import ceil
@@ -16,6 +18,8 @@ from router_app.kicad_parser import BoardData, load_board
 from router_app.path_selector import SelectionResult
 from router_app.path_selector.types import NetSelection as PyNetSelection
 
+_DLL_DIR_HANDLES: list[Any] = []
+
 
 @dataclass(frozen=True)
 class RerouteOutcome:
@@ -24,6 +28,7 @@ class RerouteOutcome:
     result: Any | None = None
     elapsed_seconds: float | None = None
     candidate_export_path: Path | None = None
+    selector_external_only: bool = False
 
 
 def select_reroute_candidates(
@@ -55,13 +60,47 @@ def select_reroute_candidates(
 
     exported_boundary_by_net = _load_exported_boundary_vertices(outcome.candidate_export_path)
     selector_board = _load_selector_board(outcome.candidate_export_path)
+    max_ripped_clearance = _max_ripped_clearance(
+        selector_board,
+        [int(getattr(result, "net_id", 0)) for result in outcome.result],
+    ) if selector_board is not None else 0.0
+    freerouting_occurrences_by_net = _load_freerouting_occurrences_by_net(selector_board)
     nets = []
     for result in outcome.result:
         item = router_core.NetCandidateSet()
         item.net_id = int(getattr(result, "net_id", 0))
-        item.candidate_paths_grid = list(getattr(result, "candidate_paths_grid", []))
-        item.candidate_paths_mm = list(getattr(result, "candidate_paths_mm", []))
-        boundary_payload = exported_boundary_by_net.get(item.net_id, [])
+        candidate_paths_grid: list[list[Any]]
+        candidate_paths_mm: list[list[Any]]
+        if outcome.selector_external_only:
+            candidate_paths_grid = []
+            candidate_paths_mm = []
+        else:
+            candidate_paths_grid = list(getattr(result, "candidate_paths_grid", []))
+            candidate_paths_mm = list(getattr(result, "candidate_paths_mm", []))
+        boundary_payload = list(exported_boundary_by_net.get(item.net_id, []))
+        external_summary = {"original": 0, "freerouting": 0, "vertices": 0}
+        if selector_board is not None:
+            _append_external_candidates_for_selector(
+                router_core=router_core,
+                board=selector_board,
+                result=result,
+                net_id=item.net_id,
+                max_ripped_clearance=max_ripped_clearance,
+                freerouting_occurrences=freerouting_occurrences_by_net.get(item.net_id, []),
+                candidate_paths_grid=candidate_paths_grid,
+                candidate_paths_mm=candidate_paths_mm,
+                boundary_payload=boundary_payload,
+                summary=external_summary,
+            )
+        item.candidate_paths_grid = candidate_paths_grid
+        item.candidate_paths_mm = candidate_paths_mm
+        # Keep Python-side results aligned with selector candidates so GUI preview
+        # can render the exact candidate index chosen by Gurobi.
+        try:
+            setattr(result, "candidate_paths_grid", candidate_paths_grid)
+            setattr(result, "candidate_paths_mm", candidate_paths_mm)
+        except Exception:
+            pass
         (
             item.candidate_boundary_vertices,
             item.candidate_terminal_coords,
@@ -71,13 +110,21 @@ def select_reroute_candidates(
             selector_board,
             result,
             item.net_id,
-            item.candidate_paths_grid,
+            candidate_paths_grid,
             boundary_payload,
         )
         item.candidate_terminal_groups = _normalize_terminal_groups_for_net(
             router_core,
             item.candidate_terminal_groups,
             item.candidate_terminal_coords,
+        )
+        print(
+            "selector_external_candidates "
+            f"net={item.net_id} "
+            f"original={external_summary['original']} "
+            f"freerouting={external_summary['freerouting']} "
+            f"boundary_vertices={external_summary['vertices']}",
+            flush=True,
         )
         nets.append(item)
     request.nets = nets
@@ -275,6 +322,859 @@ def _selector_boundary_payload_from_export(
     return boundary_vertices, terminal_coords, terminal_groups
 
 
+def _append_external_candidates_for_selector(
+    router_core: Any,
+    board: BoardData,
+    result: Any,
+    net_id: int,
+    max_ripped_clearance: float,
+    freerouting_occurrences: list[dict[str, Any]],
+    candidate_paths_grid: list[list[Any]],
+    candidate_paths_mm: list[list[Any]],
+    boundary_payload: list[list[dict[str, Any]]],
+    summary: dict[str, int],
+) -> None:
+    existing_keys: set[tuple[tuple[int, int, int], ...]] = set()
+    for raw_vertices in boundary_payload:
+        key = _boundary_payload_key(raw_vertices)
+        if key:
+            existing_keys.add(key)
+
+    anchors = _default_anchors_for_result(result)
+    if anchors is None:
+        return
+    start_anchor, goal_anchor = anchors
+
+    original_segments, original_vias = _collect_original_route_primitives(
+        board=board,
+        result=result,
+        net_id=net_id,
+        max_ripped_clearance=max_ripped_clearance,
+    )
+    original_raw = _build_boundary_payload_from_primitives(
+        board=board,
+        result=result,
+        net_id=net_id,
+        start_anchor=start_anchor,
+        goal_anchor=goal_anchor,
+        segments=original_segments,
+        vias=original_vias,
+    )
+    if _append_external_payload_candidate(
+        router_core=router_core,
+        board=board,
+        result=result,
+        start_anchor=start_anchor,
+        goal_anchor=goal_anchor,
+        raw_vertices=original_raw,
+        candidate_paths_grid=candidate_paths_grid,
+        candidate_paths_mm=candidate_paths_mm,
+        boundary_payload=boundary_payload,
+        existing_keys=existing_keys,
+        segments=original_segments,
+        vias=original_vias,
+    ):
+        summary["original"] += 1
+        summary["vertices"] += len(original_raw)
+    else:
+        print(
+            f"selector_external_missing_path net={net_id} source=original",
+            flush=True,
+        )
+
+    for occurrence in freerouting_occurrences:
+        occurrence_index = int(occurrence.get("event_index", 0))
+        occ_segments, occ_vias = _collect_freerouting_occurrence_primitives(
+            board=board,
+            result=result,
+            max_ripped_clearance=max_ripped_clearance,
+            occurrence=occurrence,
+        )
+        occ_graph = _collect_freerouting_occurrence_graph(
+            board=board,
+            result=result,
+            occurrence=occurrence,
+        )
+        occ_raw = _build_boundary_payload_from_primitives(
+            board=board,
+            result=result,
+            net_id=net_id,
+            start_anchor=start_anchor,
+            goal_anchor=goal_anchor,
+            segments=occ_segments,
+            vias=occ_vias,
+        )
+        if _append_external_payload_candidate(
+            router_core=router_core,
+            board=board,
+            result=result,
+            start_anchor=start_anchor,
+            goal_anchor=goal_anchor,
+            raw_vertices=occ_raw,
+            candidate_paths_grid=candidate_paths_grid,
+            candidate_paths_mm=candidate_paths_mm,
+            boundary_payload=boundary_payload,
+            existing_keys=existing_keys,
+            segments=occ_segments,
+            vias=occ_vias,
+            explicit_graph=occ_graph,
+        ):
+            summary["freerouting"] += 1
+            summary["vertices"] += len(occ_raw)
+        else:
+            print(
+                f"selector_external_missing_path net={net_id} source=freerouting occurrence_index={occurrence_index}",
+                flush=True,
+            )
+
+
+def _append_external_payload_candidate(
+    router_core: Any,
+    board: BoardData,
+    result: Any,
+    start_anchor: tuple[int, int, int],
+    goal_anchor: tuple[int, int, int],
+    raw_vertices: list[dict[str, Any]],
+    candidate_paths_grid: list[list[Any]],
+    candidate_paths_mm: list[list[Any]],
+    boundary_payload: list[list[dict[str, Any]]],
+    existing_keys: set[tuple[tuple[int, int, int], ...]],
+    segments: list[dict[str, Any]] | None = None,
+    vias: list[dict[str, Any]] | None = None,
+    explicit_graph: dict[str, Any] | None = None,
+) -> bool:
+    full_path_vertices = _build_external_centerline_grid_path(
+        result=result,
+        start_anchor=start_anchor,
+        goal_anchor=goal_anchor,
+        segments=segments or [],
+        vias=vias or [],
+        explicit_graph=explicit_graph,
+    )
+    if len(full_path_vertices) < 2:
+        return False
+    key = _boundary_payload_key(raw_vertices)
+    if not key or key in existing_keys:
+        return False
+    existing_keys.add(key)
+    boundary_payload.append(raw_vertices)
+    grid_points = [
+        router_core.GridPoint(vertex[0], vertex[1], vertex[2])
+        for vertex in full_path_vertices
+    ]
+    mm_points = [
+        router_core.Point2D(*_grid_vertex_to_mm(result, vertex))
+        for vertex in full_path_vertices
+    ]
+    candidate_paths_grid.append(grid_points)
+    candidate_paths_mm.append(mm_points)
+    return True
+
+
+def _default_anchors_for_result(result: Any) -> tuple[tuple[int, int, int], tuple[int, int, int]] | None:
+    start_vertices = list(getattr(result, "start_vertices", []))
+    goal_vertices = list(getattr(result, "goal_vertices", []))
+    if not start_vertices or not goal_vertices:
+        return None
+    return (
+        _grid_point_to_vertex_tuple(start_vertices[0]),
+        _grid_point_to_vertex_tuple(goal_vertices[0]),
+    )
+
+
+def _build_original_route_boundary_payload(
+    board: BoardData,
+    result: Any,
+    net_id: int,
+    start_anchor: tuple[int, int, int],
+    goal_anchor: tuple[int, int, int],
+    max_ripped_clearance: float,
+) -> list[dict[str, Any]]:
+    segments, vias = _collect_original_route_primitives(
+        board=board,
+        result=result,
+        net_id=net_id,
+        max_ripped_clearance=max_ripped_clearance,
+    )
+    return _build_boundary_payload_from_primitives(
+        board=board,
+        result=result,
+        net_id=net_id,
+        start_anchor=start_anchor,
+        goal_anchor=goal_anchor,
+        segments=segments,
+        vias=vias,
+    )
+
+
+def _build_freerouting_occurrence_boundary_payload(
+    board: BoardData,
+    result: Any,
+    net_id: int,
+    start_anchor: tuple[int, int, int],
+    goal_anchor: tuple[int, int, int],
+    max_ripped_clearance: float,
+    occurrence: dict[str, Any],
+) -> list[dict[str, Any]]:
+    segments, vias = _collect_freerouting_occurrence_primitives(
+        board=board,
+        result=result,
+        max_ripped_clearance=max_ripped_clearance,
+        occurrence=occurrence,
+    )
+    return _build_boundary_payload_from_primitives(
+        board=board,
+        result=result,
+        net_id=net_id,
+        start_anchor=start_anchor,
+        goal_anchor=goal_anchor,
+        segments=segments,
+        vias=vias,
+    )
+
+
+def _collect_original_route_primitives(
+    board: BoardData,
+    result: Any,
+    net_id: int,
+    max_ripped_clearance: float,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    boundary_clearance = max(0.0, max_ripped_clearance) * 0.5
+    segments: list[dict[str, Any]] = []
+    for track in board.tracks:
+        if int(track.net_id) != net_id:
+            continue
+        z = _layer_index_from_name(board, track.layer)
+        if z is None:
+            continue
+        segments.append(
+            {
+                "start": (float(track.start[0]), float(track.start[1])),
+                "end": (float(track.end[0]), float(track.end[1])),
+                "z": z,
+                "radius_mm": float(track.width) * 0.5 + boundary_clearance,
+            }
+        )
+
+    default_z_end = max(0, int(getattr(result, "nz", 0)) - 1)
+    vias: list[dict[str, Any]] = []
+    for via in board.vias:
+        if int(via.net_id) != net_id:
+            continue
+        vias.append(
+            {
+                "center": (float(via.center[0]), float(via.center[1])),
+                "radius_mm": float(via.diameter) * 0.5 + boundary_clearance,
+                "z_start": 0,
+                "z_end": default_z_end,
+            }
+        )
+    return segments, vias
+
+
+def _collect_freerouting_occurrence_primitives(
+    board: BoardData,
+    result: Any,
+    max_ripped_clearance: float,
+    occurrence: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    boundary_clearance = max(0.0, max_ripped_clearance) * 0.5
+    segments: list[dict[str, Any]] = []
+    for segment in occurrence.get("segments", []):
+        z = _layer_index_from_name(board, str(segment.get("layer", "")))
+        if z is None:
+            continue
+        sx = float(segment.get("start", (0.0, 0.0))[0])
+        sy = float(segment.get("start", (0.0, 0.0))[1])
+        ex = float(segment.get("end", (0.0, 0.0))[0])
+        ey = float(segment.get("end", (0.0, 0.0))[1])
+        width = float(segment.get("width_mm", 0.2))
+        segments.append(
+            {
+                "start": (sx, sy),
+                "end": (ex, ey),
+                "z": z,
+                "radius_mm": width * 0.5 + boundary_clearance,
+            }
+        )
+
+    default_z_end = max(0, int(getattr(result, "nz", 0)) - 1)
+    vias: list[dict[str, Any]] = []
+    for via in occurrence.get("vias", []):
+        sx = _layer_index_from_name(board, str(via.get("start_layer", "")))
+        ex = _layer_index_from_name(board, str(via.get("end_layer", "")))
+        if sx is None and ex is None:
+            z_start = 0
+            z_end = default_z_end
+        else:
+            z_values = [z for z in (sx, ex) if z is not None]
+            z_start = min(z_values)
+            z_end = max(z_values)
+        center = via.get("center", (0.0, 0.0))
+        diameter = float(via.get("diameter_mm", 0.6))
+        vias.append(
+            {
+                "center": (float(center[0]), float(center[1])),
+                "radius_mm": diameter * 0.5 + boundary_clearance,
+                "z_start": z_start,
+                "z_end": z_end,
+            }
+        )
+    return segments, vias
+
+
+def _collect_freerouting_occurrence_graph(
+    board: BoardData,
+    result: Any,
+    occurrence: dict[str, Any],
+) -> dict[str, Any] | None:
+    raw_graph = occurrence.get("graph")
+    if not isinstance(raw_graph, dict):
+        return None
+    raw_nodes = raw_graph.get("nodes", [])
+    raw_edges = raw_graph.get("edges", [])
+    if not isinstance(raw_nodes, list) or not isinstance(raw_edges, list):
+        return None
+
+    nodes: list[dict[str, Any]] = []
+    for node in raw_nodes:
+        if not isinstance(node, dict):
+            continue
+        try:
+            node_id = int(node.get("id", -1))
+        except Exception:
+            continue
+        point = node.get("point", {})
+        if not isinstance(point, dict):
+            continue
+        z = _layer_index_from_name(board, str(node.get("layer", "")))
+        if z is None:
+            continue
+        vertex = _mm_to_grid_vertex(
+            result,
+            float(point.get("x_mm", 0.0)),
+            -float(point.get("y_mm", 0.0)),
+            z,
+        )
+        nodes.append({"id": node_id, "vertex": vertex})
+
+    edges: list[dict[str, int]] = []
+    for edge in raw_edges:
+        if not isinstance(edge, dict):
+            continue
+        try:
+            from_id = int(edge.get("from", -1))
+            to_id = int(edge.get("to", -1))
+        except Exception:
+            continue
+        edges.append({"from": from_id, "to": to_id})
+
+    if not nodes or not edges:
+        return None
+    return {"nodes": nodes, "edges": edges}
+
+
+def _build_boundary_payload_from_primitives(
+    board: BoardData,
+    result: Any,
+    net_id: int,
+    start_anchor: tuple[int, int, int],
+    goal_anchor: tuple[int, int, int],
+    segments: list[dict[str, Any]],
+    vias: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    shell = _primitive_occupied_vertex_shell(result, segments, vias)
+    filtered = _filter_boundary_vertices_with_pads(
+        board=board,
+        result=result,
+        net_id=net_id,
+        vertices=shell,
+        start_anchor=start_anchor,
+        goal_anchor=goal_anchor,
+        clearance=_clearance_for_net(board, net_id),
+    )
+    return _serialize_boundary_vertices_with_anchors(board, filtered, start_anchor, goal_anchor)
+
+
+def _build_external_centerline_grid_path(
+    result: Any,
+    start_anchor: tuple[int, int, int],
+    goal_anchor: tuple[int, int, int],
+    segments: list[dict[str, Any]],
+    vias: list[dict[str, Any]],
+    explicit_graph: dict[str, Any] | None = None,
+) -> list[tuple[int, int, int]]:
+    graph: dict[tuple[int, int, int], set[tuple[int, int, int]]] = {}
+
+    def add_edge(a: tuple[int, int, int], b: tuple[int, int, int]) -> None:
+        graph.setdefault(a, set()).add(b)
+        graph.setdefault(b, set()).add(a)
+
+    if explicit_graph:
+        vertices_by_id: dict[int, tuple[int, int, int]] = {}
+        for node in explicit_graph.get("nodes", []):
+            if not isinstance(node, dict):
+                continue
+            try:
+                node_id = int(node.get("id", -1))
+            except Exception:
+                continue
+            vertex = node.get("vertex")
+            if not isinstance(vertex, (tuple, list)) or len(vertex) != 3:
+                continue
+            v = (int(vertex[0]), int(vertex[1]), int(vertex[2]))
+            vertices_by_id[node_id] = v
+            graph.setdefault(v, set())
+        for edge in explicit_graph.get("edges", []):
+            if not isinstance(edge, dict):
+                continue
+            try:
+                from_id = int(edge.get("from", -1))
+                to_id = int(edge.get("to", -1))
+            except Exception:
+                continue
+            a = vertices_by_id.get(from_id)
+            b = vertices_by_id.get(to_id)
+            if a is None or b is None:
+                continue
+            add_edge(a, b)
+
+    if not graph:
+        for segment in segments:
+            z = int(segment.get("z", -1))
+            if z < 0:
+                continue
+            start = segment.get("start", (0.0, 0.0))
+            end = segment.get("end", (0.0, 0.0))
+            p0 = _mm_to_grid_vertex(result, float(start[0]), float(start[1]), z)
+            p1 = _mm_to_grid_vertex(result, float(end[0]), float(end[1]), z)
+            line = _rasterize_grid_line_2d(p0, p1)
+            if not line:
+                continue
+            for a, b in zip(line, line[1:]):
+                add_edge(a, b)
+            if len(line) == 1:
+                graph.setdefault(line[0], set())
+
+        for via in vias:
+            center = via.get("center", (0.0, 0.0))
+            z_start = int(via.get("z_start", 0))
+            z_end = int(via.get("z_end", 0))
+            step = 1 if z_end >= z_start else -1
+            column = [
+                _mm_to_grid_vertex(result, float(center[0]), float(center[1]), z)
+                for z in range(z_start, z_end + step, step)
+            ]
+            if not column:
+                continue
+            for vertex in column:
+                graph.setdefault(vertex, set())
+            for a, b in zip(column, column[1:]):
+                add_edge(a, b)
+
+    if not graph:
+        return []
+    start_vertex = _nearest_graph_vertex(start_anchor, graph)
+    goal_vertex = _nearest_graph_vertex(goal_anchor, graph)
+    if start_vertex is None or goal_vertex is None:
+        return []
+    return _shortest_grid_path(graph, start_vertex, goal_vertex)
+
+
+def _mm_to_grid_vertex(result: Any, x_mm: float, y_mm: float, z: int) -> tuple[int, int, int]:
+    pitch = float(getattr(result, "grid_pitch", 0.0))
+    ox = float(getattr(result, "origin_x", 0.0))
+    oy = float(getattr(result, "origin_y", 0.0))
+    nx = int(getattr(result, "nx", 0))
+    ny = int(getattr(result, "ny", 0))
+    nz = int(getattr(result, "nz", 0))
+    if pitch <= 0.0 or nx <= 0 or ny <= 0 or nz <= 0:
+        return 0, 0, 0
+    x = int(round((x_mm - ox) / pitch))
+    y = int(round((y_mm - oy) / pitch))
+    x = max(0, min(nx - 1, x))
+    y = max(0, min(ny - 1, y))
+    z = max(0, min(nz - 1, int(z)))
+    return x, y, z
+
+
+def _rasterize_grid_line_2d(
+    start: tuple[int, int, int],
+    end: tuple[int, int, int],
+) -> list[tuple[int, int, int]]:
+    x0, y0, z0 = start
+    x1, y1, z1 = end
+    if z0 != z1:
+        return [start, end]
+
+    dx = abs(x1 - x0)
+    dy = abs(y1 - y0)
+    sx = 1 if x0 < x1 else -1
+    sy = 1 if y0 < y1 else -1
+    err = dx - dy
+    x = x0
+    y = y0
+    points: list[tuple[int, int, int]] = []
+    while True:
+        points.append((x, y, z0))
+        if x == x1 and y == y1:
+            break
+        e2 = 2 * err
+        if e2 > -dy:
+            err -= dy
+            x += sx
+        if e2 < dx:
+            err += dx
+            y += sy
+    return points
+
+
+def _connect_anchor_to_graph(
+    result: Any,
+    graph: dict[tuple[int, int, int], set[tuple[int, int, int]]],
+    anchor: tuple[int, int, int],
+) -> None:
+    if anchor in graph:
+        return
+    graph.setdefault(anchor, set())
+    if not graph:
+        return
+    candidates = [vertex for vertex in graph.keys() if vertex != anchor]
+    if not candidates:
+        return
+
+    ax, ay, az = anchor
+    nearest = min(
+        candidates,
+        key=lambda vertex: (
+            abs(vertex[0] - ax) + abs(vertex[1] - ay) + abs(vertex[2] - az),
+            abs(vertex[2] - az),
+        ),
+    )
+
+    def add_edge(a: tuple[int, int, int], b: tuple[int, int, int]) -> None:
+        graph.setdefault(a, set()).add(b)
+        graph.setdefault(b, set()).add(a)
+
+    target_xy_same_z = (nearest[0], nearest[1], az)
+    for a, b in zip(_rasterize_grid_line_2d(anchor, target_xy_same_z), _rasterize_grid_line_2d(anchor, target_xy_same_z)[1:]):
+        add_edge(a, b)
+    if target_xy_same_z != nearest:
+        z0 = target_xy_same_z[2]
+        z1 = nearest[2]
+        step = 1 if z1 >= z0 else -1
+        prev = target_xy_same_z
+        for z in range(z0 + step, z1 + step, step):
+            curr = (target_xy_same_z[0], target_xy_same_z[1], z)
+            add_edge(prev, curr)
+            prev = curr
+
+
+def _nearest_graph_vertex(
+    anchor: tuple[int, int, int],
+    graph: dict[tuple[int, int, int], set[tuple[int, int, int]]],
+) -> tuple[int, int, int] | None:
+    if not graph:
+        return None
+    ax, ay, az = anchor
+    return min(
+        graph.keys(),
+        key=lambda vertex: (
+            abs(vertex[0] - ax) + abs(vertex[1] - ay) + abs(vertex[2] - az),
+            abs(vertex[2] - az),
+        ),
+    )
+
+
+def _shortest_grid_path(
+    graph: dict[tuple[int, int, int], set[tuple[int, int, int]]],
+    start: tuple[int, int, int],
+    goal: tuple[int, int, int],
+) -> list[tuple[int, int, int]]:
+    if start == goal:
+        return [start]
+    if start not in graph or goal not in graph:
+        return []
+
+    queue: deque[tuple[int, int, int]] = deque([start])
+    prev: dict[tuple[int, int, int], tuple[int, int, int] | None] = {start: None}
+    while queue:
+        current = queue.popleft()
+        if current == goal:
+            break
+        for nxt in graph.get(current, set()):
+            if nxt in prev:
+                continue
+            prev[nxt] = current
+            queue.append(nxt)
+    if goal not in prev:
+        return []
+
+    path: list[tuple[int, int, int]] = []
+    node: tuple[int, int, int] | None = goal
+    while node is not None:
+        path.append(node)
+        node = prev.get(node)
+    path.reverse()
+    return path
+
+
+def _fallback_external_path(
+    start: tuple[int, int, int],
+    goal: tuple[int, int, int],
+) -> list[tuple[int, int, int]]:
+    if start == goal:
+        return [start]
+    path: list[tuple[int, int, int]] = []
+    same_z_goal_xy = (goal[0], goal[1], start[2])
+    line = _rasterize_grid_line_2d(start, same_z_goal_xy)
+    path.extend(line)
+    if same_z_goal_xy != goal:
+        step = 1 if goal[2] >= start[2] else -1
+        for z in range(start[2] + step, goal[2] + step, step):
+            point = (goal[0], goal[1], z)
+            if not path or path[-1] != point:
+                path.append(point)
+    return path
+
+
+def _filter_boundary_vertices_with_pads(
+    board: BoardData,
+    result: Any,
+    net_id: int,
+    vertices: set[tuple[int, int, int]],
+    start_anchor: tuple[int, int, int],
+    goal_anchor: tuple[int, int, int],
+    clearance: float,
+) -> set[tuple[int, int, int]]:
+    start_pad = _closest_net_pad_for_vertex(board, result, net_id, start_anchor)
+    goal_pad = _closest_net_pad_for_vertex(board, result, net_id, goal_anchor)
+    filtered: set[tuple[int, int, int]] = set()
+    for vertex in vertices:
+        if vertex == start_anchor or vertex == goal_anchor:
+            filtered.add(vertex)
+            continue
+        if _vertex_inside_pad_clearance(board, result, vertex, start_pad, clearance):
+            continue
+        if _vertex_inside_pad_clearance(board, result, vertex, goal_pad, clearance):
+            continue
+        filtered.add(vertex)
+    filtered.add(start_anchor)
+    filtered.add(goal_anchor)
+    return filtered
+
+
+def _serialize_boundary_vertices_with_anchors(
+    board: BoardData,
+    vertices: set[tuple[int, int, int]],
+    start_anchor: tuple[int, int, int],
+    goal_anchor: tuple[int, int, int],
+) -> list[dict[str, Any]]:
+    serialized: list[dict[str, Any]] = []
+    serialized.append(_serialize_grid_vertex_tuple(board, start_anchor, anchor="start"))
+    if goal_anchor != start_anchor:
+        serialized.append(_serialize_grid_vertex_tuple(board, goal_anchor, anchor="goal"))
+    for vertex in sorted(vertices):
+        if vertex == start_anchor or vertex == goal_anchor:
+            continue
+        serialized.append(_serialize_grid_vertex_tuple(board, vertex))
+    return serialized
+
+
+def _primitive_occupied_vertex_shell(
+    result: Any,
+    segments: list[dict[str, Any]],
+    vias: list[dict[str, Any]],
+) -> set[tuple[int, int, int]]:
+    pitch = float(getattr(result, "grid_pitch", 0.0))
+    origin_x = float(getattr(result, "origin_x", 0.0))
+    origin_y = float(getattr(result, "origin_y", 0.0))
+    nx = int(getattr(result, "nx", 0))
+    ny = int(getattr(result, "ny", 0))
+    nz = int(getattr(result, "nz", 0))
+    if pitch <= 0.0 or nx <= 0 or ny <= 0 or nz <= 0:
+        return set()
+
+    occupied: set[tuple[int, int, int]] = set()
+    for segment in segments:
+        z = int(segment.get("z", -1))
+        if z < 0 or z >= nz:
+            continue
+        start = segment.get("start", (0.0, 0.0))
+        end = segment.get("end", (0.0, 0.0))
+        radius_mm = float(segment.get("radius_mm", 0.0))
+        _mark_segment_vertices(
+            occupied,
+            float(start[0]),
+            float(start[1]),
+            float(end[0]),
+            float(end[1]),
+            z,
+            radius_mm,
+            pitch,
+            origin_x,
+            origin_y,
+            nx,
+            ny,
+        )
+
+    for via in vias:
+        center = via.get("center", (0.0, 0.0))
+        radius_mm = float(via.get("radius_mm", 0.0))
+        z_start = max(0, int(via.get("z_start", 0)))
+        z_end = min(nz - 1, int(via.get("z_end", nz - 1)))
+        if z_start > z_end:
+            z_start, z_end = z_end, z_start
+        for z in range(z_start, z_end + 1):
+            _mark_circle_vertices(
+                occupied,
+                float(center[0]),
+                float(center[1]),
+                z,
+                radius_mm,
+                pitch,
+                origin_x,
+                origin_y,
+                nx,
+                ny,
+            )
+
+    if not occupied:
+        return set()
+
+    boundary: set[tuple[int, int, int]] = set()
+    for x, y, z in occupied:
+        for dx, dy in (
+            (1, 0), (-1, 0), (0, 1), (0, -1),
+            (1, 1), (1, -1), (-1, 1), (-1, -1),
+        ):
+            nxp = x + dx
+            nyp = y + dy
+            if nxp < 0 or nxp >= nx or nyp < 0 or nyp >= ny or (nxp, nyp, z) not in occupied:
+                boundary.add((x, y, z))
+                break
+    return boundary
+
+
+def _boundary_payload_key(raw_vertices: list[dict[str, Any]]) -> tuple[tuple[int, int, int], ...]:
+    points = []
+    for item in raw_vertices:
+        if not isinstance(item, dict):
+            continue
+        points.append((int(item.get("x", 0)), int(item.get("y", 0)), int(item.get("z", 0))))
+    if not points:
+        return tuple()
+    return tuple(sorted(set(points)))
+
+
+def _layer_index_from_name(board: BoardData, layer: str) -> int | None:
+    normalized = str(layer)
+    if normalized == "Top":
+        normalized = "F.Cu"
+    elif normalized == "Bottom":
+        normalized = "B.Cu"
+    for index, name in enumerate(board.copper_layers):
+        if name == normalized:
+            return index
+    return None
+
+
+def _load_freerouting_occurrences_by_net(board: BoardData | None) -> dict[int, list[dict[str, Any]]]:
+    if board is None:
+        return {}
+
+    payload_path = None
+    for candidate in _guess_freerouting_payload_paths(board.path):
+        if candidate.exists():
+            payload_path = candidate
+            break
+    if payload_path is None:
+        return {}
+
+    try:
+        payload = json.loads(payload_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+    mapping: dict[int, list[dict[str, Any]]] = {}
+    nets = payload.get("nets", []) if isinstance(payload, dict) else []
+    for net in nets:
+        if not isinstance(net, dict):
+            continue
+        try:
+            net_id = int(net.get("net_id", 0))
+        except Exception:
+            continue
+        occurrences = net.get("occurrences", [])
+        if not isinstance(occurrences, list) or not occurrences:
+            occurrences = [net]
+        parsed: list[dict[str, Any]] = []
+        for occurrence in occurrences:
+            if not isinstance(occurrence, dict):
+                continue
+            segs = []
+            for segment in occurrence.get("segments", []):
+                if not isinstance(segment, dict):
+                    continue
+                start = segment.get("start", {})
+                end = segment.get("end", {})
+                segs.append(
+                    {
+                        "layer": str(segment.get("layer", "F.Cu")),
+                        "start": (
+                            float(start.get("x_mm", 0.0)),
+                            -float(start.get("y_mm", 0.0)),
+                        ),
+                        "end": (
+                            float(end.get("x_mm", 0.0)),
+                            -float(end.get("y_mm", 0.0)),
+                        ),
+                        "width_mm": float(segment.get("width_mm", 0.2)),
+                    }
+                )
+            vias = []
+            for via in occurrence.get("vias", []):
+                if not isinstance(via, dict):
+                    continue
+                center = via.get("center", {})
+                vias.append(
+                    {
+                        "center": (
+                            float(center.get("x_mm", 0.0)),
+                            -float(center.get("y_mm", 0.0)),
+                        ),
+                        "diameter_mm": float(via.get("diameter_mm", 0.6)),
+                        "start_layer": str(via.get("start_layer", "F.Cu")),
+                        "end_layer": str(via.get("end_layer", "B.Cu")),
+                    }
+                )
+            if segs or vias:
+                parsed.append(
+                    {
+                        "segments": segs,
+                        "vias": vias,
+                        "event_index": int(occurrence.get("event_index", 0)),
+                        "source_net_id": occurrence.get("source_net_id"),
+                        "graph": occurrence.get("graph"),
+                    }
+                )
+        if parsed:
+            mapping[net_id] = parsed
+    return mapping
+
+
+def _guess_freerouting_payload_paths(board_path: Path) -> list[Path]:
+    app_root = Path(__file__).resolve().parents[1]
+    work_dir = app_root / "out" / "freerouting_full"
+    stems = [board_path.stem]
+    if board_path.stem.endswith(".freerouting.routed"):
+        stems.append(board_path.stem[: -len(".freerouting.routed")])
+    guesses = [board_path.parent / "freerouting_ripped_routes.json"]
+    for stem in stems:
+        guesses.append(work_dir / stem / "freerouting_ripped_routes.json")
+    return guesses
+
+
 def _pad_cache_key(pad: Any) -> tuple[Any, ...]:
     return (
         str(getattr(pad, "shape", "")).lower(),
@@ -353,6 +1253,89 @@ def minimum_grid_steps_per_mm(board: BoardData) -> int:
     return max(1, ceil(1.0 / previous_pitch))
 
 
+def build_freerouting_external_selector_outcome(
+    board: BoardData,
+    ripped_net_ids: set[int],
+    grid_steps_per_mm: float = 10.0,
+) -> RerouteOutcome:
+    if not ripped_net_ids:
+        return RerouteOutcome(False, "No ripped nets were provided for freerouting selector input.")
+
+    layers = board.copper_layers or ["F.Cu"]
+    nz = len(layers)
+    pitch = 1.0 / (grid_steps_per_mm if grid_steps_per_mm > 0.0 else 10.0)
+    min_x, min_y, max_x, max_y = _board_bounds(board)
+    margin = pitch * 2.0
+    origin_x = min_x - margin
+    origin_y = min_y - margin
+    nx = max(3, int(math.ceil((max_x - min_x + margin * 2.0) / pitch)) + 1)
+    ny = max(3, int(math.ceil((max_y - min_y + margin * 2.0) / pitch)) + 1)
+
+    results: list[Any] = []
+    skipped: list[int] = []
+    for net_id in sorted(ripped_net_ids):
+        anchors = _choose_external_selector_anchors(board, net_id)
+        if anchors is None:
+            skipped.append(net_id)
+            continue
+        start_mm, goal_mm = anchors
+        start_grid = _mm_anchor_to_grid(start_mm, pitch, origin_x, origin_y, nx, ny, nz)
+        goal_grid = _mm_anchor_to_grid(goal_mm, pitch, origin_x, origin_y, nx, ny, nz)
+        start_point = SimpleNamespace(x=start_grid[0], y=start_grid[1], z=start_grid[2])
+        goal_point = SimpleNamespace(x=goal_grid[0], y=goal_grid[1], z=goal_grid[2])
+        results.append(
+            SimpleNamespace(
+                net_id=int(net_id),
+                found=True,
+                failure_reason="",
+                grid_pitch=float(pitch),
+                origin_x=float(origin_x),
+                origin_y=float(origin_y),
+                nx=int(nx),
+                ny=int(ny),
+                nz=int(nz),
+                terminal_group_sizes=[1, 1],
+                start_vertices=[start_point],
+                goal_vertices=[goal_point],
+                candidate_paths_grid=[],
+                candidate_paths_mm=[],
+                path_grid=[start_point, goal_point],
+                path_mm=[
+                    SimpleNamespace(x=float(start_mm[0]), y=float(start_mm[1])),
+                    SimpleNamespace(x=float(goal_mm[0]), y=float(goal_mm[1])),
+                ],
+            )
+        )
+
+    if not results:
+        return RerouteOutcome(
+            False,
+            "No usable net anchors were found for freerouting external-only reroute.",
+            None,
+            None,
+            None,
+            True,
+        )
+
+    export_path = _write_selector_stub_manifest(
+        board=board,
+        net_ids=[int(getattr(item, "net_id", 0)) for item in results],
+        grid_steps_per_mm=grid_steps_per_mm,
+    )
+    message = (
+        f"Freerouting external-only candidates prepared for {len(results)} nets."
+        + (f" Skipped nets: {skipped}." if skipped else "")
+    )
+    return RerouteOutcome(
+        True,
+        message,
+        results,
+        None,
+        export_path,
+        True,
+    )
+
+
 def run_dijkstra_reroute_test(
     board: BoardData,
     ripped_net_ids: set[int],
@@ -428,6 +1411,115 @@ def run_dijkstra_reroute_test(
         perf_counter() - started_at,
         candidate_export_path,
     )
+
+
+def _choose_external_selector_anchors(
+    board: BoardData,
+    net_id: int,
+) -> tuple[tuple[float, float, int], tuple[float, float, int]] | None:
+    points: list[tuple[float, float, int]] = []
+    for footprint in board.footprints:
+        for pad in footprint.pads:
+            if (pad.net_id or 0) != net_id:
+                continue
+            z = 0
+            for layer in pad.layers:
+                layer_index = _layer_index_from_name(board, layer)
+                if layer_index is not None:
+                    z = layer_index
+                    break
+            points.append((float(pad.center[0]), float(pad.center[1]), int(z)))
+
+    for track in board.tracks:
+        if int(track.net_id) != net_id:
+            continue
+        z = _layer_index_from_name(board, track.layer)
+        if z is None:
+            z = 0
+        points.append((float(track.start[0]), float(track.start[1]), int(z)))
+        points.append((float(track.end[0]), float(track.end[1]), int(z)))
+
+    for via in board.vias:
+        if int(via.net_id) != net_id:
+            continue
+        points.append((float(via.center[0]), float(via.center[1]), 0))
+        points.append((float(via.center[0]), float(via.center[1]), max(0, len(board.copper_layers or ["F.Cu"]) - 1)))
+
+    dedup: list[tuple[float, float, int]] = []
+    seen: set[tuple[float, float, int]] = set()
+    for px, py, pz in points:
+        key = (round(px, 6), round(py, 6), int(pz))
+        if key in seen:
+            continue
+        seen.add(key)
+        dedup.append((px, py, pz))
+
+    if not dedup:
+        return None
+    if len(dedup) == 1:
+        return dedup[0], dedup[0]
+
+    best_pair = (dedup[0], dedup[1])
+    best_dist2 = -1.0
+    for i in range(len(dedup)):
+        for j in range(i + 1, len(dedup)):
+            dx = dedup[i][0] - dedup[j][0]
+            dy = dedup[i][1] - dedup[j][1]
+            dist2 = dx * dx + dy * dy
+            if dist2 > best_dist2:
+                best_dist2 = dist2
+                best_pair = (dedup[i], dedup[j])
+    return best_pair
+
+
+def _mm_anchor_to_grid(
+    point: tuple[float, float, int],
+    pitch: float,
+    origin_x: float,
+    origin_y: float,
+    nx: int,
+    ny: int,
+    nz: int,
+) -> tuple[int, int, int]:
+    x = int(round((float(point[0]) - origin_x) / pitch))
+    y = int(round((float(point[1]) - origin_y) / pitch))
+    z = int(point[2])
+    x = max(0, min(nx - 1, x))
+    y = max(0, min(ny - 1, y))
+    z = max(0, min(nz - 1, z))
+    return x, y, z
+
+
+def _write_selector_stub_manifest(
+    board: BoardData,
+    net_ids: list[int],
+    grid_steps_per_mm: float,
+) -> Path:
+    root = Path(__file__).resolve().parents[1]
+    export_dir = root / "out" / "candidate_path_exports"
+    export_dir.mkdir(parents=True, exist_ok=True)
+    board_stem = board.path.stem or "board"
+    net_label = "-".join(str(net_id) for net_id in net_ids) or "none"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    export_path = export_dir / f"{board_stem}__freerouting_external_only__nets_{net_label}__{timestamp}.json"
+
+    payload = {
+        "schema_version": 1,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "board": {
+            "path": str(board.path),
+            "backend": board.backend,
+            "copper_layers": list(board.copper_layers),
+        },
+        "ripped_net_ids": list(net_ids),
+        "grid_steps_per_mm": float(grid_steps_per_mm),
+        "results": [
+            {"net_id": int(net_id), "candidate_boundary_vertices": []}
+            for net_id in net_ids
+        ],
+    }
+    export_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return export_path
 
 
 def _merge_two_phase_route_results(
@@ -557,13 +1649,32 @@ def _run_single_dijkstra_reroute_test(
 
 def _import_router_core():
     root = Path(__file__).resolve().parents[1]
-    for candidate in [
-        root,
-        root / "build",
-        root / "build-linux",
+    if hasattr(os, "add_dll_directory"):
+        dll_candidates: list[Path] = []
+        gurobi_home = os.environ.get("GUROBI_HOME")
+        if gurobi_home:
+            dll_candidates.append(Path(gurobi_home) / "bin")
+        default_gurobi_bin = Path(r"C:\gurobi1103\win64\bin")
+        if default_gurobi_bin.exists():
+            dll_candidates.append(default_gurobi_bin)
+        for dll_dir in dll_candidates:
+            try:
+                handle = os.add_dll_directory(str(dll_dir))
+                _DLL_DIR_HANDLES.append(handle)
+            except OSError:
+                continue
+
+    candidates = [
         root / "build" / "Release",
         root / "build" / "Debug",
-    ]:
+        root / "build",
+        root / "build-kicad" / "Release",
+        root / "build-kicad" / "Debug",
+        root / "build-kicad",
+        root / "build-linux",
+        root,
+    ]
+    for candidate in reversed(candidates):
         if str(candidate) not in sys.path:
             sys.path.insert(0, str(candidate))
     import router_core
