@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iostream>
 #include <limits>
 #include <map>
 #include <numeric>
@@ -53,6 +54,7 @@ struct CandidateRecord {
     int via_count = 0;
     double length_mm = 0.0;
     std::vector<VertexKey> occupied_vertices;
+    std::vector<VertexKey> cover_vertices;
     std::vector<VertexKey> terminal_coords;
     std::vector<std::vector<VertexKey>> terminal_groups;
 };
@@ -78,6 +80,18 @@ double pathLengthMm(const std::vector<Point2D>& path) {
         total += std::sqrt(dx * dx + dy * dy);
     }
     return total;
+}
+
+std::size_t candidateCount(const NetCandidateSet& net) {
+    return std::max({
+        net.candidate_paths_grid.size(),
+        net.candidate_paths_mm.size(),
+        net.candidate_via_counts.size(),
+        net.candidate_boundary_vertices.size(),
+        net.candidate_cover_vertices.size(),
+        net.candidate_terminal_coords.size(),
+        net.candidate_terminal_groups.size(),
+    });
 }
 
 int countPathVias(const std::vector<GridPoint>& path) {
@@ -119,28 +133,33 @@ SelectionResult fallbackShortestSelection(const SelectionRequest& request, const
         selection.net_id = net.net_id;
         selection.solver = result.solver;
 
-        if (net.candidate_paths_grid.empty()) {
+        const std::size_t candidate_count = candidateCount(net);
+        if (candidate_count == 0) {
             selection.has_objective = false;
             result.selections.push_back(std::move(selection));
             continue;
         }
 
-        std::vector<int> ranked(static_cast<int>(net.candidate_paths_grid.size()));
+        std::vector<int> ranked(static_cast<int>(candidate_count));
         std::iota(ranked.begin(), ranked.end(), 0);
         std::sort(ranked.begin(), ranked.end(), [&](int a, int b) {
-            int via_a = countPathVias(net.candidate_paths_grid[static_cast<std::size_t>(a)]);
-            int via_b = countPathVias(net.candidate_paths_grid[static_cast<std::size_t>(b)]);
+            int via_a = static_cast<std::size_t>(a) < net.candidate_via_counts.size()
+                ? net.candidate_via_counts[static_cast<std::size_t>(a)]
+                : 0;
+            int via_b = static_cast<std::size_t>(b) < net.candidate_via_counts.size()
+                ? net.candidate_via_counts[static_cast<std::size_t>(b)]
+                : 0;
             if (via_a != via_b) {
                 return via_a < via_b;
             }
-            double len_a = a < static_cast<int>(net.candidate_paths_mm.size())
-                ? pathLengthMm(net.candidate_paths_mm[static_cast<std::size_t>(a)])
-                : std::numeric_limits<double>::infinity();
-            double len_b = b < static_cast<int>(net.candidate_paths_mm.size())
-                ? pathLengthMm(net.candidate_paths_mm[static_cast<std::size_t>(b)])
-                : std::numeric_limits<double>::infinity();
-            if (std::abs(len_a - len_b) > 1e-9) {
-                return len_a < len_b;
+            std::size_t boundary_a = static_cast<std::size_t>(a) < net.candidate_boundary_vertices.size()
+                ? net.candidate_boundary_vertices[static_cast<std::size_t>(a)].size()
+                : 0u;
+            std::size_t boundary_b = static_cast<std::size_t>(b) < net.candidate_boundary_vertices.size()
+                ? net.candidate_boundary_vertices[static_cast<std::size_t>(b)].size()
+                : 0u;
+            if (boundary_a != boundary_b) {
+                return boundary_a < boundary_b;
             }
             return a < b;
         });
@@ -148,11 +167,6 @@ SelectionResult fallbackShortestSelection(const SelectionRequest& request, const
         int bounded_keep = std::min(keep_count, static_cast<int>(ranked.size()));
         selection.selected_candidate_indices.assign(ranked.begin(), ranked.begin() + bounded_keep);
         selection.objective = 0.0;
-        for (int index : selection.selected_candidate_indices) {
-            selection.objective += static_cast<double>(
-                countPathVias(net.candidate_paths_grid[static_cast<std::size_t>(index)])
-            );
-        }
         selection.has_objective = true;
         result.selections.push_back(std::move(selection));
     }
@@ -169,32 +183,40 @@ std::vector<NetRecord> buildNetRecords(const SelectionRequest& request, bool* tr
         record.net_id = net.net_id;
         record.original_net_index = static_cast<int>(net_idx);
 
+        const std::size_t candidate_count = candidateCount(net);
         std::vector<CandidateRecord> candidates;
-        candidates.reserve(net.candidate_paths_grid.size());
-        for (std::size_t candidate_idx = 0; candidate_idx < net.candidate_paths_grid.size(); ++candidate_idx) {
-            const auto& path_grid = net.candidate_paths_grid[candidate_idx];
-            if (path_grid.empty()) {
-                continue;
-            }
+        candidates.reserve(candidate_count);
+        for (std::size_t candidate_idx = 0; candidate_idx < candidate_count; ++candidate_idx) {
+            const std::vector<GridPoint> empty_path;
+            const auto& path_grid = candidate_idx < net.candidate_paths_grid.size()
+                ? net.candidate_paths_grid[candidate_idx]
+                : empty_path;
 
             CandidateRecord candidate;
             candidate.candidate_index = static_cast<int>(candidate_idx);
-            candidate.via_count = countPathVias(path_grid);
-            if (candidate_idx < net.candidate_paths_mm.size()) {
-                candidate.length_mm = pathLengthMm(net.candidate_paths_mm[candidate_idx]);
-            }
+            candidate.via_count = candidate_idx < net.candidate_via_counts.size()
+                ? net.candidate_via_counts[candidate_idx]
+                : 0;
+            candidate.length_mm = 0.0;
 
             if (candidate_idx < net.candidate_boundary_vertices.size() &&
                 !net.candidate_boundary_vertices[candidate_idx].empty()) {
                 candidate.occupied_vertices = uniqueVerticesFromGridPoints(net.candidate_boundary_vertices[candidate_idx]);
-            } else {
+            } else if (!path_grid.empty()) {
                 candidate.occupied_vertices = uniqueVerticesFromGridPoints(path_grid);
+            }
+
+            if (candidate_idx < net.candidate_cover_vertices.size() &&
+                !net.candidate_cover_vertices[candidate_idx].empty()) {
+                candidate.cover_vertices = uniqueVerticesFromGridPoints(net.candidate_cover_vertices[candidate_idx]);
+            } else {
+                candidate.cover_vertices = candidate.occupied_vertices;
             }
 
             if (candidate_idx < net.candidate_terminal_coords.size() &&
                 !net.candidate_terminal_coords[candidate_idx].empty()) {
                 candidate.terminal_coords = uniqueVerticesFromGridPoints(net.candidate_terminal_coords[candidate_idx]);
-            } else {
+            } else if (!path_grid.empty()) {
                 candidate.terminal_coords = {
                     toVertex(path_grid.front()),
                     toVertex(path_grid.back()),
@@ -216,7 +238,15 @@ std::vector<NetRecord> buildNetRecords(const SelectionRequest& request, bool* tr
                 }
             }
 
-            if (!candidate.terminal_coords.empty()) {
+            if (candidate.terminal_coords.empty() && !candidate.terminal_groups.empty()) {
+                for (const auto& group : candidate.terminal_groups) {
+                    if (!group.empty()) {
+                        candidate.terminal_coords.push_back(group.front());
+                    }
+                }
+            }
+
+            if (!candidate.occupied_vertices.empty() && !candidate.terminal_coords.empty()) {
                 candidates.push_back(std::move(candidate));
             }
         }
@@ -225,8 +255,8 @@ std::vector<NetRecord> buildNetRecords(const SelectionRequest& request, bool* tr
             if (a.via_count != b.via_count) {
                 return a.via_count < b.via_count;
             }
-            if (std::abs(a.length_mm - b.length_mm) > 1e-9) {
-                return a.length_mm < b.length_mm;
+            if (a.occupied_vertices.size() != b.occupied_vertices.size()) {
+                return a.occupied_vertices.size() < b.occupied_vertices.size();
             }
             return a.candidate_index < b.candidate_index;
         });
@@ -299,8 +329,10 @@ SelectionResult solveWithGurobi(const SelectionRequest& request, const std::vect
     std::vector<std::vector<std::vector<VertexKey>>> terminal_groups_by_net(records.size());
     std::map<VertexKey, GRBLinExpr> v_exprs;
     std::map<VertexKey, std::set<int>> v_groups;
+    std::size_t total_candidate_count = 0;
 
     for (std::size_t g = 0; g < records.size(); ++g) {
+        total_candidate_count += records[g].candidates.size();
         if (!records[g].candidates.empty()) {
             std::size_t max_group_count = 0;
             for (const auto& candidate : records[g].candidates) {
@@ -340,6 +372,76 @@ SelectionResult solveWithGurobi(const SelectionRequest& request, const std::vect
         }
     }
 
+    std::size_t total_terminal_group_rows = 0;
+    std::size_t total_terminal_group_nonzeros = 0;
+    for (std::size_t g = 0; g < terminal_groups_by_net.size(); ++g) {
+        total_terminal_group_rows += terminal_groups_by_net[g].size();
+        for (std::size_t gi = 0; gi < terminal_groups_by_net[g].size(); ++gi) {
+            const auto& group_vertices = terminal_groups_by_net[g][gi];
+            std::unordered_set<VertexKey, VertexKeyHash> group_vertex_set;
+            group_vertex_set.reserve(group_vertices.size() * 2 + 1);
+            for (const auto& vertex : group_vertices) {
+                group_vertex_set.insert(vertex);
+            }
+            std::size_t hit_count = 0;
+            for (std::size_t p = 0; p < records[g].candidates.size(); ++p) {
+                const auto& candidate = records[g].candidates[p];
+                bool hit_group = false;
+                for (const auto& occupied : candidate.cover_vertices) {
+                    if (group_vertex_set.find(occupied) != group_vertex_set.end()) {
+                        hit_group = true;
+                        break;
+                    }
+                }
+                if (hit_group) {
+                    ++hit_count;
+                }
+            }
+            total_terminal_group_nonzeros += hit_count;
+        }
+    }
+
+    std::size_t total_capacity_rows = 0;
+    std::size_t total_capacity_nonzeros = 0;
+    for (const auto& entry : v_groups) {
+        const VertexKey& vertex = entry.first;
+        const bool is_terminal_vertex = terminal_vertices.find(vertex) != terminal_vertices.end();
+        if (is_terminal_vertex) {
+            continue;
+        }
+        if (entry.second.size() > 1) {
+            ++total_capacity_rows;
+            auto expr_it = v_exprs.find(vertex);
+            if (expr_it != v_exprs.end()) {
+                total_capacity_nonzeros += entry.second.size();
+            }
+        }
+    }
+
+    std::cout
+        << "selector_gurobi_var_count = " << total_candidate_count << '\n'
+        << "selector_gurobi_terminal_group_row_count = " << total_terminal_group_rows << '\n'
+        << "selector_gurobi_capacity_row_count = " << total_capacity_rows << '\n'
+        << "selector_gurobi_total_row_count_estimated = " << (total_terminal_group_rows + total_capacity_rows) << '\n'
+        << "selector_gurobi_terminal_group_nonzeros_estimated = " << total_terminal_group_nonzeros << '\n'
+        << "selector_gurobi_capacity_nonzeros_estimated = " << total_capacity_nonzeros << '\n'
+        << "selector_gurobi_total_nonzeros_estimated = " << (total_terminal_group_nonzeros + total_capacity_nonzeros)
+        << std::endl;
+
+    for (const auto& record : records) {
+        std::size_t union_group_count = 0;
+        if (record.original_net_index >= 0 &&
+            static_cast<std::size_t>(record.original_net_index) < terminal_groups_by_net.size()) {
+            union_group_count = terminal_groups_by_net[static_cast<std::size_t>(record.original_net_index)].size();
+        }
+        std::cout
+            << "selector_gurobi_net_summary "
+            << "net=" << record.net_id
+            << " candidates=" << record.candidates.size()
+            << " terminal_groups=" << union_group_count
+            << std::endl;
+    }
+
     for (std::size_t g = 0; g < terminal_groups_by_net.size(); ++g) {
         for (std::size_t gi = 0; gi < terminal_groups_by_net[g].size(); ++gi) {
             GRBLinExpr group_expr = 0.0;
@@ -352,7 +454,7 @@ SelectionResult solveWithGurobi(const SelectionRequest& request, const std::vect
             for (std::size_t p = 0; p < records[g].candidates.size(); ++p) {
                 const auto& candidate = records[g].candidates[p];
                 bool hit_group = false;
-                for (const auto& occupied : candidate.occupied_vertices) {
+                for (const auto& occupied : candidate.cover_vertices) {
                     if (group_vertex_set.find(occupied) != group_vertex_set.end()) {
                         hit_group = true;
                         break;

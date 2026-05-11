@@ -71,14 +71,21 @@ def select_reroute_candidates(
         item.net_id = int(getattr(result, "net_id", 0))
         candidate_paths_grid: list[list[Any]]
         candidate_paths_mm: list[list[Any]]
+        candidate_via_counts: list[int]
+        candidate_cover_vertices: list[list[Any]]
         if outcome.selector_external_only:
             candidate_paths_grid = []
             candidate_paths_mm = []
+            candidate_via_counts = []
+            candidate_cover_vertices = []
         else:
             candidate_paths_grid = list(getattr(result, "candidate_paths_grid", []))
             candidate_paths_mm = list(getattr(result, "candidate_paths_mm", []))
+            candidate_via_counts = list(getattr(result, "candidate_via_counts", []))
+            candidate_cover_vertices = list(getattr(result, "candidate_cover_vertices", []))
         boundary_payload = list(exported_boundary_by_net.get(item.net_id, []))
-        external_summary = {"original": 0, "freerouting": 0, "vertices": 0}
+        candidate_preview_items: list[Any] = []
+        external_summary = {"original": 0, "final": 0, "freerouting": 0, "vertices": 0}
         if selector_board is not None:
             _append_external_candidates_for_selector(
                 router_core=router_core,
@@ -89,16 +96,24 @@ def select_reroute_candidates(
                 freerouting_occurrences=freerouting_occurrences_by_net.get(item.net_id, []),
                 candidate_paths_grid=candidate_paths_grid,
                 candidate_paths_mm=candidate_paths_mm,
+                candidate_via_counts=candidate_via_counts,
+                candidate_cover_vertices=candidate_cover_vertices,
                 boundary_payload=boundary_payload,
+                candidate_preview_items=candidate_preview_items,
                 summary=external_summary,
             )
         item.candidate_paths_grid = candidate_paths_grid
         item.candidate_paths_mm = candidate_paths_mm
+        item.candidate_via_counts = candidate_via_counts
+        item.candidate_cover_vertices = candidate_cover_vertices
         # Keep Python-side results aligned with selector candidates so GUI preview
         # can render the exact candidate index chosen by Gurobi.
         try:
             setattr(result, "candidate_paths_grid", candidate_paths_grid)
             setattr(result, "candidate_paths_mm", candidate_paths_mm)
+            setattr(result, "candidate_via_counts", candidate_via_counts)
+            setattr(result, "candidate_cover_vertices", candidate_cover_vertices)
+            setattr(result, "candidate_preview_items", candidate_preview_items)
         except Exception:
             pass
         (
@@ -122,6 +137,7 @@ def select_reroute_candidates(
             "selector_external_candidates "
             f"net={item.net_id} "
             f"original={external_summary['original']} "
+            f"final={external_summary['final']} "
             f"freerouting={external_summary['freerouting']} "
             f"boundary_vertices={external_summary['vertices']}",
             flush=True,
@@ -139,6 +155,36 @@ def select_reroute_candidates(
         )
         for selection in cpp_result.selections
     ]
+    result_by_net = {
+        int(getattr(result, "net_id", 0)): result
+        for result in outcome.result
+    }
+    for selection in selections:
+        if not selection.selected_candidate_indices:
+            print(
+                f"selector_selected_candidate net={selection.net_id} selected=(none)",
+                flush=True,
+            )
+            continue
+        selected_index = int(selection.selected_candidate_indices[0])
+        route_result = result_by_net.get(int(selection.net_id))
+        preview_items = list(getattr(route_result, "candidate_preview_items", [])) if route_result is not None else []
+        via_counts = list(getattr(route_result, "candidate_via_counts", [])) if route_result is not None else []
+        preview = preview_items[selected_index] if 0 <= selected_index < len(preview_items) else None
+        via_count = via_counts[selected_index] if 0 <= selected_index < len(via_counts) else None
+        source = str(getattr(preview, "source", "unknown")) if preview is not None else "unknown"
+        occurrence_index = int(getattr(preview, "occurrence_index", 0)) if preview is not None else 0
+        extra = f" occurrence_index={occurrence_index}" if occurrence_index > 0 else ""
+        via_text = str(via_count) if via_count is not None else "unknown"
+        print(
+            "selector_selected_candidate "
+            f"net={selection.net_id} "
+            f"index={selected_index} "
+            f"source={source}"
+            f"{extra} "
+            f"via_count={via_text}",
+            flush=True,
+        )
     return SelectionResult(
         ok=bool(cpp_result.ok),
         selections=selections,
@@ -243,9 +289,10 @@ def _selector_boundary_payload_from_export(
     terminal_coords: list[list[Any]] = []
     terminal_groups: list[list[list[Any]]] = []
     pad_boundary_cache: dict[tuple[Any, ...], list[tuple[int, int, int]]] = {}
-    path_count = len(candidate_paths_grid)
+    net_pads = _all_net_pads(board, net_id) if board is not None else []
+    path_count = max(len(candidate_paths_grid), len(boundary_payload))
     for index in range(path_count):
-        path = candidate_paths_grid[index]
+        path = candidate_paths_grid[index] if index < len(candidate_paths_grid) else []
         raw_vertices = boundary_payload[index] if index < len(boundary_payload) else []
 
         vertices_for_path: list[Any] = []
@@ -270,7 +317,7 @@ def _selector_boundary_payload_from_export(
             elif anchor == "goal":
                 goal_anchor = point
 
-        if not path:
+        if not path and not vertices_for_path:
             boundary_vertices.append(vertices_for_path)
             terminal_coords.append([])
             terminal_groups.append([])
@@ -291,11 +338,10 @@ def _selector_boundary_payload_from_export(
             seen.add((goal_anchor.x, goal_anchor.y, goal_anchor.z))
 
         groups_for_path: list[list[Any]] = []
+        terminals_for_path: list[Any] = []
         if board is not None:
             start_tuple = (start_anchor.x, start_anchor.y, start_anchor.z)
             goal_tuple = (goal_anchor.x, goal_anchor.y, goal_anchor.z)
-            start_pad = _closest_net_pad_for_vertex(board, result, net_id, start_tuple)
-            goal_pad = _closest_net_pad_for_vertex(board, result, net_id, goal_tuple)
 
             def _group_from_pad(pad: Any | None, anchor: tuple[int, int, int]) -> list[Any]:
                 if pad is None:
@@ -310,14 +356,42 @@ def _selector_boundary_payload_from_export(
                     group.append(router_core.GridPoint(anchor[0], anchor[1], anchor[2]))
                 return group
 
-            groups_for_path.append(_group_from_pad(start_pad, start_tuple))
-            groups_for_path.append(_group_from_pad(goal_pad, goal_tuple))
+            if net_pads:
+                for pad in net_pads:
+                    layer_hint = next(
+                        (
+                            layer
+                            for layer in getattr(pad, "layers", ())
+                            if layer in {"F.Cu", "B.Cu"} or layer.startswith("In")
+                        ),
+                        "F.Cu",
+                    )
+                    pad_anchor = _mm_to_grid_vertex(
+                        result,
+                        float(pad.center[0]),
+                        float(pad.center[1]),
+                        _layer_index_from_name(board, layer_hint) or 0,
+                    )
+                    group = _group_from_pad(pad, pad_anchor)
+                    groups_for_path.append(group)
+                    terminals_for_path.append(group[0] if group else router_core.GridPoint(*pad_anchor))
+            elif start_anchor is not None and goal_anchor is not None:
+                start_pad = _closest_net_pad_for_vertex(board, result, net_id, start_tuple)
+                goal_pad = _closest_net_pad_for_vertex(board, result, net_id, goal_tuple)
+                start_group = _group_from_pad(start_pad, start_tuple)
+                goal_group = _group_from_pad(goal_pad, goal_tuple)
+                groups_for_path.append(start_group)
+                groups_for_path.append(goal_group)
+                terminals_for_path.append(start_group[0] if start_group else start_anchor)
+                terminals_for_path.append(goal_group[0] if goal_group else goal_anchor)
         else:
             groups_for_path.append([start_anchor])
             groups_for_path.append([goal_anchor])
+            terminals_for_path.append(start_anchor)
+            terminals_for_path.append(goal_anchor)
 
         boundary_vertices.append(vertices_for_path)
-        terminal_coords.append([start_anchor, goal_anchor])
+        terminal_coords.append(terminals_for_path)
         terminal_groups.append(groups_for_path)
     return boundary_vertices, terminal_coords, terminal_groups
 
@@ -331,7 +405,10 @@ def _append_external_candidates_for_selector(
     freerouting_occurrences: list[dict[str, Any]],
     candidate_paths_grid: list[list[Any]],
     candidate_paths_mm: list[list[Any]],
+    candidate_via_counts: list[int],
+    candidate_cover_vertices: list[list[Any]],
     boundary_payload: list[list[dict[str, Any]]],
+    candidate_preview_items: list[Any],
     summary: dict[str, int],
 ) -> None:
     existing_keys: set[tuple[tuple[int, int, int], ...]] = set()
@@ -341,9 +418,86 @@ def _append_external_candidates_for_selector(
             existing_keys.add(key)
 
     anchors = _default_anchors_for_result(result)
-    if anchors is None:
-        return
-    start_anchor, goal_anchor = anchors
+    start_anchor: tuple[int, int, int] | None = anchors[0] if anchors is not None else None
+    goal_anchor: tuple[int, int, int] | None = anchors[1] if anchors is not None else None
+
+    final_board = getattr(result, "final_candidate_board", None)
+    try:
+        final_net_id = int(getattr(result, "final_candidate_net_id", 0))
+    except Exception:
+        final_net_id = 0
+
+    if final_board is not None and final_net_id > 0:
+        final_segments, final_vias = _collect_original_route_primitives(
+            board=final_board,
+            result=result,
+            net_id=final_net_id,
+            max_ripped_clearance=max_ripped_clearance,
+        )
+        final_raw = _build_boundary_payload_from_primitives(
+            board=final_board,
+            result=result,
+            net_id=final_net_id,
+            start_anchor=start_anchor,
+            goal_anchor=goal_anchor,
+            segments=final_segments,
+            vias=final_vias,
+        )
+        final_pad_reason = _external_candidate_pad_coverage_reason(
+            board=board,
+            result=result,
+            net_id=net_id,
+            segments=final_segments,
+            vias=final_vias,
+            explicit_graph=None,
+        )
+        if final_pad_reason is not None:
+            print(
+                f"selector_external_rejected_missing_pads net={net_id} source=final reason={final_pad_reason}",
+                flush=True,
+            )
+            for line in _external_candidate_pad_debug_lines(
+                board=board,
+                result=result,
+                net_id=net_id,
+                segments=final_segments,
+                vias=final_vias,
+                explicit_graph=None,
+                source_label="final",
+                reason=final_pad_reason,
+            ):
+                print(line, flush=True)
+        elif _append_external_payload_candidate(
+            router_core=router_core,
+            board=board,
+            result=result,
+            start_anchor=start_anchor,
+            goal_anchor=goal_anchor,
+            raw_vertices=final_raw,
+            candidate_paths_grid=candidate_paths_grid,
+            candidate_paths_mm=candidate_paths_mm,
+            candidate_via_counts=candidate_via_counts,
+            candidate_cover_vertices=candidate_cover_vertices,
+            boundary_payload=boundary_payload,
+            candidate_preview_items=candidate_preview_items,
+            existing_keys=existing_keys,
+            segments=final_segments,
+            vias=final_vias,
+            preview_item=_candidate_preview_item(
+                net_id,
+                final_segments,
+                final_vias,
+                0,
+                "final",
+            ),
+        ):
+            summary["final"] += 1
+            summary["vertices"] += len(final_raw)
+        else:
+            print(
+                f"selector_external_missing_boundary net={net_id} source=final",
+                flush=True,
+            )
 
     original_segments, original_vias = _collect_original_route_primitives(
         board=board,
@@ -393,16 +547,26 @@ def _append_external_candidates_for_selector(
         raw_vertices=original_raw,
         candidate_paths_grid=candidate_paths_grid,
         candidate_paths_mm=candidate_paths_mm,
+        candidate_via_counts=candidate_via_counts,
+        candidate_cover_vertices=candidate_cover_vertices,
         boundary_payload=boundary_payload,
+        candidate_preview_items=candidate_preview_items,
         existing_keys=existing_keys,
         segments=original_segments,
         vias=original_vias,
+        preview_item=_candidate_preview_item(
+            net_id,
+            original_segments,
+            original_vias,
+            0,
+            "original",
+        ),
     ):
         summary["original"] += 1
         summary["vertices"] += len(original_raw)
     else:
         print(
-            f"selector_external_missing_path net={net_id} source=original",
+            f"selector_external_missing_boundary net={net_id} source=original",
             flush=True,
         )
 
@@ -462,17 +626,27 @@ def _append_external_candidates_for_selector(
             raw_vertices=occ_raw,
             candidate_paths_grid=candidate_paths_grid,
             candidate_paths_mm=candidate_paths_mm,
+            candidate_via_counts=candidate_via_counts,
+            candidate_cover_vertices=candidate_cover_vertices,
             boundary_payload=boundary_payload,
+            candidate_preview_items=candidate_preview_items,
             existing_keys=existing_keys,
             segments=occ_segments,
             vias=occ_vias,
             explicit_graph=occ_graph,
+            preview_item=_candidate_preview_item(
+                net_id,
+                occ_segments,
+                occ_vias,
+                occurrence_index,
+                "freerouting",
+            ),
         ):
             summary["freerouting"] += 1
             summary["vertices"] += len(occ_raw)
         else:
             print(
-                f"selector_external_missing_path net={net_id} source=freerouting occurrence_index={occurrence_index}",
+                f"selector_external_missing_boundary net={net_id} source=freerouting occurrence_index={occurrence_index}",
                 flush=True,
             )
 
@@ -481,43 +655,79 @@ def _append_external_payload_candidate(
     router_core: Any,
     board: BoardData,
     result: Any,
-    start_anchor: tuple[int, int, int],
-    goal_anchor: tuple[int, int, int],
+    start_anchor: tuple[int, int, int] | None,
+    goal_anchor: tuple[int, int, int] | None,
     raw_vertices: list[dict[str, Any]],
     candidate_paths_grid: list[list[Any]],
     candidate_paths_mm: list[list[Any]],
+    candidate_via_counts: list[int],
+    candidate_cover_vertices: list[list[Any]],
     boundary_payload: list[list[dict[str, Any]]],
+    candidate_preview_items: list[Any],
     existing_keys: set[tuple[tuple[int, int, int], ...]],
     segments: list[dict[str, Any]] | None = None,
     vias: list[dict[str, Any]] | None = None,
     explicit_graph: dict[str, Any] | None = None,
+    preview_item: Any | None = None,
 ) -> bool:
-    full_path_vertices = _build_external_centerline_grid_path(
+    graph = _build_external_grid_graph(
         result=result,
-        start_anchor=start_anchor,
-        goal_anchor=goal_anchor,
         segments=segments or [],
         vias=vias or [],
         explicit_graph=explicit_graph,
     )
-    if len(full_path_vertices) < 2:
+    if not graph and not raw_vertices:
         return False
     key = _boundary_payload_key(raw_vertices)
     if not key or key in existing_keys:
         return False
     existing_keys.add(key)
     boundary_payload.append(raw_vertices)
-    grid_points = [
-        router_core.GridPoint(vertex[0], vertex[1], vertex[2])
-        for vertex in full_path_vertices
-    ]
-    mm_points = [
-        router_core.Point2D(*_grid_vertex_to_mm(result, vertex))
-        for vertex in full_path_vertices
-    ]
-    candidate_paths_grid.append(grid_points)
-    candidate_paths_mm.append(mm_points)
+    candidate_via_counts.append(len(vias or []))
+    cover_vertices = _primitive_occupied_vertices(result, segments or [], vias or [])
+    candidate_cover_vertices.append([
+        router_core.GridPoint(x, y, z)
+        for (x, y, z) in sorted(cover_vertices)
+    ])
+    candidate_preview_items.append(
+        preview_item
+        if preview_item is not None
+        else SimpleNamespace(net_id=int(getattr(result, "net_id", 0)))
+    )
     return True
+
+
+def _candidate_preview_item(
+    net_id: int,
+    segments: list[dict[str, Any]],
+    vias: list[dict[str, Any]],
+    occurrence_index: int,
+    source: str,
+) -> Any:
+    return SimpleNamespace(
+        net_id=int(net_id),
+        occurrence_index=int(occurrence_index),
+        source=str(source),
+        preview_kind="candidate",
+        segments=[
+            SimpleNamespace(
+                start=tuple(segment.get("start", (0.0, 0.0))),
+                end=tuple(segment.get("end", (0.0, 0.0))),
+                width=float(segment.get("width_mm", segment.get("width", 0.2))),
+                layer=str(segment.get("layer", "F.Cu")),
+            )
+            for segment in segments
+        ],
+        vias=[
+            SimpleNamespace(
+                center=tuple(via.get("center", (0.0, 0.0))),
+                diameter=float(via.get("diameter_mm", via.get("diameter", 0.6))),
+                start_layer=str(via.get("start_layer", "F.Cu")),
+                end_layer=str(via.get("end_layer", "B.Cu")),
+            )
+            for via in vias
+        ],
+    )
 
 
 def _default_anchors_for_result(result: Any) -> tuple[tuple[int, int, int], tuple[int, int, int]] | None:
@@ -535,8 +745,8 @@ def _build_original_route_boundary_payload(
     board: BoardData,
     result: Any,
     net_id: int,
-    start_anchor: tuple[int, int, int],
-    goal_anchor: tuple[int, int, int],
+    start_anchor: tuple[int, int, int] | None,
+    goal_anchor: tuple[int, int, int] | None,
     max_ripped_clearance: float,
 ) -> list[dict[str, Any]]:
     segments, vias = _collect_original_route_primitives(
@@ -560,8 +770,8 @@ def _build_freerouting_occurrence_boundary_payload(
     board: BoardData,
     result: Any,
     net_id: int,
-    start_anchor: tuple[int, int, int],
-    goal_anchor: tuple[int, int, int],
+    start_anchor: tuple[int, int, int] | None,
+    goal_anchor: tuple[int, int, int] | None,
     max_ripped_clearance: float,
     occurrence: dict[str, Any],
 ) -> list[dict[str, Any]]:
@@ -600,6 +810,8 @@ def _collect_original_route_primitives(
             {
                 "start": (float(track.start[0]), float(track.start[1])),
                 "end": (float(track.end[0]), float(track.end[1])),
+                "layer": str(track.layer),
+                "width_mm": float(track.width),
                 "z": z,
                 "radius_mm": float(track.width) * 0.5 + boundary_clearance,
             }
@@ -613,6 +825,9 @@ def _collect_original_route_primitives(
         vias.append(
             {
                 "center": (float(via.center[0]), float(via.center[1])),
+                "diameter_mm": float(via.diameter),
+                "start_layer": "F.Cu",
+                "end_layer": "B.Cu",
                 "radius_mm": float(via.diameter) * 0.5 + boundary_clearance,
                 "z_start": 0,
                 "z_end": default_z_end,
@@ -642,6 +857,8 @@ def _collect_freerouting_occurrence_primitives(
             {
                 "start": (sx, sy),
                 "end": (ex, ey),
+                "layer": str(segment.get("layer", "")),
+                "width_mm": width,
                 "z": z,
                 "radius_mm": width * 0.5 + boundary_clearance,
             }
@@ -664,6 +881,9 @@ def _collect_freerouting_occurrence_primitives(
         vias.append(
             {
                 "center": (float(center[0]), float(center[1])),
+                "diameter_mm": diameter,
+                "start_layer": str(via.get("start_layer", "F.Cu")),
+                "end_layer": str(via.get("end_layer", "B.Cu")),
                 "radius_mm": diameter * 0.5 + boundary_clearance,
                 "z_start": z_start,
                 "z_end": z_end,
@@ -727,8 +947,8 @@ def _build_boundary_payload_from_primitives(
     board: BoardData,
     result: Any,
     net_id: int,
-    start_anchor: tuple[int, int, int],
-    goal_anchor: tuple[int, int, int],
+    start_anchor: tuple[int, int, int] | None,
+    goal_anchor: tuple[int, int, int] | None,
     segments: list[dict[str, Any]],
     vias: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -766,6 +986,38 @@ def _build_external_centerline_grid_path(
     if start_vertex is None or goal_vertex is None:
         return []
     return _shortest_grid_path(graph, start_vertex, goal_vertex)
+
+
+def _graph_traversal_grid_path(
+    graph: dict[tuple[int, int, int], set[tuple[int, int, int]]],
+) -> list[tuple[int, int, int]]:
+    if not graph:
+        return []
+    remaining = set(graph.keys())
+    ordered_components: list[list[tuple[int, int, int]]] = []
+    while remaining:
+        start = min(remaining)
+        stack = [start]
+        seen: set[tuple[int, int, int]] = set()
+        component_order: list[tuple[int, int, int]] = []
+        while stack:
+            current = stack.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            remaining.discard(current)
+            component_order.append(current)
+            neighbors = sorted(graph.get(current, set()), reverse=True)
+            stack.extend(neighbors)
+        if component_order:
+            ordered_components.append(component_order)
+    path: list[tuple[int, int, int]] = []
+    for component in ordered_components:
+        if path and path[-1] == component[0]:
+            path.extend(component[1:])
+        else:
+            path.extend(component)
+    return path
 
 
 def _build_external_grid_graph(
@@ -1190,36 +1442,40 @@ def _filter_boundary_vertices_with_pads(
     result: Any,
     net_id: int,
     vertices: set[tuple[int, int, int]],
-    start_anchor: tuple[int, int, int],
-    goal_anchor: tuple[int, int, int],
+    start_anchor: tuple[int, int, int] | None,
+    goal_anchor: tuple[int, int, int] | None,
     clearance: float,
 ) -> set[tuple[int, int, int]]:
-    start_pad = _closest_net_pad_for_vertex(board, result, net_id, start_anchor)
-    goal_pad = _closest_net_pad_for_vertex(board, result, net_id, goal_anchor)
+    anchor_vertices = {
+        anchor for anchor in (start_anchor, goal_anchor)
+        if anchor is not None
+    }
+    pads_to_filter = _all_net_pads(board, net_id)
     filtered: set[tuple[int, int, int]] = set()
     for vertex in vertices:
-        if vertex == start_anchor or vertex == goal_anchor:
+        if vertex in anchor_vertices:
             filtered.add(vertex)
             continue
-        if _vertex_inside_pad_clearance(board, result, vertex, start_pad, clearance):
-            continue
-        if _vertex_inside_pad_clearance(board, result, vertex, goal_pad, clearance):
+        if any(
+            _vertex_inside_pad_clearance(board, result, vertex, pad, clearance)
+            for pad in pads_to_filter
+        ):
             continue
         filtered.add(vertex)
-    filtered.add(start_anchor)
-    filtered.add(goal_anchor)
+    filtered.update(anchor_vertices)
     return filtered
 
 
 def _serialize_boundary_vertices_with_anchors(
     board: BoardData,
     vertices: set[tuple[int, int, int]],
-    start_anchor: tuple[int, int, int],
-    goal_anchor: tuple[int, int, int],
+    start_anchor: tuple[int, int, int] | None,
+    goal_anchor: tuple[int, int, int] | None,
 ) -> list[dict[str, Any]]:
     serialized: list[dict[str, Any]] = []
-    serialized.append(_serialize_grid_vertex_tuple(board, start_anchor, anchor="start"))
-    if goal_anchor != start_anchor:
+    if start_anchor is not None:
+        serialized.append(_serialize_grid_vertex_tuple(board, start_anchor, anchor="start"))
+    if goal_anchor is not None and goal_anchor != start_anchor:
         serialized.append(_serialize_grid_vertex_tuple(board, goal_anchor, anchor="goal"))
     for vertex in sorted(vertices):
         if vertex == start_anchor or vertex == goal_anchor:
@@ -1228,7 +1484,7 @@ def _serialize_boundary_vertices_with_anchors(
     return serialized
 
 
-def _primitive_occupied_vertex_shell(
+def _primitive_occupied_vertices(
     result: Any,
     segments: list[dict[str, Any]],
     vias: list[dict[str, Any]],
@@ -1286,8 +1542,19 @@ def _primitive_occupied_vertex_shell(
                 ny,
             )
 
+    return occupied
+
+
+def _primitive_occupied_vertex_shell(
+    result: Any,
+    segments: list[dict[str, Any]],
+    vias: list[dict[str, Any]],
+) -> set[tuple[int, int, int]]:
+    occupied = _primitive_occupied_vertices(result, segments, vias)
     if not occupied:
         return set()
+    nx = int(getattr(result, "nx", 0))
+    ny = int(getattr(result, "ny", 0))
 
     boundary: set[tuple[int, int, int]] = set()
     for x, y, z in occupied:
@@ -1434,6 +1701,15 @@ def _pad_cache_key(pad: Any) -> tuple[Any, ...]:
     )
 
 
+def _matching_net_id_by_name(board: BoardData | None, net_name: str) -> int:
+    if board is None or not net_name:
+        return 0
+    matches = [int(net_id) for net_id, name in board.nets.items() if name == net_name]
+    if len(matches) == 1:
+        return matches[0]
+    return 0
+
+
 def _pad_boundary_vertices_for_selector(
     board: BoardData,
     result: Any,
@@ -1504,6 +1780,7 @@ def build_freerouting_external_selector_outcome(
     board: BoardData,
     ripped_net_ids: set[int],
     grid_steps_per_mm: float = 10.0,
+    final_board: BoardData | None = None,
 ) -> RerouteOutcome:
     if not ripped_net_ids:
         return RerouteOutcome(False, "No ripped nets were provided for freerouting selector input.")
@@ -1521,6 +1798,9 @@ def build_freerouting_external_selector_outcome(
     results: list[Any] = []
     skipped: list[int] = []
     for net_id in sorted(ripped_net_ids):
+        net_pads = _all_net_pads(board, net_id)
+        net_name = board.nets.get(net_id, "")
+        final_net_id = _matching_net_id_by_name(final_board, net_name)
         anchors = _choose_external_selector_anchors(board, net_id)
         if anchors is None:
             skipped.append(net_id)
@@ -1541,7 +1821,10 @@ def build_freerouting_external_selector_outcome(
                 nx=int(nx),
                 ny=int(ny),
                 nz=int(nz),
-                terminal_group_sizes=[1, 1],
+                terminal_group_sizes=[1 for _ in net_pads] or [1, 1],
+                net_pads=list(net_pads),
+                final_candidate_board=final_board,
+                final_candidate_net_id=int(final_net_id),
                 start_vertices=[start_point],
                 goal_vertices=[goal_point],
                 candidate_paths_grid=[],
@@ -2257,6 +2540,18 @@ def _closest_net_pad_for_vertex(
                 best_dist2 = dist2
                 best_pad = pad
     return best_pad
+
+
+def _all_net_pads(board: BoardData | None, net_id: int) -> list[Any]:
+    if board is None:
+        return []
+    pads: list[Any] = []
+    for footprint in board.footprints:
+        for pad in footprint.pads:
+            if (pad.net_id or 0) == net_id:
+                pads.append(pad)
+    pads.sort(key=lambda pad: (float(pad.center[0]), float(pad.center[1]), str(getattr(pad, "name", ""))))
+    return pads
 
 
 def _layer_name_for_z(board: BoardData, z: int) -> str | None:

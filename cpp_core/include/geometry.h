@@ -86,7 +86,9 @@ struct NetCandidateSet {
     int net_id = 0;
     std::vector<std::vector<GridPoint>> candidate_paths_grid;
     std::vector<std::vector<Point2D>> candidate_paths_mm;
+    std::vector<int> candidate_via_counts;
     std::vector<std::vector<GridPoint>> candidate_boundary_vertices;
+    std::vector<std::vector<GridPoint>> candidate_cover_vertices;
     std::vector<std::vector<GridPoint>> candidate_terminal_coords;
     std::vector<std::vector<std::vector<GridPoint>>> candidate_terminal_groups;
 };

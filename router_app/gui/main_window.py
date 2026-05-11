@@ -362,7 +362,7 @@ class MainWindow(QMainWindow):
             if not selection.ok:
                 self.statusBar().showMessage(f"Path selection failed: {selection.message}")
                 return
-            if str(selection.solver).lower() != "gurobi":
+            if not str(selection.solver).lower().startswith("gurobi"):
                 self.statusBar().showMessage(
                     f"Reroute skipped: solver={selection.solver} (not gurobi). {selection.message}"
                 )
@@ -395,7 +395,7 @@ class MainWindow(QMainWindow):
         if not selection.ok:
             self.statusBar().showMessage(f"Path selection failed: {selection.message}")
             return
-        if str(selection.solver).lower() != "gurobi":
+        if not str(selection.solver).lower().startswith("gurobi"):
             self.statusBar().showMessage(
                 f"Reroute skipped: solver={selection.solver} (not gurobi). {selection.message}"
             )
@@ -477,6 +477,7 @@ class MainWindow(QMainWindow):
             selector_board,
             ripped_net_ids,
             self.trace_panel.grid_steps_per_mm,
+            final_board=self._board,
         )
         if outcome.result:
             self._candidate_outcome = RerouteOutcome(
@@ -520,10 +521,14 @@ class MainWindow(QMainWindow):
         preview_results: list[object] = []
         for route_result in route_results:
             net_id = int(getattr(route_result, "net_id", 0))
+            candidate_preview_items = list(getattr(route_result, "candidate_preview_items", []))
             candidate_grid = list(getattr(route_result, "candidate_paths_grid", []))
             candidate_mm = list(getattr(route_result, "candidate_paths_mm", []))
             selected_index = selected_by_net.get(net_id)
             if selected_index is None or selected_index < 0:
+                continue
+            if selected_index < len(candidate_preview_items):
+                preview_results.append(candidate_preview_items[selected_index])
                 continue
             if selected_index >= len(candidate_grid) or selected_index >= len(candidate_mm):
                 continue

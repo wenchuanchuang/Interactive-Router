@@ -489,8 +489,13 @@ class RoutePreviewCanvas(QGraphicsView):
                 marker.setZValue(60)
                 self._scene.addItem(marker)
 
+        is_candidate_preview = any(
+            str(getattr(route_result, "preview_kind", "")) == "candidate"
+            for route_result in route_results
+        )
+        label_prefix = "Candidate preview" if is_candidate_preview else "Ripped-route preview"
         label = QGraphicsTextItem(
-            f"Ripped-route preview | {len(route_results)} occurrences | "
+            f"{label_prefix} | {len(route_results)} occurrences | "
             f"{segment_count} segments | {via_count} vias"
         )
         label.setDefaultTextColor(QColor("#ffffff"))
