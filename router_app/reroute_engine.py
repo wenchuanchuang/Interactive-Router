@@ -360,7 +360,31 @@ def _append_external_candidates_for_selector(
         segments=original_segments,
         vias=original_vias,
     )
-    if _append_external_payload_candidate(
+    original_pad_reason = _external_candidate_pad_coverage_reason(
+        board=board,
+        result=result,
+        net_id=net_id,
+        segments=original_segments,
+        vias=original_vias,
+        explicit_graph=None,
+    )
+    if original_pad_reason is not None:
+        print(
+            f"selector_external_rejected_missing_pads net={net_id} source=original reason={original_pad_reason}",
+            flush=True,
+        )
+        for line in _external_candidate_pad_debug_lines(
+            board=board,
+            result=result,
+            net_id=net_id,
+            segments=original_segments,
+            vias=original_vias,
+            explicit_graph=None,
+            source_label="original",
+            reason=original_pad_reason,
+        ):
+            print(line, flush=True)
+    elif _append_external_payload_candidate(
         router_core=router_core,
         board=board,
         result=result,
@@ -404,7 +428,32 @@ def _append_external_candidates_for_selector(
             segments=occ_segments,
             vias=occ_vias,
         )
-        if _append_external_payload_candidate(
+        occ_pad_reason = _external_candidate_pad_coverage_reason(
+            board=board,
+            result=result,
+            net_id=net_id,
+            segments=occ_segments,
+            vias=occ_vias,
+            explicit_graph=occ_graph,
+        )
+        if occ_pad_reason is not None:
+            print(
+                "selector_external_rejected_missing_pads "
+                f"net={net_id} source=freerouting occurrence_index={occurrence_index} reason={occ_pad_reason}",
+                flush=True,
+            )
+            for line in _external_candidate_pad_debug_lines(
+                board=board,
+                result=result,
+                net_id=net_id,
+                segments=occ_segments,
+                vias=occ_vias,
+                explicit_graph=occ_graph,
+                source_label=f"freerouting occurrence_index={occurrence_index}",
+                reason=occ_pad_reason,
+            ):
+                print(line, flush=True)
+        elif _append_external_payload_candidate(
             router_core=router_core,
             board=board,
             result=result,
@@ -704,6 +753,27 @@ def _build_external_centerline_grid_path(
     vias: list[dict[str, Any]],
     explicit_graph: dict[str, Any] | None = None,
 ) -> list[tuple[int, int, int]]:
+    graph = _build_external_grid_graph(
+        result=result,
+        segments=segments,
+        vias=vias,
+        explicit_graph=explicit_graph,
+    )
+    if not graph:
+        return []
+    start_vertex = _nearest_graph_vertex(start_anchor, graph)
+    goal_vertex = _nearest_graph_vertex(goal_anchor, graph)
+    if start_vertex is None or goal_vertex is None:
+        return []
+    return _shortest_grid_path(graph, start_vertex, goal_vertex)
+
+
+def _build_external_grid_graph(
+    result: Any,
+    segments: list[dict[str, Any]],
+    vias: list[dict[str, Any]],
+    explicit_graph: dict[str, Any] | None = None,
+) -> dict[tuple[int, int, int], set[tuple[int, int, int]]]:
     graph: dict[tuple[int, int, int], set[tuple[int, int, int]]] = {}
 
     def add_edge(a: tuple[int, int, int], b: tuple[int, int, int]) -> None:
@@ -737,48 +807,225 @@ def _build_external_centerline_grid_path(
             b = vertices_by_id.get(to_id)
             if a is None or b is None:
                 continue
+            for p0, p1 in zip(_expand_graph_edge(a, b), _expand_graph_edge(a, b)[1:]):
+                add_edge(p0, p1)
+
+    if graph:
+        return graph
+
+    for segment in segments:
+        z = int(segment.get("z", -1))
+        if z < 0:
+            continue
+        start = segment.get("start", (0.0, 0.0))
+        end = segment.get("end", (0.0, 0.0))
+        line = _rasterize_grid_line_2d(
+            _mm_to_grid_vertex(result, float(start[0]), float(start[1]), z),
+            _mm_to_grid_vertex(result, float(end[0]), float(end[1]), z),
+        )
+        if not line:
+            continue
+        graph.setdefault(line[0], set())
+        for a, b in zip(line, line[1:]):
             add_edge(a, b)
 
-    if not graph:
-        for segment in segments:
-            z = int(segment.get("z", -1))
-            if z < 0:
-                continue
-            start = segment.get("start", (0.0, 0.0))
-            end = segment.get("end", (0.0, 0.0))
-            p0 = _mm_to_grid_vertex(result, float(start[0]), float(start[1]), z)
-            p1 = _mm_to_grid_vertex(result, float(end[0]), float(end[1]), z)
-            line = _rasterize_grid_line_2d(p0, p1)
-            if not line:
-                continue
-            for a, b in zip(line, line[1:]):
-                add_edge(a, b)
-            if len(line) == 1:
-                graph.setdefault(line[0], set())
+    for via in vias:
+        center = via.get("center", (0.0, 0.0))
+        z_start = int(via.get("z_start", 0))
+        z_end = int(via.get("z_end", 0))
+        step = 1 if z_end >= z_start else -1
+        column = [
+            _mm_to_grid_vertex(result, float(center[0]), float(center[1]), z)
+            for z in range(z_start, z_end + step, step)
+        ]
+        if not column:
+            continue
+        graph.setdefault(column[0], set())
+        for a, b in zip(column, column[1:]):
+            add_edge(a, b)
+    return graph
 
-        for via in vias:
-            center = via.get("center", (0.0, 0.0))
-            z_start = int(via.get("z_start", 0))
-            z_end = int(via.get("z_end", 0))
-            step = 1 if z_end >= z_start else -1
-            column = [
-                _mm_to_grid_vertex(result, float(center[0]), float(center[1]), z)
-                for z in range(z_start, z_end + step, step)
+
+def _expand_graph_edge(
+    start: tuple[int, int, int],
+    end: tuple[int, int, int],
+) -> list[tuple[int, int, int]]:
+    if start[2] == end[2]:
+        return _rasterize_grid_line_2d(start, end)
+    if start[0] == end[0] and start[1] == end[1]:
+        step = 1 if end[2] >= start[2] else -1
+        return [(start[0], start[1], z) for z in range(start[2], end[2] + step, step)]
+    return [start, end]
+
+
+def _external_candidate_pad_coverage_reason(
+    board: BoardData,
+    result: Any,
+    net_id: int,
+    segments: list[dict[str, Any]],
+    vias: list[dict[str, Any]],
+    explicit_graph: dict[str, Any] | None,
+) -> str | None:
+    graph = _build_external_grid_graph(
+        result=result,
+        segments=segments,
+        vias=vias,
+        explicit_graph=explicit_graph,
+    )
+    if not graph:
+        return "empty_graph"
+
+    component_by_vertex: dict[tuple[int, int, int], int] = {}
+    component_index = 0
+    for start in graph.keys():
+        if start in component_by_vertex:
+            continue
+        queue: deque[tuple[int, int, int]] = deque([start])
+        component_by_vertex[start] = component_index
+        while queue:
+            current = queue.popleft()
+            for nxt in graph.get(current, set()):
+                if nxt in component_by_vertex:
+                    continue
+                component_by_vertex[nxt] = component_index
+                queue.append(nxt)
+        component_index += 1
+
+    pad_components: list[int] = []
+    unmatched_pads = 0
+    total_pads = 0
+    for footprint in board.footprints:
+        for pad in footprint.pads:
+            if (pad.net_id or 0) != net_id:
+                continue
+            total_pads += 1
+            matched_components = {
+                component_by_vertex[vertex]
+                for vertex in graph.keys()
+                if _vertex_inside_pad_clearance(board, result, vertex, pad, 0.0)
+            }
+            if not matched_components:
+                unmatched_pads += 1
+                continue
+            pad_components.extend(sorted(matched_components))
+
+    if total_pads <= 0:
+        return None
+    if unmatched_pads > 0:
+        return f"unmatched_pads={unmatched_pads}/{total_pads}"
+    unique_components = sorted(set(pad_components))
+    if len(unique_components) > 1:
+        return f"pad_components={unique_components}"
+    return None
+
+
+def _external_candidate_pad_debug_lines(
+    board: BoardData,
+    result: Any,
+    net_id: int,
+    segments: list[dict[str, Any]],
+    vias: list[dict[str, Any]],
+    explicit_graph: dict[str, Any] | None,
+    source_label: str,
+    reason: str,
+) -> list[str]:
+    graph = _build_external_grid_graph(
+        result=result,
+        segments=segments,
+        vias=vias,
+        explicit_graph=explicit_graph,
+    )
+    vertices = sorted(graph.keys())
+    lines = [
+        (
+            "selector_external_pad_debug "
+            f"net={net_id} source={source_label} reason={reason} "
+            f"graph_vertices={len(vertices)} graph_edges={sum(len(v) for v in graph.values()) // 2}"
+        )
+    ]
+    if not vertices:
+        return lines
+
+    mm_vertices = [
+        (vertex, *_grid_vertex_to_mm(result, vertex))
+        for vertex in vertices
+    ]
+    xs = [x_mm for _, x_mm, _ in mm_vertices]
+    ys = [y_mm for _, _, y_mm in mm_vertices]
+    lines.append(
+        "selector_external_graph_bounds "
+        f"net={net_id} source={source_label} "
+        f"x_mm=[{min(xs):.4f},{max(xs):.4f}] "
+        f"y_mm=[{min(ys):.4f},{max(ys):.4f}]"
+    )
+
+    for footprint in board.footprints:
+        for pad in footprint.pads:
+            if (pad.net_id or 0) != net_id:
+                continue
+            matched_vertices = [
+                vertex
+                for vertex in vertices
+                if _vertex_inside_pad_clearance(board, result, vertex, pad, 0.0)
             ]
-            if not column:
-                continue
-            for vertex in column:
-                graph.setdefault(vertex, set())
-            for a, b in zip(column, column[1:]):
-                add_edge(a, b)
+            nearest = sorted(
+                mm_vertices,
+                key=lambda item: (
+                    (item[1] - float(pad.center[0])) ** 2 + (item[2] - float(pad.center[1])) ** 2
+                ) ** 0.5,
+            )
+            nearest_lines: list[str] = []
+            for vertex, x_mm, y_mm in nearest[: min(8, len(nearest))]:
+                dist = ((x_mm - float(pad.center[0])) ** 2 + (y_mm - float(pad.center[1])) ** 2) ** 0.5
+                nearest_lines.append(
+                    f"{vertex}@({x_mm:.4f},{y_mm:.4f}) d_mm={dist:.4f}"
+                )
+            layer_hint = next(
+                (
+                    layer
+                    for layer in pad.layers
+                    if layer in {"F.Cu", "B.Cu"} or layer.startswith("In")
+                ),
+                pad.layers[0] if pad.layers else "?",
+            )
+            pad_grid = _mm_to_grid_vertex(
+                result,
+                float(pad.center[0]),
+                float(pad.center[1]),
+                _layer_index_from_name(board, layer_hint) or 0,
+            )
+            lines.append(
+                "selector_external_pad_detail "
+                f"net={net_id} source={source_label} "
+                f"pad={footprint.reference}:{pad.name} "
+                f"center_mm=({float(pad.center[0]):.4f},{float(pad.center[1]):.4f}) "
+                f"size_mm=({float(pad.size[0]):.4f},{float(pad.size[1]):.4f}) "
+                f"rotation_deg={float(getattr(pad, 'rotation_degrees', 0.0)):.4f} "
+                f"layer_hint={layer_hint} "
+                f"center_grid={pad_grid} "
+                f"matched_vertices={len(matched_vertices)}"
+            )
+            if nearest_lines:
+                lines.append(
+                    "selector_external_pad_nearest "
+                    f"net={net_id} source={source_label} "
+                    f"pad={footprint.reference}:{pad.name} "
+                    + " | ".join(nearest_lines)
+                )
 
-    if not graph:
-        return []
-    start_vertex = _nearest_graph_vertex(start_anchor, graph)
-    goal_vertex = _nearest_graph_vertex(goal_anchor, graph)
-    if start_vertex is None or goal_vertex is None:
-        return []
-    return _shortest_grid_path(graph, start_vertex, goal_vertex)
+    dump_limit = 120
+    for index, (vertex, x_mm, y_mm) in enumerate(mm_vertices[:dump_limit]):
+        lines.append(
+            "selector_external_graph_vertex "
+            f"net={net_id} source={source_label} "
+            f"index={index} grid={vertex} mm=({x_mm:.4f},{y_mm:.4f})"
+        )
+    if len(mm_vertices) > dump_limit:
+        lines.append(
+            "selector_external_graph_vertex "
+            f"net={net_id} source={source_label} omitted={len(mm_vertices) - dump_limit}"
+        )
+    return lines
 
 
 def _mm_to_grid_vertex(result: Any, x_mm: float, y_mm: float, z: int) -> tuple[int, int, int]:

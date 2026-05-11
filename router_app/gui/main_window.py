@@ -448,6 +448,14 @@ class MainWindow(QMainWindow):
         segment_count = sum(len(item.segments) for item in self._freerouting_run.ripup_previews)
         via_count = sum(len(item.vias) for item in self._freerouting_run.ripup_previews)
         truncated_count = sum(1 for item in self._freerouting_run.ripup_previews if item.truncated)
+        truncated_labels = []
+        for item in self._freerouting_run.ripup_previews:
+            if not item.truncated:
+                continue
+            if item.occurrence_index > 0:
+                truncated_labels.append(f"{item.net_id}@E{item.occurrence_index}")
+            else:
+                truncated_labels.append(str(item.net_id))
         self.trace_panel.show_ripped_nets(self._board, ripped_net_ids)
         self.route_preview.show_routes(self._freerouting_run.ripup_previews, self._board, ripped_net_ids)
         print(
@@ -455,8 +463,18 @@ class MainWindow(QMainWindow):
             + ", ".join(overlay_net_ids),
             flush=True,
         )
+        print(
+            f"freerouting_truncated_occurrence_count = {truncated_count}",
+            flush=True,
+        )
+        print(
+            "freerouting_truncated_occurrences = "
+            + (", ".join(truncated_labels) if truncated_labels else "(none)"),
+            flush=True,
+        )
+        selector_board = self._original_board or self._board
         outcome = build_freerouting_external_selector_outcome(
-            self._board,
+            selector_board,
             ripped_net_ids,
             self.trace_panel.grid_steps_per_mm,
         )
