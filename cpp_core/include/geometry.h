@@ -108,6 +108,9 @@ struct PadCoverageResult {
     int graph_edge_count = 0;
     int total_pads = 0;
     int unmatched_pads = 0;
+    int padless_components = 0;
+    int dangling_endpoints = 0;
+    std::vector<int> matched_pad_indices;
     std::vector<int> matched_components;
 };
 

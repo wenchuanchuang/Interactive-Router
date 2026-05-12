@@ -485,33 +485,62 @@ PadCoverageResult analyzePadCoverage(const RasterRequest& request) {
         ++component_index;
     }
 
+    result.total_pads = static_cast<int>(request.pads.size());
     std::vector<PackedVertexId> vertices;
     vertices.reserve(graph.size());
     for (const auto& entry : graph) {
         vertices.push_back(entry.first);
     }
 
-    result.total_pads = static_cast<int>(request.pads.size());
-    for (const auto& pad : request.pads) {
+    std::vector<bool> vertex_hits_pad(vertices.size(), false);
+    std::vector<bool> component_has_pad(component_index, false);
+    for (std::size_t pad_index = 0; pad_index < request.pads.size(); ++pad_index) {
+        const auto& pad = request.pads[pad_index];
         std::set<int> matched_components;
-        for (PackedVertexId vertex : vertices) {
+        bool pad_matched = false;
+        for (std::size_t vertex_index = 0; vertex_index < vertices.size(); ++vertex_index) {
+            const PackedVertexId vertex = vertices[vertex_index];
             if (!vertexInsidePad(request, vertex, pad, 0.0)) {
                 continue;
             }
+            pad_matched = true;
+            vertex_hits_pad[vertex_index] = true;
             const auto component_it = component_by_vertex.find(vertex);
             if (component_it != component_by_vertex.end()) {
                 matched_components.insert(component_it->second);
+                if (component_it->second >= 0 &&
+                    component_it->second < static_cast<int>(component_has_pad.size())) {
+                    component_has_pad[static_cast<std::size_t>(component_it->second)] = true;
+                }
             }
         }
-        if (matched_components.empty()) {
+        if (!pad_matched || matched_components.empty()) {
             ++result.unmatched_pads;
             continue;
         }
+        result.matched_pad_indices.push_back(static_cast<int>(pad_index));
         result.matched_components.insert(
             result.matched_components.end(),
             matched_components.begin(),
             matched_components.end()
         );
+    }
+
+    for (bool has_pad : component_has_pad) {
+        if (!has_pad) {
+            ++result.padless_components;
+        }
+    }
+
+    for (std::size_t vertex_index = 0; vertex_index < vertices.size(); ++vertex_index) {
+        if (vertex_hits_pad[vertex_index]) {
+            continue;
+        }
+        const auto graph_it = graph.find(vertices[vertex_index]);
+        const std::size_t degree = (graph_it == graph.end()) ? 0U : graph_it->second.size();
+        if (degree <= 1U) {
+            ++result.dangling_endpoints;
+        }
     }
 
     return result;

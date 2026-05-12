@@ -512,11 +512,13 @@ class MainWindow(QMainWindow):
         self._update_ripup_buttons()
 
     def _build_selected_preview_results(self, route_results, selection) -> list[object]:
-        selected_by_net: dict[int, int] = {}
+        selected_by_net: dict[int, list[int]] = {}
         for net_selection in selection.selections:
             if not net_selection.selected_candidate_indices:
                 continue
-            selected_by_net[int(net_selection.net_id)] = int(net_selection.selected_candidate_indices[0])
+            selected_by_net[int(net_selection.net_id)] = [
+                int(index) for index in net_selection.selected_candidate_indices
+            ]
 
         preview_results: list[object] = []
         for route_result in route_results:
@@ -524,21 +526,24 @@ class MainWindow(QMainWindow):
             candidate_preview_items = list(getattr(route_result, "candidate_preview_items", []))
             candidate_grid = list(getattr(route_result, "candidate_paths_grid", []))
             candidate_mm = list(getattr(route_result, "candidate_paths_mm", []))
-            selected_index = selected_by_net.get(net_id)
-            if selected_index is None or selected_index < 0:
+            selected_indices = selected_by_net.get(net_id)
+            if not selected_indices:
                 continue
-            if selected_index < len(candidate_preview_items):
-                preview_results.append(candidate_preview_items[selected_index])
-                continue
-            if selected_index >= len(candidate_grid) or selected_index >= len(candidate_mm):
-                continue
-            preview_results.append(
-                SimpleNamespace(
-                    net_id=net_id,
-                    candidate_paths_grid=[candidate_grid[selected_index]],
-                    candidate_paths_mm=[candidate_mm[selected_index]],
+            for selected_index in selected_indices:
+                if selected_index < 0:
+                    continue
+                if selected_index < len(candidate_preview_items):
+                    preview_results.append(candidate_preview_items[selected_index])
+                    continue
+                if selected_index >= len(candidate_grid) or selected_index >= len(candidate_mm):
+                    continue
+                preview_results.append(
+                    SimpleNamespace(
+                        net_id=net_id,
+                        candidate_paths_grid=[candidate_grid[selected_index]],
+                        candidate_paths_mm=[candidate_mm[selected_index]],
+                    )
                 )
-            )
         return preview_results
 
     def _set_layers(self, layers: list[str]) -> None:

@@ -111,6 +111,9 @@ PYBIND11_MODULE(router_core, m) {
         .def_readonly("graph_edge_count", &PadCoverageResult::graph_edge_count)
         .def_readonly("total_pads", &PadCoverageResult::total_pads)
         .def_readonly("unmatched_pads", &PadCoverageResult::unmatched_pads)
+        .def_readonly("padless_components", &PadCoverageResult::padless_components)
+        .def_readonly("dangling_endpoints", &PadCoverageResult::dangling_endpoints)
+        .def_readonly("matched_pad_indices", &PadCoverageResult::matched_pad_indices)
         .def_readonly("matched_components", &PadCoverageResult::matched_components);
 
     py::class_<RouteRequest>(m, "RouteRequest")

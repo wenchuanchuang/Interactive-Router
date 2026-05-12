@@ -73,6 +73,8 @@ def select_reroute_candidates(
     external_append_total = 0.0
     boundary_payload_total = 0.0
     terminal_normalize_total = 0.0
+    zero_valid_net_labels: list[str] = []
+    zero_valid_net_details: list[str] = []
     nets = []
     for result in outcome.result:
         net_started_at = perf_counter()
@@ -94,7 +96,14 @@ def select_reroute_candidates(
             candidate_cover_vertices = list(getattr(result, "candidate_cover_vertices", []))
         boundary_payload = list(exported_boundary_by_net.get(item.net_id, []))
         candidate_preview_items: list[Any] = []
-        external_summary = {"original": 0, "final": 0, "freerouting": 0, "vertices": 0}
+        external_summary: dict[str, Any] = {
+            "original": 0,
+            "final": 0,
+            "freerouting": 0,
+            "vertices": 0,
+            "rejections": [],
+            "missing_boundary": [],
+        }
         precomputed_pad_groups: list[list[Any]] | None = None
         if selector_board is not None:
             precomputed_pad_groups = _cpp_pad_boundary_groups_for_net(
@@ -182,6 +191,31 @@ def select_reroute_candidates(
             f"total_sec={net_elapsed:.3f}",
             flush=True,
         )
+        valid_candidate_count = _valid_selector_candidate_count(
+            item.candidate_paths_grid,
+            item.candidate_boundary_vertices,
+            item.candidate_terminal_coords,
+            item.candidate_terminal_groups,
+        )
+        if valid_candidate_count <= 0:
+            rejection_text = ", ".join(external_summary.get("rejections", [])) or "(none)"
+            missing_boundary_text = ", ".join(external_summary.get("missing_boundary", [])) or "(none)"
+            net_name = selector_board.nets.get(item.net_id, "") if selector_board is not None else ""
+            zero_valid_line = (
+                "selector_zero_candidate_net "
+                f"net={item.net_id} "
+                f"net_name={net_name!r} "
+                f"candidate_slots={max(_candidate_slot_count(item), 0)} "
+                f"valid_candidates=0 "
+                f"original={external_summary['original']} "
+                f"final={external_summary['final']} "
+                f"freerouting={external_summary['freerouting']} "
+                f"rejections={rejection_text} "
+                f"missing_boundary={missing_boundary_text}"
+            )
+            print(zero_valid_line, flush=True)
+            zero_valid_net_details.append(zero_valid_line)
+            zero_valid_net_labels.append(f"{item.net_id}:{net_name}" if net_name else str(item.net_id))
         nets.append(item)
     request.nets = nets
 
@@ -208,25 +242,55 @@ def select_reroute_candidates(
                 flush=True,
             )
             continue
-        selected_index = int(selection.selected_candidate_indices[0])
         route_result = result_by_net.get(int(selection.net_id))
         preview_items = list(getattr(route_result, "candidate_preview_items", [])) if route_result is not None else []
         via_counts = list(getattr(route_result, "candidate_via_counts", [])) if route_result is not None else []
-        preview = preview_items[selected_index] if 0 <= selected_index < len(preview_items) else None
-        via_count = via_counts[selected_index] if 0 <= selected_index < len(via_counts) else None
-        source = str(getattr(preview, "source", "unknown")) if preview is not None else "unknown"
-        occurrence_index = int(getattr(preview, "occurrence_index", 0)) if preview is not None else 0
-        extra = f" occurrence_index={occurrence_index}" if occurrence_index > 0 else ""
-        via_text = str(via_count) if via_count is not None else "unknown"
+        for raw_index in selection.selected_candidate_indices:
+            selected_index = int(raw_index)
+            preview = preview_items[selected_index] if 0 <= selected_index < len(preview_items) else None
+            via_count = via_counts[selected_index] if 0 <= selected_index < len(via_counts) else None
+            source = str(getattr(preview, "source", "unknown")) if preview is not None else "unknown"
+            source_net_id = int(getattr(preview, "source_net_id", selection.net_id)) if preview is not None else int(selection.net_id)
+            occurrence_index = int(getattr(preview, "occurrence_index", 0)) if preview is not None else 0
+            extra = f" occurrence_index={occurrence_index}" if occurrence_index > 0 else ""
+            source_net_extra = f" source_net_id={source_net_id}"
+            via_text = str(via_count) if via_count is not None else "unknown"
+            print(
+                "selector_selected_candidate "
+                f"net={selection.net_id} "
+                f"index={selected_index} "
+                f"source={source}"
+                f"{extra}"
+                f"{source_net_extra} "
+                f"via_count={via_text}",
+                flush=True,
+            )
+
+    left_top_board = _freerouting_final_board_from_results(outcome.result)
+    if left_top_board is not None:
+        left_top_wire_length_mm = sum(
+            math.hypot(track.end[0] - track.start[0], track.end[1] - track.start[1])
+            for track in left_top_board.tracks
+        )
+        left_top_via_count = len(left_top_board.vias)
         print(
-            "selector_selected_candidate "
-            f"net={selection.net_id} "
-            f"index={selected_index} "
-            f"source={source}"
-            f"{extra} "
-            f"via_count={via_text}",
+            f"selector_left_top_total_via_count = {left_top_via_count}  # 左上 freerouting 最終結果總 via 數",
             flush=True,
         )
+        print(
+            f"selector_left_top_total_wire_length_mm = {left_top_wire_length_mm:.3f}  # 左上 freerouting 最終結果總線長(mm)",
+            flush=True,
+        )
+
+    selected_via_count, selected_wire_length_mm = _selected_solution_stats(outcome.result, selections)
+    print(
+        f"selector_selected_total_via_count = {selected_via_count}  # Gurobi 選出結果總 via 數",
+        flush=True,
+    )
+    print(
+        f"selector_selected_total_wire_length_mm = {selected_wire_length_mm:.3f}  # Gurobi 選出結果總線長(mm)",
+        flush=True,
+    )
     total_elapsed = perf_counter() - selector_started_at
     print(
         "selector_timing_summary "
@@ -239,12 +303,113 @@ def select_reroute_candidates(
         f"total_sec={total_elapsed:.3f}",
         flush=True,
     )
+    if zero_valid_net_labels:
+        print(
+            "selector_zero_candidate_nets = " + ", ".join(zero_valid_net_labels),
+            flush=True,
+        )
+        for detail in zero_valid_net_details:
+            print(detail, flush=True)
     return SelectionResult(
         ok=bool(cpp_result.ok),
         selections=selections,
         solver=str(cpp_result.solver),
         message=str(cpp_result.message),
     )
+
+
+def _candidate_slot_count(item: Any) -> int:
+    return max(
+        len(getattr(item, "candidate_paths_grid", [])),
+        len(getattr(item, "candidate_paths_mm", [])),
+        len(getattr(item, "candidate_via_counts", [])),
+        len(getattr(item, "candidate_boundary_vertices", [])),
+        len(getattr(item, "candidate_cover_vertices", [])),
+        len(getattr(item, "candidate_terminal_coords", [])),
+        len(getattr(item, "candidate_terminal_groups", [])),
+    )
+
+
+def _freerouting_final_board_from_results(results: list[Any] | None) -> BoardData | None:
+    if not results:
+        return None
+    for result in results:
+        board = getattr(result, "final_candidate_board", None)
+        if isinstance(board, BoardData):
+            return board
+    return None
+
+
+def _selected_solution_stats(
+    results: list[Any] | None,
+    selections: list[PyNetSelection],
+) -> tuple[int, float]:
+    if not results or not selections:
+        return 0, 0.0
+
+    result_by_net = {
+        int(getattr(result, "net_id", 0)): result
+        for result in results
+    }
+    total_via_count = 0
+    total_wire_length_mm = 0.0
+    for selection in selections:
+        route_result = result_by_net.get(int(selection.net_id))
+        if route_result is None:
+            continue
+        preview_items = list(getattr(route_result, "candidate_preview_items", []))
+        for raw_index in selection.selected_candidate_indices:
+            selected_index = int(raw_index)
+            if not (0 <= selected_index < len(preview_items)):
+                continue
+            preview = preview_items[selected_index]
+            total_via_count += len(getattr(preview, "vias", []) or [])
+            for segment in getattr(preview, "segments", []) or []:
+                start = getattr(segment, "start", None)
+                end = getattr(segment, "end", None)
+                if (
+                    not isinstance(start, tuple)
+                    or not isinstance(end, tuple)
+                    or len(start) < 2
+                    or len(end) < 2
+                ):
+                    continue
+                total_wire_length_mm += math.hypot(
+                    float(end[0]) - float(start[0]),
+                    float(end[1]) - float(start[1]),
+                )
+    return total_via_count, total_wire_length_mm
+
+
+def _valid_selector_candidate_count(
+    candidate_paths_grid: list[list[Any]],
+    candidate_boundary_vertices: list[list[Any]],
+    candidate_terminal_coords: list[list[Any]],
+    candidate_terminal_groups: list[list[list[Any]]],
+) -> int:
+    valid_count = 0
+    candidate_count = max(
+        len(candidate_paths_grid),
+        len(candidate_boundary_vertices),
+        len(candidate_terminal_coords),
+        len(candidate_terminal_groups),
+    )
+    for candidate_idx in range(candidate_count):
+        path_grid = candidate_paths_grid[candidate_idx] if candidate_idx < len(candidate_paths_grid) else []
+        occupied_vertices = (
+            candidate_boundary_vertices[candidate_idx]
+            if candidate_idx < len(candidate_boundary_vertices) and candidate_boundary_vertices[candidate_idx]
+            else path_grid
+        )
+        terminal_coords = list(candidate_terminal_coords[candidate_idx]) if candidate_idx < len(candidate_terminal_coords) else []
+        terminal_groups = list(candidate_terminal_groups[candidate_idx]) if candidate_idx < len(candidate_terminal_groups) else []
+        if not terminal_groups:
+            terminal_groups = [[point] for point in terminal_coords]
+        if not terminal_coords and terminal_groups:
+            terminal_coords = [group[0] for group in terminal_groups if group]
+        if occupied_vertices and terminal_coords:
+            valid_count += 1
+    return valid_count
 
 
 def _normalize_terminal_groups_for_net(
@@ -507,6 +672,7 @@ def _append_external_candidates_for_selector(
             result=result,
             net_id=final_net_id,
             max_ripped_clearance=max_ripped_clearance,
+            layer_index_board=board,
         )
         collect_total += perf_counter() - collect_started_at
         raster_started_at = perf_counter()
@@ -533,6 +699,7 @@ def _append_external_candidates_for_selector(
         )
         pad_reason_total += perf_counter() - pad_reason_started_at
         if final_pad_reason is not None:
+            summary.setdefault("rejections", []).append(f"final:{final_pad_reason}")
             print(
                 f"selector_external_rejected_missing_pads net={net_id} source=final reason={final_pad_reason}",
                 flush=True,
@@ -573,6 +740,7 @@ def _append_external_candidates_for_selector(
                     final_vias,
                     0,
                     "final",
+                    net_id,
                 ),
             )
             candidate_append_total += perf_counter() - candidate_append_started_at
@@ -580,6 +748,7 @@ def _append_external_candidates_for_selector(
                 summary["final"] += 1
                 summary["vertices"] += len(final_raw)
             else:
+                summary.setdefault("missing_boundary", []).append("final")
                 print(
                     f"selector_external_missing_boundary net={net_id} source=final",
                     flush=True,
@@ -617,6 +786,7 @@ def _append_external_candidates_for_selector(
     )
     pad_reason_total += perf_counter() - pad_reason_started_at
     if original_pad_reason is not None:
+        summary.setdefault("rejections", []).append(f"original:{original_pad_reason}")
         print(
             f"selector_external_rejected_missing_pads net={net_id} source=original reason={original_pad_reason}",
             flush=True,
@@ -657,6 +827,7 @@ def _append_external_candidates_for_selector(
                 original_vias,
                 0,
                 "original",
+                net_id,
             ),
         )
         candidate_append_total += perf_counter() - candidate_append_started_at
@@ -664,6 +835,7 @@ def _append_external_candidates_for_selector(
             summary["original"] += 1
             summary["vertices"] += len(original_raw)
         else:
+            summary.setdefault("missing_boundary", []).append("original")
             print(
                 f"selector_external_missing_boundary net={net_id} source=original",
                 flush=True,
@@ -713,6 +885,9 @@ def _append_external_candidates_for_selector(
         )
         pad_reason_total += perf_counter() - pad_reason_started_at
         if occ_pad_reason is not None:
+            summary.setdefault("rejections", []).append(
+                f"freerouting@E{occurrence_index}:{occ_pad_reason}"
+            )
             print(
                 "selector_external_rejected_missing_pads "
                 f"net={net_id} source=freerouting occurrence_index={occurrence_index} reason={occ_pad_reason}",
@@ -755,6 +930,7 @@ def _append_external_candidates_for_selector(
                     occ_vias,
                     occurrence_index,
                     "freerouting",
+                    int(occurrence.get("source_net_id", net_id) or net_id),
                 ),
             )
             candidate_append_total += perf_counter() - candidate_append_started_at
@@ -762,6 +938,7 @@ def _append_external_candidates_for_selector(
                 summary["freerouting"] += 1
                 summary["vertices"] += len(occ_raw)
             else:
+                summary.setdefault("missing_boundary", []).append(f"freerouting@E{occurrence_index}")
                 print(
                     f"selector_external_missing_boundary net={net_id} source=freerouting occurrence_index={occurrence_index}",
                     flush=True,
@@ -838,11 +1015,13 @@ def _candidate_preview_item(
     vias: list[dict[str, Any]],
     occurrence_index: int,
     source: str,
+    source_net_id: int | None = None,
 ) -> Any:
     return SimpleNamespace(
         net_id=int(net_id),
         occurrence_index=int(occurrence_index),
         source=str(source),
+        source_net_id=int(source_net_id if source_net_id is not None else net_id),
         preview_kind="candidate",
         segments=[
             SimpleNamespace(
@@ -932,13 +1111,19 @@ def _collect_original_route_primitives(
     result: Any,
     net_id: int,
     max_ripped_clearance: float,
+    layer_index_board: BoardData | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    # Track/via geometry may come from a board that uses a different copper-layer
+    # index space than the selector board. Keep the source geometry on `board`,
+    # but map z indices through `layer_index_board` when one is provided so the
+    # selector sees a consistent layer numbering scheme.
+    mapping_board = layer_index_board if layer_index_board is not None else board
     boundary_clearance = max(0.0, max_ripped_clearance) * 0.5
     segments: list[dict[str, Any]] = []
     for track in board.tracks:
         if int(track.net_id) != net_id:
             continue
-        z = _layer_index_from_name(board, track.layer)
+        z = _layer_index_from_name(mapping_board, track.layer)
         if z is None:
             continue
         segments.append(
@@ -952,7 +1137,11 @@ def _collect_original_route_primitives(
             }
         )
 
+    top_layer_index = _layer_index_from_name(mapping_board, "F.Cu")
+    bottom_layer_index = _layer_index_from_name(mapping_board, "B.Cu")
     default_z_end = max(0, int(getattr(result, "nz", 0)) - 1)
+    z_start = top_layer_index if top_layer_index is not None else 0
+    z_end = bottom_layer_index if bottom_layer_index is not None else default_z_end
     vias: list[dict[str, Any]] = []
     for via in board.vias:
         if int(via.net_id) != net_id:
@@ -964,8 +1153,8 @@ def _collect_original_route_primitives(
                 "start_layer": "F.Cu",
                 "end_layer": "B.Cu",
                 "radius_mm": float(via.diameter) * 0.5 + boundary_clearance,
-                "z_start": 0,
-                "z_end": default_z_end,
+                "z_start": z_start,
+                "z_end": z_end,
             }
         )
     return segments, vias
@@ -1268,15 +1457,12 @@ def _cpp_external_candidate_pad_coverage_reason(
         analysis = router_core.analyze_pad_coverage(request)
         if not bool(getattr(analysis, "has_graph", False)):
             return "empty_graph"
-        total_pads = int(getattr(analysis, "total_pads", 0))
-        if total_pads <= 0:
-            return None
-        unmatched_pads = int(getattr(analysis, "unmatched_pads", 0))
-        if unmatched_pads > 0:
-            return f"unmatched_pads={unmatched_pads}/{total_pads}"
-        unique_components = sorted(set(int(value) for value in getattr(analysis, "matched_components", [])))
-        if len(unique_components) > 1:
-            return f"pad_components={unique_components}"
+        padless_components = int(getattr(analysis, "padless_components", 0))
+        if padless_components > 0:
+            return f"padless_components={padless_components}"
+        dangling_endpoints = int(getattr(analysis, "dangling_endpoints", 0))
+        if dangling_endpoints > 0:
+            return f"nonpad_endpoints={dangling_endpoints}"
         return None
     except Exception:
         return _external_candidate_pad_coverage_reason(
@@ -1504,30 +1690,37 @@ def _external_candidate_pad_coverage_reason(
         component_index += 1
 
     pad_components: list[int] = []
-    unmatched_pads = 0
-    total_pads = 0
+    component_has_pad: list[bool] = [False] * component_index
+    vertex_hits_pad: dict[tuple[int, int, int], bool] = {vertex: False for vertex in graph.keys()}
     for footprint in board.footprints:
         for pad in footprint.pads:
             if (pad.net_id or 0) != net_id:
                 continue
-            total_pads += 1
             matched_components = {
                 component_by_vertex[vertex]
                 for vertex in graph.keys()
                 if _vertex_inside_pad_clearance(board, result, vertex, pad, 0.0)
             }
-            if not matched_components:
-                unmatched_pads += 1
-                continue
+            for vertex in graph.keys():
+                if _vertex_inside_pad_clearance(board, result, vertex, pad, 0.0):
+                    vertex_hits_pad[vertex] = True
+            for component_id in matched_components:
+                if 0 <= component_id < len(component_has_pad):
+                    component_has_pad[component_id] = True
             pad_components.extend(sorted(matched_components))
 
-    if total_pads <= 0:
-        return None
-    if unmatched_pads > 0:
-        return f"unmatched_pads={unmatched_pads}/{total_pads}"
-    unique_components = sorted(set(pad_components))
-    if len(unique_components) > 1:
-        return f"pad_components={unique_components}"
+    padless_components = sum(1 for has_pad in component_has_pad if not has_pad)
+    if padless_components > 0:
+        return f"padless_components={padless_components}"
+
+    dangling_endpoints = 0
+    for vertex, neighbors in graph.items():
+        if vertex_hits_pad.get(vertex, False):
+            continue
+        if len(neighbors) <= 1:
+            dangling_endpoints += 1
+    if dangling_endpoints > 0:
+        return f"nonpad_endpoints={dangling_endpoints}"
     return None
 
 

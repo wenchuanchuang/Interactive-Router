@@ -71,6 +71,12 @@ struct NetRecord {
     std::vector<CandidateRecord> candidates;
 };
 
+struct GroupEdgeVar {
+    int group_a = -1;
+    int group_b = -1;
+    GRBVar var;
+};
+
 VertexKey toVertex(const GridPoint& point) {
     return VertexKey{
         static_cast<std::int32_t>(point.x),
@@ -137,6 +143,24 @@ int countPathVias(const std::vector<GridPoint>& path) {
         }
     }
     return via_count;
+}
+
+std::size_t sharedPadCount(const std::vector<int>& a, const std::vector<int>& b) {
+    std::size_t count = 0;
+    std::size_t ia = 0;
+    std::size_t ib = 0;
+    while (ia < a.size() && ib < b.size()) {
+        if (a[ia] == b[ib]) {
+            ++count;
+            ++ia;
+            ++ib;
+        } else if (a[ia] < b[ib]) {
+            ++ia;
+        } else {
+            ++ib;
+        }
+    }
+    return count;
 }
 
 std::vector<PackedVertexId> uniqueVerticesFromGridPoints(const std::vector<GridPoint>& points) {
@@ -305,7 +329,7 @@ std::vector<NetRecord> buildNetRecords(const SelectionRequest& request, bool* tr
 SelectionResult buildSelectionResultFromChoice(
     const SelectionRequest& request,
     const std::vector<NetRecord>& records,
-    const std::vector<int>& chosen_candidate_index,
+    const std::vector<std::vector<int>>& chosen_candidate_indices,
     const std::string& solver,
     double objective,
     const std::string& message
@@ -324,9 +348,9 @@ SelectionResult buildSelectionResultFromChoice(
     }
     for (std::size_t i = 0; i < records.size(); ++i) {
         const auto& record = records[i];
-        int chosen = (i < chosen_candidate_index.size()) ? chosen_candidate_index[i] : -1;
-        if (chosen >= 0) {
-            ordered[static_cast<std::size_t>(record.original_net_index)].selected_candidate_indices = {chosen};
+        if (i < chosen_candidate_indices.size()) {
+            ordered[static_cast<std::size_t>(record.original_net_index)].selected_candidate_indices =
+                chosen_candidate_indices[i];
         }
     }
     for (auto& sel : ordered) {
@@ -336,17 +360,135 @@ SelectionResult buildSelectionResultFromChoice(
 }
 
 #if defined(ROUTER_HAS_GUROBI)
+class GroupConnectivityLazyCallback : public GRBCallback {
+public:
+    GroupConnectivityLazyCallback(
+        const std::vector<bool>& multi_group_net,
+        const std::vector<std::vector<GRBVar>>& group_choice,
+        const std::vector<std::vector<GroupEdgeVar>>& group_edge_vars
+    )
+        : multi_group_net_(multi_group_net),
+          group_choice_(group_choice),
+          group_edge_vars_(group_edge_vars) {}
+
+protected:
+    void callback() override {
+        if (where != GRB_CB_MIPSOL) {
+            return;
+        }
+
+        try {
+            constexpr double kSelectedThreshold = 0.5;
+            for (std::size_t g = 0; g < multi_group_net_.size(); ++g) {
+                if (!multi_group_net_[g] || group_choice_[g].size() <= 1) {
+                    continue;
+                }
+
+                std::vector<int> selected_groups;
+                selected_groups.reserve(group_choice_[g].size());
+                for (std::size_t group_index = 0; group_index < group_choice_[g].size(); ++group_index) {
+                    if (getSolution(group_choice_[g][group_index]) > kSelectedThreshold) {
+                        selected_groups.push_back(static_cast<int>(group_index));
+                    }
+                }
+                if (selected_groups.size() <= 1) {
+                    continue;
+                }
+
+                std::unordered_set<int> selected_set(selected_groups.begin(), selected_groups.end());
+                std::unordered_map<int, std::vector<int>> active_adjacency;
+                for (int group_index : selected_groups) {
+                    active_adjacency[group_index] = {};
+                }
+                for (const auto& edge : group_edge_vars_[g]) {
+                    if (selected_set.find(edge.group_a) == selected_set.end() ||
+                        selected_set.find(edge.group_b) == selected_set.end()) {
+                        continue;
+                    }
+                    if (getSolution(edge.var) > kSelectedThreshold) {
+                        active_adjacency[edge.group_a].push_back(edge.group_b);
+                        active_adjacency[edge.group_b].push_back(edge.group_a);
+                    }
+                }
+
+                std::unordered_set<int> unvisited(selected_groups.begin(), selected_groups.end());
+                std::vector<std::vector<int>> connected_components;
+                while (!unvisited.empty()) {
+                    const int start = *unvisited.begin();
+                    std::vector<int> component;
+                    std::vector<int> stack = {start};
+                    unvisited.erase(start);
+                    while (!stack.empty()) {
+                        const int current = stack.back();
+                        stack.pop_back();
+                        component.push_back(current);
+                        auto adjacency_it = active_adjacency.find(current);
+                        if (adjacency_it == active_adjacency.end()) {
+                            continue;
+                        }
+                        for (int neighbor : adjacency_it->second) {
+                            auto unvisited_it = unvisited.find(neighbor);
+                            if (unvisited_it != unvisited.end()) {
+                                unvisited.erase(unvisited_it);
+                                stack.push_back(neighbor);
+                            }
+                        }
+                    }
+                    connected_components.push_back(std::move(component));
+                }
+
+                if (connected_components.size() <= 1) {
+                    continue;
+                }
+
+                const int anchor_group = connected_components.front().front();
+                for (std::size_t component_index = 1; component_index < connected_components.size(); ++component_index) {
+                    const auto& component = connected_components[component_index];
+                    std::unordered_set<int> component_set(component.begin(), component.end());
+                    GRBLinExpr cut_expr = 0.0;
+                    for (const auto& edge : group_edge_vars_[g]) {
+                        const bool a_in = component_set.find(edge.group_a) != component_set.end();
+                        const bool b_in = component_set.find(edge.group_b) != component_set.end();
+                        if (a_in != b_in) {
+                            cut_expr += edge.var;
+                        }
+                    }
+
+                    // If one selected group sits inside this component and another selected group
+                    // sits outside it, at least one active group-graph edge must cross the cut.
+                    GRBLinExpr lazy_expr = cut_expr
+                        - group_choice_[g][static_cast<std::size_t>(anchor_group)]
+                        - group_choice_[g][static_cast<std::size_t>(component.front())];
+                    addLazy(lazy_expr, GRB_GREATER_EQUAL, -1.0);
+                }
+            }
+        } catch (const GRBException&) {
+            throw;
+        } catch (...) {
+            // Let Gurobi surface unknown callback failures through the outer solve path.
+            throw;
+        }
+    }
+
+private:
+    const std::vector<bool>& multi_group_net_;
+    const std::vector<std::vector<GRBVar>>& group_choice_;
+    const std::vector<std::vector<GroupEdgeVar>>& group_edge_vars_;
+};
+
 SelectionResult solveWithGurobi(const SelectionRequest& request, const std::vector<NetRecord>& records) {
-    // This solver follows tmp.cpp SolveNetwork style:
-    // - path choice binary variables
-    // - terminal vertex == 1
-    // - shared non-terminal vertex <= 1 (only if touched by >= 2 nets)
-    // - objective: minimize via_count * pathChoice
+    // Candidate selection uses binary variables per path.
+    // Terminal coverage stays exact for single-group nets, while multi-group nets
+    // allow several partial candidates as long as each pad is covered and each
+    // candidate group contributes at most one selected path.
+    // Shared non-terminal vertices remain mutually exclusive across different nets.
+    // Objective: minimize via_count * pathChoice.
     GRBEnv env = GRBEnv();
     GRBModel model = GRBModel(env);
 
     model.set(GRB_IntParam_Threads, 20);
     model.set(GRB_DoubleParam_MIPGap, 0.1);
+    model.set(GRB_IntParam_LazyConstraints, 1);
 
     std::vector<std::vector<GRBVar>> path_choice;
     path_choice.resize(records.size());
@@ -357,8 +499,17 @@ SelectionResult solveWithGurobi(const SelectionRequest& request, const std::vect
         }
     }
 
+    std::vector<std::vector<GRBVar>> group_choice(records.size());
+    std::vector<std::vector<GroupEdgeVar>> group_edge_vars(records.size());
+
     std::set<PackedVertexId> terminal_vertices;
     std::vector<std::vector<std::vector<PackedVertexId>>> terminal_groups_by_net(records.size());
+    std::vector<std::vector<std::unordered_set<PackedVertexId>>> terminal_group_sets_by_net(records.size());
+    std::vector<std::vector<std::vector<int>>> candidate_hit_terminal_groups_by_net(records.size());
+    std::vector<std::vector<std::vector<int>>> candidate_groups_by_net(records.size());
+    std::vector<std::vector<std::vector<int>>> group_pad_sets_by_net(records.size());
+    std::vector<std::vector<int>> zero_hit_candidates_by_net(records.size());
+    std::vector<bool> multi_group_net(records.size(), false);
     std::map<PackedVertexId, GRBLinExpr> v_exprs;
     std::map<PackedVertexId, std::set<int>> v_groups;
     std::size_t total_candidate_count = 0;
@@ -381,7 +532,9 @@ SelectionResult solveWithGurobi(const SelectionRequest& request, const std::vect
             }
 
             terminal_groups_by_net[g].clear();
+            terminal_group_sets_by_net[g].clear();
             terminal_groups_by_net[g].reserve(union_groups.size());
+            terminal_group_sets_by_net[g].reserve(union_groups.size());
             for (auto& group_set : union_groups) {
                 if (group_set.empty()) {
                     continue;
@@ -393,8 +546,47 @@ SelectionResult solveWithGurobi(const SelectionRequest& request, const std::vect
                     terminal_vertices.insert(vertex);
                 }
                 terminal_groups_by_net[g].push_back(std::move(group_vertices));
+                terminal_group_sets_by_net[g].push_back(std::move(group_set));
             }
+
+            candidate_hit_terminal_groups_by_net[g].resize(records[g].candidates.size());
+            std::map<std::vector<int>, int> signature_to_group;
+            for (std::size_t p = 0; p < records[g].candidates.size(); ++p) {
+                const auto& candidate = records[g].candidates[p];
+                std::vector<int> hit_groups;
+                hit_groups.reserve(terminal_group_sets_by_net[g].size());
+                for (std::size_t gi = 0; gi < terminal_group_sets_by_net[g].size(); ++gi) {
+                    bool hit_group = false;
+                    for (const auto& occupied : candidate.cover_vertices) {
+                        if (terminal_group_sets_by_net[g][gi].find(occupied) != terminal_group_sets_by_net[g][gi].end()) {
+                            hit_group = true;
+                            break;
+                        }
+                    }
+                    if (hit_group) {
+                        hit_groups.push_back(static_cast<int>(gi));
+                    }
+                }
+                candidate_hit_terminal_groups_by_net[g][p] = hit_groups;
+                if (hit_groups.empty()) {
+                    zero_hit_candidates_by_net[g].push_back(static_cast<int>(p));
+                    continue;
+                }
+                auto signature_it = signature_to_group.find(hit_groups);
+                int group_index = -1;
+                if (signature_it == signature_to_group.end()) {
+                    group_index = static_cast<int>(group_pad_sets_by_net[g].size());
+                    signature_to_group.emplace(hit_groups, group_index);
+                    group_pad_sets_by_net[g].push_back(hit_groups);
+                    candidate_groups_by_net[g].push_back({});
+                } else {
+                    group_index = signature_it->second;
+                }
+                candidate_groups_by_net[g][static_cast<std::size_t>(group_index)].push_back(static_cast<int>(p));
+            }
+            multi_group_net[g] = group_pad_sets_by_net[g].size() >= 2;
         }
+
         for (std::size_t p = 0; p < records[g].candidates.size(); ++p) {
             const auto& candidate = records[g].candidates[p];
             for (const auto& vertex : candidate.occupied_vertices) {
@@ -406,30 +598,47 @@ SelectionResult solveWithGurobi(const SelectionRequest& request, const std::vect
 
     std::size_t total_terminal_group_rows = 0;
     std::size_t total_terminal_group_nonzeros = 0;
+    std::size_t total_candidate_group_rows = 0;
+    std::size_t total_group_conflict_rows = 0;
+    std::size_t total_group_connectivity_edge_count = 0;
+    std::size_t total_group_selection_rows = 0;
+    std::size_t total_group_edge_link_rows = 0;
+    std::size_t total_zero_hit_rows = 0;
     for (std::size_t g = 0; g < terminal_groups_by_net.size(); ++g) {
         total_terminal_group_rows += terminal_groups_by_net[g].size();
-        for (std::size_t gi = 0; gi < terminal_groups_by_net[g].size(); ++gi) {
-            const auto& group_vertices = terminal_groups_by_net[g][gi];
-            std::unordered_set<PackedVertexId> group_vertex_set;
-            group_vertex_set.reserve(group_vertices.size() * 2 + 1);
-            for (const auto& vertex : group_vertices) {
-                group_vertex_set.insert(vertex);
-            }
-            std::size_t hit_count = 0;
-            for (std::size_t p = 0; p < records[g].candidates.size(); ++p) {
-                const auto& candidate = records[g].candidates[p];
-                bool hit_group = false;
-                for (const auto& occupied : candidate.cover_vertices) {
-                    if (group_vertex_set.find(occupied) != group_vertex_set.end()) {
-                        hit_group = true;
-                        break;
+        total_zero_hit_rows += zero_hit_candidates_by_net[g].size();
+        if (multi_group_net[g]) {
+            total_candidate_group_rows += candidate_groups_by_net[g].size();
+            total_group_selection_rows += candidate_groups_by_net[g].size();
+            for (std::size_t ga = 0; ga < group_pad_sets_by_net[g].size(); ++ga) {
+                for (std::size_t gb = ga + 1; gb < group_pad_sets_by_net[g].size(); ++gb) {
+                    if (sharedPadCount(group_pad_sets_by_net[g][ga], group_pad_sets_by_net[g][gb]) > 0) {
+                        ++total_group_connectivity_edge_count;
+                        total_group_edge_link_rows += 2;
                     }
                 }
-                if (hit_group) {
+            }
+        }
+        for (std::size_t gi = 0; gi < terminal_groups_by_net[g].size(); ++gi) {
+            std::size_t hit_count = 0;
+            for (std::size_t p = 0; p < candidate_hit_terminal_groups_by_net[g].size(); ++p) {
+                const auto& hit_groups = candidate_hit_terminal_groups_by_net[g][p];
+                if (std::find(hit_groups.begin(), hit_groups.end(), static_cast<int>(gi)) != hit_groups.end()) {
                     ++hit_count;
                 }
             }
             total_terminal_group_nonzeros += hit_count;
+        }
+        if (multi_group_net[g]) {
+            for (std::size_t ga = 0; ga < group_pad_sets_by_net[g].size(); ++ga) {
+                for (std::size_t gb = ga + 1; gb < group_pad_sets_by_net[g].size(); ++gb) {
+                    const std::size_t shared_pad_count =
+                        sharedPadCount(group_pad_sets_by_net[g][ga], group_pad_sets_by_net[g][gb]);
+                    if (shared_pad_count >= 2) {
+                        ++total_group_conflict_rows;
+                    }
+                }
+            }
         }
     }
 
@@ -453,8 +662,21 @@ SelectionResult solveWithGurobi(const SelectionRequest& request, const std::vect
     std::cout
         << "selector_gurobi_var_count = " << total_candidate_count << '\n'
         << "selector_gurobi_terminal_group_row_count = " << total_terminal_group_rows << '\n'
+        << "selector_gurobi_candidate_group_row_count = " << total_candidate_group_rows << '\n'
+        << "selector_gurobi_group_conflict_row_count = " << total_group_conflict_rows << '\n'
+        << "selector_gurobi_group_connectivity_edge_count = " << total_group_connectivity_edge_count << '\n'
+        << "selector_gurobi_group_selection_row_count = " << total_group_selection_rows << '\n'
+        << "selector_gurobi_group_edge_link_row_count = " << total_group_edge_link_rows << '\n'
+        << "selector_gurobi_zero_hit_row_count = " << total_zero_hit_rows << '\n'
         << "selector_gurobi_capacity_row_count = " << total_capacity_rows << '\n'
-        << "selector_gurobi_total_row_count_estimated = " << (total_terminal_group_rows + total_capacity_rows) << '\n'
+        << "selector_gurobi_total_row_count_estimated = "
+        << (total_terminal_group_rows
+            + total_candidate_group_rows
+            + total_group_conflict_rows
+            + total_group_selection_rows
+            + total_group_edge_link_rows
+            + total_zero_hit_rows
+            + total_capacity_rows) << '\n'
         << "selector_gurobi_terminal_group_nonzeros_estimated = " << total_terminal_group_nonzeros << '\n'
         << "selector_gurobi_capacity_nonzeros_estimated = " << total_capacity_nonzeros << '\n'
         << "selector_gurobi_total_nonzeros_estimated = " << (total_terminal_group_nonzeros + total_capacity_nonzeros)
@@ -462,44 +684,136 @@ SelectionResult solveWithGurobi(const SelectionRequest& request, const std::vect
 
     for (const auto& record : records) {
         std::size_t union_group_count = 0;
+        std::size_t candidate_group_count = 0;
         if (record.original_net_index >= 0 &&
             static_cast<std::size_t>(record.original_net_index) < terminal_groups_by_net.size()) {
             union_group_count = terminal_groups_by_net[static_cast<std::size_t>(record.original_net_index)].size();
+            candidate_group_count = group_pad_sets_by_net[static_cast<std::size_t>(record.original_net_index)].size();
         }
         std::cout
             << "selector_gurobi_net_summary "
             << "net=" << record.net_id
             << " candidates=" << record.candidates.size()
             << " terminal_groups=" << union_group_count
+            << " candidate_groups=" << candidate_group_count
             << std::endl;
+    }
+
+    for (std::size_t g = 0; g < zero_hit_candidates_by_net.size(); ++g) {
+        for (int candidate_index : zero_hit_candidates_by_net[g]) {
+            model.addConstr(
+                path_choice[g][static_cast<std::size_t>(candidate_index)] == 0.0,
+                "ZeroHit_net" + std::to_string(records[g].net_id) + "_c" + std::to_string(candidate_index)
+            );
+        }
+    }
+
+    for (std::size_t g = 0; g < candidate_groups_by_net.size(); ++g) {
+        if (!multi_group_net[g]) {
+            continue;
+        }
+        group_choice[g].reserve(candidate_groups_by_net[g].size());
+        for (std::size_t group_index = 0; group_index < candidate_groups_by_net[g].size(); ++group_index) {
+            group_choice[g].push_back(
+                model.addVar(
+                    0.0,
+                    1.0,
+                    0.0,
+                    GRB_BINARY,
+                    "GroupSelect_net" + std::to_string(records[g].net_id) + "_g" + std::to_string(group_index)
+                )
+            );
+        }
+        for (std::size_t group_index = 0; group_index < candidate_groups_by_net[g].size(); ++group_index) {
+            GRBLinExpr group_expr = 0.0;
+            for (int candidate_index : candidate_groups_by_net[g][group_index]) {
+                group_expr += path_choice[g][static_cast<std::size_t>(candidate_index)];
+            }
+            model.addConstr(
+                group_choice[g][group_index] == group_expr,
+                "GroupChoice_net" + std::to_string(records[g].net_id) + "_g" + std::to_string(group_index)
+            );
+            model.addConstr(
+                group_expr <= 1.0,
+                "CandidateGroup_net" + std::to_string(records[g].net_id) + "_g" + std::to_string(group_index)
+            );
+        }
+        for (std::size_t ga = 0; ga < group_pad_sets_by_net[g].size(); ++ga) {
+            for (std::size_t gb = ga + 1; gb < group_pad_sets_by_net[g].size(); ++gb) {
+                if (sharedPadCount(group_pad_sets_by_net[g][ga], group_pad_sets_by_net[g][gb]) == 0) {
+                    continue;
+                }
+                GroupEdgeVar edge_var;
+                edge_var.group_a = static_cast<int>(ga);
+                edge_var.group_b = static_cast<int>(gb);
+                edge_var.var = model.addVar(
+                    0.0,
+                    1.0,
+                    0.0,
+                    GRB_BINARY,
+                    "GroupEdge_net" + std::to_string(records[g].net_id)
+                        + "_a" + std::to_string(ga)
+                        + "_b" + std::to_string(gb)
+                );
+                model.addConstr(
+                    edge_var.var <= group_choice[g][ga],
+                    "GroupEdgeLinkA_net" + std::to_string(records[g].net_id)
+                        + "_a" + std::to_string(ga)
+                        + "_b" + std::to_string(gb)
+                );
+                model.addConstr(
+                    edge_var.var <= group_choice[g][gb],
+                    "GroupEdgeLinkB_net" + std::to_string(records[g].net_id)
+                        + "_a" + std::to_string(ga)
+                        + "_b" + std::to_string(gb)
+                );
+                group_edge_vars[g].push_back(std::move(edge_var));
+            }
+        }
+        for (std::size_t ga = 0; ga < group_pad_sets_by_net[g].size(); ++ga) {
+            for (std::size_t gb = ga + 1; gb < group_pad_sets_by_net[g].size(); ++gb) {
+                const std::size_t shared_pad_count =
+                    sharedPadCount(group_pad_sets_by_net[g][ga], group_pad_sets_by_net[g][gb]);
+                if (shared_pad_count < 2) {
+                    continue;
+                }
+                GRBLinExpr conflict_expr = 0.0;
+                for (int candidate_index : candidate_groups_by_net[g][ga]) {
+                    conflict_expr += path_choice[g][static_cast<std::size_t>(candidate_index)];
+                }
+                for (int candidate_index : candidate_groups_by_net[g][gb]) {
+                    conflict_expr += path_choice[g][static_cast<std::size_t>(candidate_index)];
+                }
+                model.addConstr(
+                    conflict_expr <= 1.0,
+                    "GroupConflict_net" + std::to_string(records[g].net_id)
+                        + "_a" + std::to_string(ga)
+                        + "_b" + std::to_string(gb)
+                );
+            }
+        }
     }
 
     for (std::size_t g = 0; g < terminal_groups_by_net.size(); ++g) {
         for (std::size_t gi = 0; gi < terminal_groups_by_net[g].size(); ++gi) {
             GRBLinExpr group_expr = 0.0;
-            const auto& group_vertices = terminal_groups_by_net[g][gi];
-            std::unordered_set<PackedVertexId> group_vertex_set;
-            group_vertex_set.reserve(group_vertices.size() * 2 + 1);
-            for (const auto& vertex : group_vertices) {
-                group_vertex_set.insert(vertex);
-            }
-            for (std::size_t p = 0; p < records[g].candidates.size(); ++p) {
-                const auto& candidate = records[g].candidates[p];
-                bool hit_group = false;
-                for (const auto& occupied : candidate.cover_vertices) {
-                    if (group_vertex_set.find(occupied) != group_vertex_set.end()) {
-                        hit_group = true;
-                        break;
-                    }
-                }
-                if (hit_group) {
+            for (std::size_t p = 0; p < candidate_hit_terminal_groups_by_net[g].size(); ++p) {
+                const auto& hit_groups = candidate_hit_terminal_groups_by_net[g][p];
+                if (std::find(hit_groups.begin(), hit_groups.end(), static_cast<int>(gi)) != hit_groups.end()) {
                     group_expr += path_choice[g][p];
                 }
             }
-            model.addConstr(
-                group_expr == 1.0,
-                "TerminalGroup_net" + std::to_string(records[g].net_id) + "_g" + std::to_string(gi)
-            );
+            if (multi_group_net[g]) {
+                model.addConstr(
+                    group_expr >= 1.0,
+                    "TerminalGroup_net" + std::to_string(records[g].net_id) + "_g" + std::to_string(gi)
+                );
+            } else {
+                model.addConstr(
+                    group_expr == 1.0,
+                    "TerminalGroup_net" + std::to_string(records[g].net_id) + "_g" + std::to_string(gi)
+                );
+            }
         }
     }
 
@@ -527,6 +841,8 @@ SelectionResult solveWithGurobi(const SelectionRequest& request, const std::vect
         }
     }
     model.setObjective(obj, GRB_MINIMIZE);
+    GroupConnectivityLazyCallback connectivity_callback(multi_group_net, group_choice, group_edge_vars);
+    model.setCallback(&connectivity_callback);
     model.optimize();
 
     const int status = model.get(GRB_IntAttr_Status);
@@ -545,7 +861,7 @@ SelectionResult solveWithGurobi(const SelectionRequest& request, const std::vect
         return fail;
     }
 
-    std::vector<int> chosen(records.size(), -1);
+    std::vector<std::vector<int>> chosen(records.size());
     for (std::size_t g = 0; g < records.size(); ++g) {
         double best_x = -1.0;
         int best_p = -1;
@@ -556,12 +872,11 @@ SelectionResult solveWithGurobi(const SelectionRequest& request, const std::vect
                 best_p = static_cast<int>(p);
             }
             if (x > 0.5) {
-                best_p = static_cast<int>(p);
-                break;
+                chosen[g].push_back(records[g].candidates[p].candidate_index);
             }
         }
-        if (best_p >= 0 && best_p < static_cast<int>(records[g].candidates.size())) {
-            chosen[g] = records[g].candidates[static_cast<std::size_t>(best_p)].candidate_index;
+        if (chosen[g].empty() && best_p >= 0 && best_p < static_cast<int>(records[g].candidates.size())) {
+            chosen[g].push_back(records[g].candidates[static_cast<std::size_t>(best_p)].candidate_index);
         }
     }
 
