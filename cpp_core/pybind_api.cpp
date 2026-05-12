@@ -49,6 +49,70 @@ PYBIND11_MODULE(router_core, m) {
         .def_readwrite("diameter", &ViaGeometry::diameter)
         .def_readwrite("net_id", &ViaGeometry::net_id);
 
+    py::class_<RasterSegment>(m, "RasterSegment")
+        .def(py::init<>())
+        .def_readwrite("start", &RasterSegment::start)
+        .def_readwrite("end", &RasterSegment::end)
+        .def_readwrite("radius_mm", &RasterSegment::radius_mm)
+        .def_readwrite("z", &RasterSegment::z);
+
+    py::class_<RasterVia>(m, "RasterVia")
+        .def(py::init<>())
+        .def_readwrite("center", &RasterVia::center)
+        .def_readwrite("radius_mm", &RasterVia::radius_mm)
+        .def_readwrite("z_start", &RasterVia::z_start)
+        .def_readwrite("z_end", &RasterVia::z_end);
+
+    py::class_<RasterPad>(m, "RasterPad")
+        .def(py::init<>())
+        .def_readwrite("center", &RasterPad::center)
+        .def_readwrite("size_x", &RasterPad::size_x)
+        .def_readwrite("size_y", &RasterPad::size_y)
+        .def_readwrite("rotation_degrees", &RasterPad::rotation_degrees)
+        .def_readwrite("shape", &RasterPad::shape)
+        .def_readwrite("candidate_layers", &RasterPad::candidate_layers);
+
+    py::class_<RasterGraphNode>(m, "RasterGraphNode")
+        .def(py::init<>())
+        .def_readwrite("id", &RasterGraphNode::id)
+        .def_readwrite("vertex", &RasterGraphNode::vertex);
+
+    py::class_<RasterGraphEdge>(m, "RasterGraphEdge")
+        .def(py::init<>())
+        .def_readwrite("from_id", &RasterGraphEdge::from_id)
+        .def_readwrite("to_id", &RasterGraphEdge::to_id);
+
+    py::class_<RasterRequest>(m, "RasterRequest")
+        .def(py::init<>())
+        .def_readwrite("grid_pitch", &RasterRequest::grid_pitch)
+        .def_readwrite("origin_x", &RasterRequest::origin_x)
+        .def_readwrite("origin_y", &RasterRequest::origin_y)
+        .def_readwrite("nx", &RasterRequest::nx)
+        .def_readwrite("ny", &RasterRequest::ny)
+        .def_readwrite("nz", &RasterRequest::nz)
+        .def_readwrite("segments", &RasterRequest::segments)
+        .def_readwrite("vias", &RasterRequest::vias)
+        .def_readwrite("pads", &RasterRequest::pads)
+        .def_readwrite("pad_clearance", &RasterRequest::pad_clearance)
+        .def_readwrite("anchor_vertices", &RasterRequest::anchor_vertices)
+        .def_readwrite("explicit_graph_nodes", &RasterRequest::explicit_graph_nodes)
+        .def_readwrite("explicit_graph_edges", &RasterRequest::explicit_graph_edges);
+
+    py::class_<RasterResult>(m, "RasterResult")
+        .def(py::init<>())
+        .def_readonly("occupied_vertices", &RasterResult::occupied_vertices)
+        .def_readonly("boundary_vertices", &RasterResult::boundary_vertices)
+        .def_readonly("pad_boundary_groups", &RasterResult::pad_boundary_groups);
+
+    py::class_<PadCoverageResult>(m, "PadCoverageResult")
+        .def(py::init<>())
+        .def_readonly("has_graph", &PadCoverageResult::has_graph)
+        .def_readonly("graph_vertex_count", &PadCoverageResult::graph_vertex_count)
+        .def_readonly("graph_edge_count", &PadCoverageResult::graph_edge_count)
+        .def_readonly("total_pads", &PadCoverageResult::total_pads)
+        .def_readonly("unmatched_pads", &PadCoverageResult::unmatched_pads)
+        .def_readonly("matched_components", &PadCoverageResult::matched_components);
+
     py::class_<RouteRequest>(m, "RouteRequest")
         .def(py::init<>())
         .def_readwrite("tracks", &RouteRequest::tracks)
@@ -119,4 +183,7 @@ PYBIND11_MODULE(router_core, m) {
 
     m.def("run_dijkstra_test", &runDijkstraTest, py::arg("request"));
     m.def("select_candidate_paths", &selectCandidatePaths, py::arg("request"));
+    m.def("rasterize_selector_geometry", &rasterizeSelectorGeometry, py::arg("request"));
+    m.def("build_pad_boundary_groups", &buildPadBoundaryGroups, py::arg("request"));
+    m.def("analyze_pad_coverage", &analyzePadCoverage, py::arg("request"));
 }

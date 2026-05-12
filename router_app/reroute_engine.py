@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import os
@@ -36,6 +36,7 @@ def select_reroute_candidates(
     max_paths_per_net: int = 1,
     prefer_gurobi: bool = True,
 ) -> SelectionResult:
+    selector_started_at = perf_counter()
     if not outcome.result or not isinstance(outcome.result, list):
         return SelectionResult(
             ok=False,
@@ -58,6 +59,7 @@ def select_reroute_candidates(
     request.prefer_gurobi = prefer_gurobi
     request.allow_fallback = True
 
+    load_started_at = perf_counter()
     exported_boundary_by_net = _load_exported_boundary_vertices(outcome.candidate_export_path)
     selector_board = _load_selector_board(outcome.candidate_export_path)
     max_ripped_clearance = _max_ripped_clearance(
@@ -65,8 +67,15 @@ def select_reroute_candidates(
         [int(getattr(result, "net_id", 0)) for result in outcome.result],
     ) if selector_board is not None else 0.0
     freerouting_occurrences_by_net = _load_freerouting_occurrences_by_net(selector_board)
+    load_elapsed = perf_counter() - load_started_at
+
+    candidate_prep_total = 0.0
+    external_append_total = 0.0
+    boundary_payload_total = 0.0
+    terminal_normalize_total = 0.0
     nets = []
     for result in outcome.result:
+        net_started_at = perf_counter()
         item = router_core.NetCandidateSet()
         item.net_id = int(getattr(result, "net_id", 0))
         candidate_paths_grid: list[list[Any]]
@@ -86,7 +95,16 @@ def select_reroute_candidates(
         boundary_payload = list(exported_boundary_by_net.get(item.net_id, []))
         candidate_preview_items: list[Any] = []
         external_summary = {"original": 0, "final": 0, "freerouting": 0, "vertices": 0}
+        precomputed_pad_groups: list[list[Any]] | None = None
         if selector_board is not None:
+            precomputed_pad_groups = _cpp_pad_boundary_groups_for_net(
+                router_core,
+                selector_board,
+                result,
+                item.net_id,
+            )
+        if selector_board is not None:
+            append_started_at = perf_counter()
             _append_external_candidates_for_selector(
                 router_core=router_core,
                 board=selector_board,
@@ -102,6 +120,9 @@ def select_reroute_candidates(
                 candidate_preview_items=candidate_preview_items,
                 summary=external_summary,
             )
+            append_elapsed = perf_counter() - append_started_at
+        else:
+            append_elapsed = 0.0
         item.candidate_paths_grid = candidate_paths_grid
         item.candidate_paths_mm = candidate_paths_mm
         item.candidate_via_counts = candidate_via_counts
@@ -116,6 +137,7 @@ def select_reroute_candidates(
             setattr(result, "candidate_preview_items", candidate_preview_items)
         except Exception:
             pass
+        boundary_started_at = perf_counter()
         (
             item.candidate_boundary_vertices,
             item.candidate_terminal_coords,
@@ -127,12 +149,21 @@ def select_reroute_candidates(
             item.net_id,
             candidate_paths_grid,
             boundary_payload,
+            precomputed_pad_groups=precomputed_pad_groups,
         )
+        boundary_elapsed = perf_counter() - boundary_started_at
+        normalize_started_at = perf_counter()
         item.candidate_terminal_groups = _normalize_terminal_groups_for_net(
             router_core,
             item.candidate_terminal_groups,
             item.candidate_terminal_coords,
         )
+        normalize_elapsed = perf_counter() - normalize_started_at
+        net_elapsed = perf_counter() - net_started_at
+        candidate_prep_total += net_elapsed
+        external_append_total += append_elapsed
+        boundary_payload_total += boundary_elapsed
+        terminal_normalize_total += normalize_elapsed
         print(
             "selector_external_candidates "
             f"net={item.net_id} "
@@ -142,10 +173,21 @@ def select_reroute_candidates(
             f"boundary_vertices={external_summary['vertices']}",
             flush=True,
         )
+        print(
+            "selector_timing_net "
+            f"net={item.net_id} "
+            f"append_sec={append_elapsed:.3f} "
+            f"boundary_sec={boundary_elapsed:.3f} "
+            f"normalize_sec={normalize_elapsed:.3f} "
+            f"total_sec={net_elapsed:.3f}",
+            flush=True,
+        )
         nets.append(item)
     request.nets = nets
 
+    gurobi_started_at = perf_counter()
     cpp_result = router_core.select_candidate_paths(request)
+    gurobi_elapsed = perf_counter() - gurobi_started_at
     selections = [
         PyNetSelection(
             net_id=int(selection.net_id),
@@ -185,6 +227,18 @@ def select_reroute_candidates(
             f"via_count={via_text}",
             flush=True,
         )
+    total_elapsed = perf_counter() - selector_started_at
+    print(
+        "selector_timing_summary "
+        f"load_sec={load_elapsed:.3f} "
+        f"candidate_prep_sec={candidate_prep_total:.3f} "
+        f"append_sec={external_append_total:.3f} "
+        f"boundary_sec={boundary_payload_total:.3f} "
+        f"normalize_sec={terminal_normalize_total:.3f} "
+        f"gurobi_sec={gurobi_elapsed:.3f} "
+        f"total_sec={total_elapsed:.3f}",
+        flush=True,
+    )
     return SelectionResult(
         ok=bool(cpp_result.ok),
         selections=selections,
@@ -284,6 +338,7 @@ def _selector_boundary_payload_from_export(
     net_id: int,
     candidate_paths_grid: list[list[Any]],
     boundary_payload: list[list[dict[str, Any]]],
+    precomputed_pad_groups: list[list[Any]] | None = None,
 ) -> tuple[list[list[Any]], list[list[Any]], list[list[list[Any]]]]:
     boundary_vertices: list[list[Any]] = []
     terminal_coords: list[list[Any]] = []
@@ -346,12 +401,19 @@ def _selector_boundary_payload_from_export(
             def _group_from_pad(pad: Any | None, anchor: tuple[int, int, int]) -> list[Any]:
                 if pad is None:
                     return [router_core.GridPoint(anchor[0], anchor[1], anchor[2])]
-                key = _pad_cache_key(pad)
-                cached = pad_boundary_cache.get(key)
-                if cached is None:
-                    cached = sorted(_pad_boundary_vertices_for_selector(board, result, pad))
-                    pad_boundary_cache[key] = cached
-                group = [router_core.GridPoint(x, y, z) for (x, y, z) in cached]
+                pad_index = net_pads.index(pad) if pad in net_pads else -1
+                if precomputed_pad_groups is not None and 0 <= pad_index < len(precomputed_pad_groups):
+                    group = [
+                        router_core.GridPoint(int(getattr(point, "x", 0)), int(getattr(point, "y", 0)), int(getattr(point, "z", 0)))
+                        for point in precomputed_pad_groups[pad_index]
+                    ]
+                else:
+                    key = _pad_cache_key(pad)
+                    cached = pad_boundary_cache.get(key)
+                    if cached is None:
+                        cached = sorted(_pad_boundary_vertices_for_selector(board, result, pad))
+                        pad_boundary_cache[key] = cached
+                    group = [router_core.GridPoint(x, y, z) for (x, y, z) in cached]
                 if anchor not in {(v.x, v.y, v.z) for v in group}:
                     group.append(router_core.GridPoint(anchor[0], anchor[1], anchor[2]))
                 return group
@@ -411,6 +473,17 @@ def _append_external_candidates_for_selector(
     candidate_preview_items: list[Any],
     summary: dict[str, int],
 ) -> None:
+    # Break append time into smaller buckets so we can pinpoint the remaining hotspot.
+    # This separates primitive collection, graph building, C++ raster work,
+    # pad-coverage checks, and the final selector candidate insertion step.
+    collect_total = 0.0
+    raster_total = 0.0
+    graph_total = 0.0
+    pad_reason_total = 0.0
+    candidate_append_total = 0.0
+    occurrence_total = 0.0
+    occurrence_count = 0
+
     existing_keys: set[tuple[tuple[int, int, int], ...]] = set()
     for raw_vertices in boundary_payload:
         key = _boundary_payload_key(raw_vertices)
@@ -428,29 +501,37 @@ def _append_external_candidates_for_selector(
         final_net_id = 0
 
     if final_board is not None and final_net_id > 0:
+        collect_started_at = perf_counter()
         final_segments, final_vias = _collect_original_route_primitives(
             board=final_board,
             result=result,
             net_id=final_net_id,
             max_ripped_clearance=max_ripped_clearance,
         )
-        final_raw = _build_boundary_payload_from_primitives(
-            board=final_board,
-            result=result,
-            net_id=final_net_id,
-            start_anchor=start_anchor,
-            goal_anchor=goal_anchor,
-            segments=final_segments,
-            vias=final_vias,
+        collect_total += perf_counter() - collect_started_at
+        raster_started_at = perf_counter()
+        final_raw, final_cover_vertices = _cpp_rasterize_candidate_geometry(
+            router_core,
+            final_board,
+            result,
+            final_net_id,
+            start_anchor,
+            goal_anchor,
+            final_segments,
+            final_vias,
         )
-        final_pad_reason = _external_candidate_pad_coverage_reason(
+        raster_total += perf_counter() - raster_started_at
+        pad_reason_started_at = perf_counter()
+        final_pad_reason = _cpp_external_candidate_pad_coverage_reason(
             board=board,
+            router_core=router_core,
             result=result,
             net_id=net_id,
             segments=final_segments,
             vias=final_vias,
             explicit_graph=None,
         )
+        pad_reason_total += perf_counter() - pad_reason_started_at
         if final_pad_reason is not None:
             print(
                 f"selector_external_rejected_missing_pads net={net_id} source=final reason={final_pad_reason}",
@@ -467,61 +548,74 @@ def _append_external_candidates_for_selector(
                 reason=final_pad_reason,
             ):
                 print(line, flush=True)
-        elif _append_external_payload_candidate(
-            router_core=router_core,
-            board=board,
-            result=result,
-            start_anchor=start_anchor,
-            goal_anchor=goal_anchor,
-            raw_vertices=final_raw,
-            candidate_paths_grid=candidate_paths_grid,
-            candidate_paths_mm=candidate_paths_mm,
-            candidate_via_counts=candidate_via_counts,
-            candidate_cover_vertices=candidate_cover_vertices,
-            boundary_payload=boundary_payload,
-            candidate_preview_items=candidate_preview_items,
-            existing_keys=existing_keys,
-            segments=final_segments,
-            vias=final_vias,
-            preview_item=_candidate_preview_item(
-                net_id,
-                final_segments,
-                final_vias,
-                0,
-                "final",
-            ),
-        ):
-            summary["final"] += 1
-            summary["vertices"] += len(final_raw)
         else:
-            print(
-                f"selector_external_missing_boundary net={net_id} source=final",
-                flush=True,
+            candidate_append_started_at = perf_counter()
+            appended = _append_external_payload_candidate(
+                router_core=router_core,
+                board=board,
+                result=result,
+                start_anchor=start_anchor,
+                goal_anchor=goal_anchor,
+                raw_vertices=final_raw,
+                candidate_paths_grid=candidate_paths_grid,
+                candidate_paths_mm=candidate_paths_mm,
+                candidate_via_counts=candidate_via_counts,
+                candidate_cover_vertices=candidate_cover_vertices,
+                boundary_payload=boundary_payload,
+                candidate_preview_items=candidate_preview_items,
+                existing_keys=existing_keys,
+                segments=final_segments,
+                vias=final_vias,
+                cover_vertices_points=final_cover_vertices,
+                preview_item=_candidate_preview_item(
+                    net_id,
+                    final_segments,
+                    final_vias,
+                    0,
+                    "final",
+                ),
             )
+            candidate_append_total += perf_counter() - candidate_append_started_at
+            if appended:
+                summary["final"] += 1
+                summary["vertices"] += len(final_raw)
+            else:
+                print(
+                    f"selector_external_missing_boundary net={net_id} source=final",
+                    flush=True,
+                )
 
+    collect_started_at = perf_counter()
     original_segments, original_vias = _collect_original_route_primitives(
         board=board,
         result=result,
         net_id=net_id,
         max_ripped_clearance=max_ripped_clearance,
     )
-    original_raw = _build_boundary_payload_from_primitives(
-        board=board,
-        result=result,
-        net_id=net_id,
-        start_anchor=start_anchor,
-        goal_anchor=goal_anchor,
-        segments=original_segments,
-        vias=original_vias,
+    collect_total += perf_counter() - collect_started_at
+    raster_started_at = perf_counter()
+    original_raw, original_cover_vertices = _cpp_rasterize_candidate_geometry(
+        router_core,
+        board,
+        result,
+        net_id,
+        start_anchor,
+        goal_anchor,
+        original_segments,
+        original_vias,
     )
-    original_pad_reason = _external_candidate_pad_coverage_reason(
+    raster_total += perf_counter() - raster_started_at
+    pad_reason_started_at = perf_counter()
+    original_pad_reason = _cpp_external_candidate_pad_coverage_reason(
         board=board,
+        router_core=router_core,
         result=result,
         net_id=net_id,
         segments=original_segments,
         vias=original_vias,
         explicit_graph=None,
     )
+    pad_reason_total += perf_counter() - pad_reason_started_at
     if original_pad_reason is not None:
         print(
             f"selector_external_rejected_missing_pads net={net_id} source=original reason={original_pad_reason}",
@@ -535,71 +629,89 @@ def _append_external_candidates_for_selector(
             vias=original_vias,
             explicit_graph=None,
             source_label="original",
-            reason=original_pad_reason,
-        ):
-            print(line, flush=True)
-    elif _append_external_payload_candidate(
-        router_core=router_core,
-        board=board,
-        result=result,
-        start_anchor=start_anchor,
-        goal_anchor=goal_anchor,
-        raw_vertices=original_raw,
-        candidate_paths_grid=candidate_paths_grid,
-        candidate_paths_mm=candidate_paths_mm,
-        candidate_via_counts=candidate_via_counts,
-        candidate_cover_vertices=candidate_cover_vertices,
-        boundary_payload=boundary_payload,
-        candidate_preview_items=candidate_preview_items,
-        existing_keys=existing_keys,
-        segments=original_segments,
-        vias=original_vias,
-        preview_item=_candidate_preview_item(
-            net_id,
-            original_segments,
-            original_vias,
-            0,
-            "original",
-        ),
-    ):
-        summary["original"] += 1
-        summary["vertices"] += len(original_raw)
+                reason=original_pad_reason,
+            ):
+                print(line, flush=True)
     else:
-        print(
-            f"selector_external_missing_boundary net={net_id} source=original",
-            flush=True,
+        candidate_append_started_at = perf_counter()
+        appended = _append_external_payload_candidate(
+            router_core=router_core,
+            board=board,
+            result=result,
+            start_anchor=start_anchor,
+            goal_anchor=goal_anchor,
+            raw_vertices=original_raw,
+            candidate_paths_grid=candidate_paths_grid,
+            candidate_paths_mm=candidate_paths_mm,
+            candidate_via_counts=candidate_via_counts,
+            candidate_cover_vertices=candidate_cover_vertices,
+            boundary_payload=boundary_payload,
+            candidate_preview_items=candidate_preview_items,
+            existing_keys=existing_keys,
+            segments=original_segments,
+            vias=original_vias,
+            cover_vertices_points=original_cover_vertices,
+            preview_item=_candidate_preview_item(
+                net_id,
+                original_segments,
+                original_vias,
+                0,
+                "original",
+            ),
         )
+        candidate_append_total += perf_counter() - candidate_append_started_at
+        if appended:
+            summary["original"] += 1
+            summary["vertices"] += len(original_raw)
+        else:
+            print(
+                f"selector_external_missing_boundary net={net_id} source=original",
+                flush=True,
+            )
 
     for occurrence in freerouting_occurrences:
+        occurrence_started_at = perf_counter()
+        occurrence_count += 1
         occurrence_index = int(occurrence.get("event_index", 0))
+        collect_started_at = perf_counter()
         occ_segments, occ_vias = _collect_freerouting_occurrence_primitives(
             board=board,
             result=result,
             max_ripped_clearance=max_ripped_clearance,
             occurrence=occurrence,
         )
+        collect_total += perf_counter() - collect_started_at
+        graph_started_at = perf_counter()
         occ_graph = _collect_freerouting_occurrence_graph(
             board=board,
             result=result,
             occurrence=occurrence,
         )
-        occ_raw = _build_boundary_payload_from_primitives(
-            board=board,
-            result=result,
-            net_id=net_id,
-            start_anchor=start_anchor,
-            goal_anchor=goal_anchor,
-            segments=occ_segments,
-            vias=occ_vias,
+        graph_total += perf_counter() - graph_started_at
+        raster_started_at = perf_counter()
+        occ_raw, occ_cover_vertices = _cpp_rasterize_candidate_geometry(
+            router_core,
+            board,
+            result,
+            net_id,
+            start_anchor,
+            goal_anchor,
+            occ_segments,
+            occ_vias,
+            occ_graph,
         )
-        occ_pad_reason = _external_candidate_pad_coverage_reason(
+        raster_total += perf_counter() - raster_started_at
+        pad_reason_started_at = perf_counter()
+        occ_pad_reason = _cpp_external_candidate_pad_coverage_reason(
             board=board,
+            router_core=router_core,
             result=result,
             net_id=net_id,
             segments=occ_segments,
             vias=occ_vias,
             explicit_graph=occ_graph,
         )
+        pad_reason_total += perf_counter() - pad_reason_started_at
         if occ_pad_reason is not None:
             print(
                 "selector_external_rejected_missing_pads "
@@ -614,41 +726,60 @@ def _append_external_candidates_for_selector(
                 vias=occ_vias,
                 explicit_graph=occ_graph,
                 source_label=f"freerouting occurrence_index={occurrence_index}",
-                reason=occ_pad_reason,
-            ):
-                print(line, flush=True)
-        elif _append_external_payload_candidate(
-            router_core=router_core,
-            board=board,
-            result=result,
-            start_anchor=start_anchor,
-            goal_anchor=goal_anchor,
-            raw_vertices=occ_raw,
-            candidate_paths_grid=candidate_paths_grid,
-            candidate_paths_mm=candidate_paths_mm,
-            candidate_via_counts=candidate_via_counts,
-            candidate_cover_vertices=candidate_cover_vertices,
-            boundary_payload=boundary_payload,
-            candidate_preview_items=candidate_preview_items,
-            existing_keys=existing_keys,
-            segments=occ_segments,
-            vias=occ_vias,
-            explicit_graph=occ_graph,
-            preview_item=_candidate_preview_item(
-                net_id,
-                occ_segments,
-                occ_vias,
-                occurrence_index,
-                "freerouting",
-            ),
-        ):
-            summary["freerouting"] += 1
-            summary["vertices"] += len(occ_raw)
+                    reason=occ_pad_reason,
+                ):
+                    print(line, flush=True)
         else:
-            print(
-                f"selector_external_missing_boundary net={net_id} source=freerouting occurrence_index={occurrence_index}",
-                flush=True,
+            candidate_append_started_at = perf_counter()
+            appended = _append_external_payload_candidate(
+                router_core=router_core,
+                board=board,
+                result=result,
+                start_anchor=start_anchor,
+                goal_anchor=goal_anchor,
+                raw_vertices=occ_raw,
+                candidate_paths_grid=candidate_paths_grid,
+                candidate_paths_mm=candidate_paths_mm,
+                candidate_via_counts=candidate_via_counts,
+                candidate_cover_vertices=candidate_cover_vertices,
+                boundary_payload=boundary_payload,
+                candidate_preview_items=candidate_preview_items,
+                existing_keys=existing_keys,
+                segments=occ_segments,
+                vias=occ_vias,
+                explicit_graph=occ_graph,
+                cover_vertices_points=occ_cover_vertices,
+                preview_item=_candidate_preview_item(
+                    net_id,
+                    occ_segments,
+                    occ_vias,
+                    occurrence_index,
+                    "freerouting",
+                ),
             )
+            candidate_append_total += perf_counter() - candidate_append_started_at
+            if appended:
+                summary["freerouting"] += 1
+                summary["vertices"] += len(occ_raw)
+            else:
+                print(
+                    f"selector_external_missing_boundary net={net_id} source=freerouting occurrence_index={occurrence_index}",
+                    flush=True,
+                )
+        occurrence_total += perf_counter() - occurrence_started_at
+
+    print(
+        "selector_timing_append_breakdown "
+        f"net={net_id} "
+        f"collect_sec={collect_total:.3f} "
+        f"graph_sec={graph_total:.3f} "
+        f"raster_sec={raster_total:.3f} "
+        f"pad_reason_sec={pad_reason_total:.3f} "
+        f"candidate_append_sec={candidate_append_total:.3f} "
+        f"occurrence_count={occurrence_count} "
+        f"occurrence_total_sec={occurrence_total:.3f}",
+        flush=True,
+    )
 
 
 def _append_external_payload_candidate(
@@ -668,6 +799,7 @@ def _append_external_payload_candidate(
     segments: list[dict[str, Any]] | None = None,
     vias: list[dict[str, Any]] | None = None,
     explicit_graph: dict[str, Any] | None = None,
+    cover_vertices_points: list[Any] | None = None,
     preview_item: Any | None = None,
 ) -> bool:
     graph = _build_external_grid_graph(
@@ -684,11 +816,14 @@ def _append_external_payload_candidate(
     existing_keys.add(key)
     boundary_payload.append(raw_vertices)
     candidate_via_counts.append(len(vias or []))
-    cover_vertices = _primitive_occupied_vertices(result, segments or [], vias or [])
-    candidate_cover_vertices.append([
-        router_core.GridPoint(x, y, z)
-        for (x, y, z) in sorted(cover_vertices)
-    ])
+    if cover_vertices_points is not None:
+        candidate_cover_vertices.append(list(cover_vertices_points))
+    else:
+        cover_vertices = _primitive_occupied_vertices(result, segments or [], vias or [])
+        candidate_cover_vertices.append([
+            router_core.GridPoint(x, y, z)
+            for (x, y, z) in sorted(cover_vertices)
+        ])
     candidate_preview_items.append(
         preview_item
         if preview_item is not None
@@ -963,6 +1098,231 @@ def _build_boundary_payload_from_primitives(
         clearance=_clearance_for_net(board, net_id),
     )
     return _serialize_boundary_vertices_with_anchors(board, filtered, start_anchor, goal_anchor)
+
+
+def _cpp_raster_request(
+    router_core: Any,
+    board: BoardData,
+    result: Any,
+    segments: list[dict[str, Any]],
+    vias: list[dict[str, Any]],
+    pads: list[Any],
+    pad_clearance: float,
+    anchor_vertices: list[tuple[int, int, int]],
+    explicit_graph: dict[str, Any] | None = None,
+) -> Any:
+    request = router_core.RasterRequest()
+    request.grid_pitch = float(getattr(result, "grid_pitch", 0.0))
+    request.origin_x = float(getattr(result, "origin_x", 0.0))
+    request.origin_y = float(getattr(result, "origin_y", 0.0))
+    request.nx = int(getattr(result, "nx", 0))
+    request.ny = int(getattr(result, "ny", 0))
+    request.nz = int(getattr(result, "nz", 0))
+    request.pad_clearance = float(pad_clearance)
+    request.anchor_vertices = [
+        router_core.GridPoint(int(x), int(y), int(z))
+        for (x, y, z) in anchor_vertices
+    ]
+
+    raster_segments: list[Any] = []
+    for segment in segments:
+        item = router_core.RasterSegment()
+        start = segment.get("start", (0.0, 0.0))
+        end = segment.get("end", (0.0, 0.0))
+        item.start = router_core.Point2D(float(start[0]), float(start[1]))
+        item.end = router_core.Point2D(float(end[0]), float(end[1]))
+        item.radius_mm = float(segment.get("radius_mm", 0.0))
+        item.z = int(segment.get("z", 0))
+        raster_segments.append(item)
+    request.segments = raster_segments
+
+    raster_vias: list[Any] = []
+    for via in vias:
+        item = router_core.RasterVia()
+        center = via.get("center", (0.0, 0.0))
+        item.center = router_core.Point2D(float(center[0]), float(center[1]))
+        item.radius_mm = float(via.get("radius_mm", 0.0))
+        item.z_start = int(via.get("z_start", 0))
+        item.z_end = int(via.get("z_end", 0))
+        raster_vias.append(item)
+    request.vias = raster_vias
+
+    raster_pads: list[Any] = []
+    for pad in pads:
+        item = router_core.RasterPad()
+        item.center = router_core.Point2D(float(pad.center[0]), float(pad.center[1]))
+        item.size_x = float(pad.size[0])
+        item.size_y = float(pad.size[1])
+        item.rotation_degrees = float(getattr(pad, "rotation_degrees", 0.0))
+        item.shape = str(getattr(pad, "shape", ""))
+        item.candidate_layers = [
+            z
+            for z, layer_name in enumerate(board.copper_layers)
+            if "*.Cu" in pad.layers or layer_name in pad.layers
+        ]
+        raster_pads.append(item)
+    request.pads = raster_pads
+
+    if explicit_graph:
+        request.explicit_graph_nodes = []
+        for node in explicit_graph.get("nodes", []):
+            if not isinstance(node, dict):
+                continue
+            vertex = node.get("vertex")
+            if not isinstance(vertex, (tuple, list)) or len(vertex) != 3:
+                continue
+            item = router_core.RasterGraphNode()
+            item.id = int(node.get("id", 0))
+            item.vertex = router_core.GridPoint(int(vertex[0]), int(vertex[1]), int(vertex[2]))
+            request.explicit_graph_nodes.append(item)
+
+        request.explicit_graph_edges = []
+        for edge in explicit_graph.get("edges", []):
+            if not isinstance(edge, dict):
+                continue
+            item = router_core.RasterGraphEdge()
+            item.from_id = int(edge.get("from", 0))
+            item.to_id = int(edge.get("to", 0))
+            request.explicit_graph_edges.append(item)
+    return request
+
+
+def _cpp_rasterize_candidate_geometry(
+    router_core: Any,
+    board: BoardData,
+    result: Any,
+    net_id: int,
+    start_anchor: tuple[int, int, int] | None,
+    goal_anchor: tuple[int, int, int] | None,
+    segments: list[dict[str, Any]],
+    vias: list[dict[str, Any]],
+    explicit_graph: dict[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], list[Any]]:
+    try:
+        pads = _all_net_pads(board, net_id)
+        anchors = [
+            anchor for anchor in (start_anchor, goal_anchor)
+            if anchor is not None
+        ]
+        request = _cpp_raster_request(
+            router_core,
+            board,
+            result,
+            segments,
+            vias,
+            pads,
+            _clearance_for_net(board, net_id),
+            anchors,
+            explicit_graph,
+        )
+        raster = router_core.rasterize_selector_geometry(request)
+        boundary_set = {
+            (int(point.x), int(point.y), int(point.z))
+            for point in getattr(raster, "boundary_vertices", [])
+        }
+        raw_vertices = _serialize_boundary_vertices_with_anchors(board, boundary_set, start_anchor, goal_anchor)
+        cover_vertices = [
+            router_core.GridPoint(int(point.x), int(point.y), int(point.z))
+            for point in getattr(raster, "occupied_vertices", [])
+        ]
+        return raw_vertices, cover_vertices
+    except Exception:
+        raw_vertices = _build_boundary_payload_from_primitives(
+            board=board,
+            result=result,
+            net_id=net_id,
+            start_anchor=start_anchor,
+            goal_anchor=goal_anchor,
+            segments=segments,
+            vias=vias,
+        )
+        cover_vertices = [
+            router_core.GridPoint(x, y, z)
+            for (x, y, z) in sorted(_primitive_occupied_vertices(result, segments, vias))
+        ]
+        return raw_vertices, cover_vertices
+
+
+def _cpp_external_candidate_pad_coverage_reason(
+    router_core: Any,
+    board: BoardData,
+    result: Any,
+    net_id: int,
+    segments: list[dict[str, Any]],
+    vias: list[dict[str, Any]],
+    explicit_graph: dict[str, Any] | None,
+) -> str | None:
+    try:
+        pads = _all_net_pads(board, net_id)
+        request = _cpp_raster_request(
+            router_core,
+            board,
+            result,
+            segments,
+            vias,
+            pads,
+            0.0,
+            [],
+            explicit_graph,
+        )
+        analysis = router_core.analyze_pad_coverage(request)
+        if not bool(getattr(analysis, "has_graph", False)):
+            return "empty_graph"
+        total_pads = int(getattr(analysis, "total_pads", 0))
+        if total_pads <= 0:
+            return None
+        unmatched_pads = int(getattr(analysis, "unmatched_pads", 0))
+        if unmatched_pads > 0:
+            return f"unmatched_pads={unmatched_pads}/{total_pads}"
+        unique_components = sorted(set(int(value) for value in getattr(analysis, "matched_components", [])))
+        if len(unique_components) > 1:
+            return f"pad_components={unique_components}"
+        return None
+    except Exception:
+        return _external_candidate_pad_coverage_reason(
+            board=board,
+            result=result,
+            net_id=net_id,
+            segments=segments,
+            vias=vias,
+            explicit_graph=explicit_graph,
+        )
+
+
+def _cpp_pad_boundary_groups_for_net(
+    router_core: Any,
+    board: BoardData,
+    result: Any,
+    net_id: int,
+) -> list[list[Any]]:
+    try:
+        pads = _all_net_pads(board, net_id)
+        if not pads:
+            return []
+        request = _cpp_raster_request(
+            router_core,
+            board,
+            result,
+            [],
+            [],
+            pads,
+            0.0,
+            [],
+        )
+        groups = router_core.build_pad_boundary_groups(request)
+        return [
+            [
+                router_core.GridPoint(int(point.x), int(point.y), int(point.z))
+                for point in group
+            ]
+            for group in groups
+        ]
+    except Exception:
+        groups: list[list[Any]] = []
+        for pad in _all_net_pads(board, net_id):
+            vertices = sorted(_pad_boundary_vertices_for_selector(board, result, pad))
+            groups.append([router_core.GridPoint(x, y, z) for (x, y, z) in vertices])
+        return groups
 
 
 def _build_external_centerline_grid_path(

@@ -1,12 +1,14 @@
-#include "router.h"
+﻿#include "router.h"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <iostream>
 #include <limits>
 #include <map>
 #include <numeric>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -21,9 +23,9 @@ namespace interactive_router {
 namespace {
 
 struct VertexKey {
-    int x = 0;
-    int y = 0;
-    int z = 0;
+    std::int32_t x = 0;
+    std::int32_t y = 0;
+    std::int32_t z = 0;
 
     bool operator==(const VertexKey& other) const {
         return x == other.x && y == other.y && z == other.z;
@@ -40,23 +42,27 @@ struct VertexKey {
     }
 };
 
-struct VertexKeyHash {
-    std::size_t operator()(const VertexKey& key) const {
-        std::size_t hx = static_cast<std::size_t>(key.x) * 73856093u;
-        std::size_t hy = static_cast<std::size_t>(key.y) * 19349663u;
-        std::size_t hz = static_cast<std::size_t>(key.z) * 83492791u;
-        return hx ^ hy ^ hz;
-    }
-};
+using PackedVertexId = std::uint64_t;
+
+// Keep coordinate arithmetic signed to avoid x-1 / y-1 underflow at grid boundaries.
+// Large vertex collections are stored as packed ids to reduce memory and hashing overhead.
+constexpr std::uint64_t kPackedXBits = 28;
+constexpr std::uint64_t kPackedYBits = 28;
+constexpr std::uint64_t kPackedZBits = 8;
+constexpr std::uint64_t kPackedYShift = kPackedXBits;
+constexpr std::uint64_t kPackedZShift = kPackedXBits + kPackedYBits;
+constexpr std::uint64_t kPackedXMask = (1ULL << kPackedXBits) - 1ULL;
+constexpr std::uint64_t kPackedYMask = (1ULL << kPackedYBits) - 1ULL;
+constexpr std::uint64_t kPackedZMask = (1ULL << kPackedZBits) - 1ULL;
 
 struct CandidateRecord {
     int candidate_index = -1;
     int via_count = 0;
     double length_mm = 0.0;
-    std::vector<VertexKey> occupied_vertices;
-    std::vector<VertexKey> cover_vertices;
-    std::vector<VertexKey> terminal_coords;
-    std::vector<std::vector<VertexKey>> terminal_groups;
+    std::vector<PackedVertexId> occupied_vertices;
+    std::vector<PackedVertexId> cover_vertices;
+    std::vector<PackedVertexId> terminal_coords;
+    std::vector<std::vector<PackedVertexId>> terminal_groups;
 };
 
 struct NetRecord {
@@ -66,7 +72,33 @@ struct NetRecord {
 };
 
 VertexKey toVertex(const GridPoint& point) {
-    return VertexKey{point.x, point.y, point.z};
+    return VertexKey{
+        static_cast<std::int32_t>(point.x),
+        static_cast<std::int32_t>(point.y),
+        static_cast<std::int32_t>(point.z),
+    };
+}
+
+PackedVertexId packVertex(const VertexKey& vertex) {
+    if (vertex.x < 0 || vertex.y < 0 || vertex.z < 0) {
+        throw std::overflow_error("Negative grid coordinate cannot be packed into unsigned vertex id.");
+    }
+    if (static_cast<std::uint64_t>(vertex.x) > kPackedXMask ||
+        static_cast<std::uint64_t>(vertex.y) > kPackedYMask ||
+        static_cast<std::uint64_t>(vertex.z) > kPackedZMask) {
+        throw std::overflow_error("Grid coordinate exceeds packed vertex id bit budget.");
+    }
+    return (static_cast<std::uint64_t>(vertex.z) << kPackedZShift) |
+           (static_cast<std::uint64_t>(vertex.y) << kPackedYShift) |
+           static_cast<std::uint64_t>(vertex.x);
+}
+
+VertexKey unpackVertex(PackedVertexId packed) {
+    return VertexKey{
+        static_cast<std::int32_t>(packed & kPackedXMask),
+        static_cast<std::int32_t>((packed >> kPackedYShift) & kPackedYMask),
+        static_cast<std::int32_t>((packed >> kPackedZShift) & kPackedZMask),
+    };
 }
 
 double pathLengthMm(const std::vector<Point2D>& path) {
@@ -107,13 +139,13 @@ int countPathVias(const std::vector<GridPoint>& path) {
     return via_count;
 }
 
-std::vector<VertexKey> uniqueVerticesFromGridPoints(const std::vector<GridPoint>& points) {
-    std::vector<VertexKey> vertices;
+std::vector<PackedVertexId> uniqueVerticesFromGridPoints(const std::vector<GridPoint>& points) {
+    std::vector<PackedVertexId> vertices;
     vertices.reserve(points.size());
-    std::unordered_set<VertexKey, VertexKeyHash> seen;
+    std::unordered_set<PackedVertexId> seen;
     seen.reserve(points.size() * 2 + 1);
     for (const auto& point : points) {
-        VertexKey key = toVertex(point);
+        PackedVertexId key = packVertex(toVertex(point));
         if (seen.insert(key).second) {
             vertices.push_back(key);
         }
@@ -218,8 +250,8 @@ std::vector<NetRecord> buildNetRecords(const SelectionRequest& request, bool* tr
                 candidate.terminal_coords = uniqueVerticesFromGridPoints(net.candidate_terminal_coords[candidate_idx]);
             } else if (!path_grid.empty()) {
                 candidate.terminal_coords = {
-                    toVertex(path_grid.front()),
-                    toVertex(path_grid.back()),
+                    packVertex(toVertex(path_grid.front())),
+                    packVertex(toVertex(path_grid.back())),
                 };
             }
 
@@ -325,10 +357,10 @@ SelectionResult solveWithGurobi(const SelectionRequest& request, const std::vect
         }
     }
 
-    std::set<VertexKey> terminal_vertices;
-    std::vector<std::vector<std::vector<VertexKey>>> terminal_groups_by_net(records.size());
-    std::map<VertexKey, GRBLinExpr> v_exprs;
-    std::map<VertexKey, std::set<int>> v_groups;
+    std::set<PackedVertexId> terminal_vertices;
+    std::vector<std::vector<std::vector<PackedVertexId>>> terminal_groups_by_net(records.size());
+    std::map<PackedVertexId, GRBLinExpr> v_exprs;
+    std::map<PackedVertexId, std::set<int>> v_groups;
     std::size_t total_candidate_count = 0;
 
     for (std::size_t g = 0; g < records.size(); ++g) {
@@ -339,7 +371,7 @@ SelectionResult solveWithGurobi(const SelectionRequest& request, const std::vect
                 max_group_count = std::max(max_group_count, candidate.terminal_groups.size());
             }
 
-            std::vector<std::unordered_set<VertexKey, VertexKeyHash>> union_groups(max_group_count);
+            std::vector<std::unordered_set<PackedVertexId>> union_groups(max_group_count);
             for (const auto& candidate : records[g].candidates) {
                 for (std::size_t gi = 0; gi < candidate.terminal_groups.size(); ++gi) {
                     for (const auto& vertex : candidate.terminal_groups[gi]) {
@@ -354,7 +386,7 @@ SelectionResult solveWithGurobi(const SelectionRequest& request, const std::vect
                 if (group_set.empty()) {
                     continue;
                 }
-                std::vector<VertexKey> group_vertices;
+                std::vector<PackedVertexId> group_vertices;
                 group_vertices.reserve(group_set.size());
                 for (const auto& vertex : group_set) {
                     group_vertices.push_back(vertex);
@@ -378,7 +410,7 @@ SelectionResult solveWithGurobi(const SelectionRequest& request, const std::vect
         total_terminal_group_rows += terminal_groups_by_net[g].size();
         for (std::size_t gi = 0; gi < terminal_groups_by_net[g].size(); ++gi) {
             const auto& group_vertices = terminal_groups_by_net[g][gi];
-            std::unordered_set<VertexKey, VertexKeyHash> group_vertex_set;
+            std::unordered_set<PackedVertexId> group_vertex_set;
             group_vertex_set.reserve(group_vertices.size() * 2 + 1);
             for (const auto& vertex : group_vertices) {
                 group_vertex_set.insert(vertex);
@@ -404,7 +436,7 @@ SelectionResult solveWithGurobi(const SelectionRequest& request, const std::vect
     std::size_t total_capacity_rows = 0;
     std::size_t total_capacity_nonzeros = 0;
     for (const auto& entry : v_groups) {
-        const VertexKey& vertex = entry.first;
+        const PackedVertexId& vertex = entry.first;
         const bool is_terminal_vertex = terminal_vertices.find(vertex) != terminal_vertices.end();
         if (is_terminal_vertex) {
             continue;
@@ -446,7 +478,7 @@ SelectionResult solveWithGurobi(const SelectionRequest& request, const std::vect
         for (std::size_t gi = 0; gi < terminal_groups_by_net[g].size(); ++gi) {
             GRBLinExpr group_expr = 0.0;
             const auto& group_vertices = terminal_groups_by_net[g][gi];
-            std::unordered_set<VertexKey, VertexKeyHash> group_vertex_set;
+            std::unordered_set<PackedVertexId> group_vertex_set;
             group_vertex_set.reserve(group_vertices.size() * 2 + 1);
             for (const auto& vertex : group_vertices) {
                 group_vertex_set.insert(vertex);
@@ -472,7 +504,7 @@ SelectionResult solveWithGurobi(const SelectionRequest& request, const std::vect
     }
 
     for (const auto& entry : v_exprs) {
-        const VertexKey& vertex = entry.first;
+        const PackedVertexId& vertex = entry.first;
         const GRBLinExpr& expr = entry.second;
         const bool is_terminal_vertex = terminal_vertices.find(vertex) != terminal_vertices.end();
         if (is_terminal_vertex) {
@@ -480,9 +512,10 @@ SelectionResult solveWithGurobi(const SelectionRequest& request, const std::vect
         }
         auto it = v_groups.find(vertex);
         if (it != v_groups.end() && it->second.size() > 1) {
+            const VertexKey unpacked = unpackVertex(vertex);
             model.addConstr(
                 expr <= 1.0,
-                "Capacity_x" + std::to_string(vertex.x) + "_y" + std::to_string(vertex.y) + "_z" + std::to_string(vertex.z)
+                "Capacity_x" + std::to_string(unpacked.x) + "_y" + std::to_string(unpacked.y) + "_z" + std::to_string(unpacked.z)
             );
         }
     }

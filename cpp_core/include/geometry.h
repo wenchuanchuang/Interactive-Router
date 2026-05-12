@@ -47,6 +47,70 @@ struct ViaGeometry {
     int net_id = 0;
 };
 
+struct RasterSegment {
+    Point2D start;
+    Point2D end;
+    double radius_mm = 0.0;
+    int z = 0;
+};
+
+struct RasterVia {
+    Point2D center;
+    double radius_mm = 0.0;
+    int z_start = 0;
+    int z_end = 0;
+};
+
+struct RasterPad {
+    Point2D center;
+    double size_x = 0.0;
+    double size_y = 0.0;
+    double rotation_degrees = 0.0;
+    std::string shape;
+    std::vector<int> candidate_layers;
+};
+
+struct RasterGraphNode {
+    int id = 0;
+    GridPoint vertex;
+};
+
+struct RasterGraphEdge {
+    int from_id = 0;
+    int to_id = 0;
+};
+
+struct RasterRequest {
+    double grid_pitch = 0.0;
+    double origin_x = 0.0;
+    double origin_y = 0.0;
+    int nx = 0;
+    int ny = 0;
+    int nz = 0;
+    std::vector<RasterSegment> segments;
+    std::vector<RasterVia> vias;
+    std::vector<RasterPad> pads;
+    double pad_clearance = 0.0;
+    std::vector<GridPoint> anchor_vertices;
+    std::vector<RasterGraphNode> explicit_graph_nodes;
+    std::vector<RasterGraphEdge> explicit_graph_edges;
+};
+
+struct RasterResult {
+    std::vector<GridPoint> occupied_vertices;
+    std::vector<GridPoint> boundary_vertices;
+    std::vector<std::vector<GridPoint>> pad_boundary_groups;
+};
+
+struct PadCoverageResult {
+    bool has_graph = false;
+    int graph_vertex_count = 0;
+    int graph_edge_count = 0;
+    int total_pads = 0;
+    int unmatched_pads = 0;
+    std::vector<int> matched_components;
+};
+
 struct RouteRequest {
     std::vector<TrackGeometry> tracks;
     std::vector<PadGeometry> pads;

@@ -1,4 +1,4 @@
-#include "net_analysis.h"
+﻿#include "net_analysis.h"
 
 #include <algorithm>
 #include <cmath>
@@ -96,7 +96,7 @@ int originalRouteSegmentCount(const RouteRequest& request, int net_id) {
 
     for (const auto& [junction_key, incident_indices] : incident_tracks_by_point) {
         (void) junction_key;
-        //某個接點剛好只接兩條 track
+        //?暺?憟賢?亙璇?track
         if (incident_indices.size() != 2) {
             continue;
         }
@@ -109,11 +109,11 @@ int originalRouteSegmentCount(const RouteRequest& request, int net_id) {
         Point2D junction = samePhysicalPoint(first.start, second.start) || samePhysicalPoint(first.start, second.end)
             ? first.start
             : first.end;
-        //在這個接點是直通、不是轉彎
+        //?券暺?湧??航?敶?
         if (!isStraightThroughAtJunction(first, second, junction)) {
             continue;
         }
-        //把原本兩條 track 視為同一個幾何 segment，所以 count 減 1
+        //???砍璇?track 閬???嗾雿?segment嚗?隞?count 皜?1
         --count;
     }
 
@@ -130,7 +130,7 @@ bool layerMatchesPad(const PadGeometry& pad, const std::string& layer) {
         || std::find(pad.layers.begin(), pad.layers.end(), "*.Cu") != pad.layers.end();
 }
 
-//某個實體座標 point，有沒有落在 pad 幾何範圍裡
+// Check whether a physical point falls inside the pad geometry.
 bool pointInsidePad(const PadGeometry& pad, const Point2D& point, double bloat) {
     constexpr double kPi = 3.14159265358979323846;
     double dx = point.x - pad.center.x;
@@ -162,11 +162,11 @@ bool pointInsidePad(const PadGeometry& pad, const Point2D& point, double bloat) 
         && std::abs(local_y) <= pad.size_y * 0.5 + bloat;
 }
 
-//如果這顆起點 pad 有多層 center 可以當起點，那應該選哪一層當 start center
-// 如果起點 pad 有多層 center
-// 只取 一個 center_vertex當起點
-// 優先選「原本這個 net 的 track endpoint 落在 pad 裡的那一層」
-// 如果原本繞線不存在或判斷不出來，就退回 最上層可用 layer 的 center
+//憒???韏琿? pad ??撅?center ?臭誑?嗉絲暺????閰脤?芯?撅斤 start center
+// 憒?韏琿? pad ??撅?center
+// ?芸? 銝??center_vertex?嗉絲暺?
+// ?芸??詻??祇?net ??track endpoint ?賢 pad 鋆∠????撅扎?
+// 憒??蝜?銝??冽??斗銝靘?撠梢???銝惜?舐 layer ??center
 int preferredPadStartLayer(
     const RouteRequest& request,
     const PadGeometry& pad,
@@ -177,13 +177,13 @@ int preferredPadStartLayer(
         if (track.net_id != net_id) {
             continue;
         }
-        //檢查這條 track 的 layer 是不是 pad 支援的 layer
+        //瑼Ｘ?? track ??layer ?臭???pad ?舀??layer
         if (!layerMatchesPad(pad, track.layer)) {
             continue;
         }
-        //檢查這條 track 的 start/end 有沒有落在 pad 裡
+        //瑼Ｘ?? track ??start/end ?????pad 鋆?
         if (pointInsidePad(pad, track.start) || pointInsidePad(pad, track.end)) {
-            // 原本這顆 pad 的連線是在這個 layer 上接入/接出的
+            // ??? pad ????臬??layer 銝???亙??
             int z = grid.layerIndex(track.layer);
             if (z >= 0) {
                 return z;
@@ -191,7 +191,7 @@ int preferredPadStartLayer(
         }
     }
 
-    //如果整個 net 都找不到 track endpoint 落在 pad 裡, 取 pad 的最上層可用 layer
+    //憒??游?net ?賣銝 track endpoint ?賢 pad 鋆? ??pad ??銝惜?舐 layer
     for (int z = 0; z < grid.nz(); ++z) {
         if (layerMatchesPad(pad, grid.layers()[z])) {
             return z;

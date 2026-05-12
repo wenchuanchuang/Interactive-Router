@@ -20,4 +20,8 @@ std::vector<GridPoint> collectTerminalVertices(
     double clearance
 );
 
+RasterResult rasterizeSelectorGeometry(const RasterRequest& request);
+std::vector<std::vector<GridPoint>> buildPadBoundaryGroups(const RasterRequest& request);
+PadCoverageResult analyzePadCoverage(const RasterRequest& request);
+
 }  // namespace interactive_router
