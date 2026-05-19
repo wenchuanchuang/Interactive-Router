@@ -114,6 +114,37 @@ struct PadCoverageResult {
     std::vector<int> matched_components;
 };
 
+struct RasterAnalysisPairRequest {
+    RasterRequest raster_request;
+    RasterRequest coverage_request;
+};
+
+struct RasterAnalysisResult {
+    RasterResult raster;
+    PadCoverageResult coverage;
+    bool cache_hit = false;
+    int cache_source_index = -1;
+};
+
+struct RasterCandidateGeometry {
+    std::vector<RasterSegment> segments;
+    std::vector<RasterVia> vias;
+    std::vector<RasterGraphNode> explicit_graph_nodes;
+    std::vector<RasterGraphEdge> explicit_graph_edges;
+    std::vector<int> graph_node_ids;
+    std::vector<int> graph_node_x;
+    std::vector<int> graph_node_y;
+    std::vector<int> graph_node_z;
+    std::vector<int> graph_edge_from;
+    std::vector<int> graph_edge_to;
+};
+
+struct RasterCandidateBatchRequest {
+    RasterRequest raster_base;
+    RasterRequest coverage_base;
+    std::vector<RasterCandidateGeometry> candidates;
+};
+
 struct RouteRequest {
     std::vector<TrackGeometry> tracks;
     std::vector<PadGeometry> pads;

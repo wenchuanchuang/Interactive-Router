@@ -1,0 +1,72 @@
+{
+  "profile": {
+    "id": "b53e464f-9207-4f46-a274-87a45acad687",
+    "email": "",
+    "allow_telemetry": true,
+    "allow_contact": true
+  },
+  "gui": {
+    "enabled": true,
+    "input_directory": "",
+    "dialog_confirmation_timeout": 5
+  },
+  "router": {
+    "algorithm": "freerouting-router",
+    "job_timeout": "12:00:00",
+    "max_passes": 9999,
+    "stop_at_pass_minimum": 20,
+    "stagnation_pass_limit": 80,
+    "stagnation_score_threshold": 0.05,
+    "optimizer": {},
+    "scoring": {
+      "default_preferred_direction_trace_cost": 1.0,
+      "default_undesired_direction_trace_cost": 1.01,
+      "via_costs": 8,
+      "start_ripup_costs": 10
+    }
+  },
+  "drc": {
+    "include_warnings": true,
+    "include_errors": true
+  },
+  "usage_and_diagnostic_data": {
+    "disable_analytics": false
+  },
+  "feature_flags": {
+    "multi_threading": true,
+    "inspection_mode": false,
+    "other_menu": false,
+    "save_jobs": false
+  },
+  "api_server": {
+    "enabled": false,
+    "http_allowed": true,
+    "endpoints": [
+      "http://127.0.0.1:37864"
+    ],
+    "authentication": {
+      "enabled": true,
+      "providers": "",
+      "google_sheets": {}
+    },
+    "cors_origins": ""
+  },
+  "statistics": {
+    "start_time": "2026-05-13 08:58:14",
+    "sessions_total": 0,
+    "jobs_started": 0,
+    "jobs_completed": 0
+  },
+  "logging": {
+    "console": {
+      "enabled": true,
+      "level": "INFO"
+    },
+    "file": {
+      "enabled": false,
+      "level": "INFO",
+      "location": "D:\\lab_code\\Interactive-Router\\.freerouting-home\\freerouting.log"
+    }
+  },
+  "version": "2.2.2"
+}

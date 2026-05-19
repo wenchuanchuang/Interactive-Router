@@ -177,6 +177,45 @@ std::vector<PackedVertexId> uniqueVerticesFromGridPoints(const std::vector<GridP
     return vertices;
 }
 
+void appendPackedVertices(std::string& key, std::vector<PackedVertexId> vertices) {
+    std::sort(vertices.begin(), vertices.end());
+    vertices.erase(std::unique(vertices.begin(), vertices.end()), vertices.end());
+    key += "[";
+    for (PackedVertexId vertex : vertices) {
+        key += std::to_string(vertex);
+        key += ",";
+    }
+    key += "]";
+}
+
+std::string candidateRecordGeometryKey(const CandidateRecord& candidate) {
+    // Deduplicate candidates only when their selector-visible geometry and
+    // terminal coverage are identical. This catches duplicate stable/aggressive
+    // final routes without merging genuinely different alternatives.
+    std::string key;
+    key.reserve(
+        (candidate.occupied_vertices.size() + candidate.cover_vertices.size() +
+         candidate.terminal_coords.size()) * 24
+    );
+    key += "occ=";
+    appendPackedVertices(key, candidate.occupied_vertices);
+    key += "cov=";
+    appendPackedVertices(key, candidate.cover_vertices);
+    key += "term=";
+    appendPackedVertices(key, candidate.terminal_coords);
+    key += "groups=";
+    std::vector<std::vector<PackedVertexId>> groups = candidate.terminal_groups;
+    for (auto& group : groups) {
+        std::sort(group.begin(), group.end());
+        group.erase(std::unique(group.begin(), group.end()), group.end());
+    }
+    std::sort(groups.begin(), groups.end());
+    for (const auto& group : groups) {
+        appendPackedVertices(key, group);
+    }
+    return key;
+}
+
 SelectionResult fallbackShortestSelection(const SelectionRequest& request, const std::string& reason) {
     SelectionResult result;
     result.ok = true;
@@ -317,9 +356,21 @@ std::vector<NetRecord> buildNetRecords(const SelectionRequest& request, bool* tr
             return a.candidate_index < b.candidate_index;
         });
 
+        std::vector<CandidateRecord> deduped_candidates;
+        deduped_candidates.reserve(candidates.size());
+        std::unordered_set<std::string> seen_candidate_geometry;
+        seen_candidate_geometry.reserve(candidates.size() * 2 + 1);
+        for (auto& candidate : candidates) {
+            const std::string key = candidateRecordGeometryKey(candidate);
+            if (!seen_candidate_geometry.insert(key).second) {
+                continue;
+            }
+            deduped_candidates.push_back(std::move(candidate));
+        }
+
         (void)truncated_candidates;
 
-        record.candidates = std::move(candidates);
+        record.candidates = std::move(deduped_candidates);
         records.push_back(std::move(record));
     }
 

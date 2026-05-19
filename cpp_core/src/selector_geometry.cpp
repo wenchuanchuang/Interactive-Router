@@ -4,9 +4,13 @@
 #include <cmath>
 #include <cstdint>
 #include <deque>
+#include <iomanip>
 #include <map>
+#include <sstream>
 #include <set>
 #include <stdexcept>
+#include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -367,6 +371,73 @@ PackedGraph buildRasterGraph(const RasterRequest& request) {
     return graph;
 }
 
+void appendPointKey(std::ostringstream& out, const Point2D& point) {
+    out << point.x << "," << point.y << ";";
+}
+
+void appendGridPointKey(std::ostringstream& out, const GridPoint& point) {
+    out << point.x << "," << point.y << "," << point.z << ";";
+}
+
+void appendRasterRequestKey(std::ostringstream& out, const RasterRequest& request) {
+    // This key is intentionally exact for selector-visible request fields.
+    // It only reuses batch work when the raster and coverage inputs match bit-for-bit
+    // after Python has converted them into C++ request objects.
+    out << std::setprecision(17);
+    out << "grid:"
+        << request.grid_pitch << ","
+        << request.origin_x << ","
+        << request.origin_y << ","
+        << request.nx << ","
+        << request.ny << ","
+        << request.nz << ";";
+    out << "pad_clearance:" << request.pad_clearance << ";";
+    out << "anchors:";
+    for (const auto& anchor : request.anchor_vertices) {
+        appendGridPointKey(out, anchor);
+    }
+    out << "segments:";
+    for (const auto& segment : request.segments) {
+        appendPointKey(out, segment.start);
+        appendPointKey(out, segment.end);
+        out << segment.radius_mm << "," << segment.z << ";";
+    }
+    out << "vias:";
+    for (const auto& via : request.vias) {
+        appendPointKey(out, via.center);
+        out << via.radius_mm << "," << via.z_start << "," << via.z_end << ";";
+    }
+    out << "pads:";
+    for (const auto& pad : request.pads) {
+        appendPointKey(out, pad.center);
+        out << pad.size_x << "," << pad.size_y << ","
+            << pad.rotation_degrees << "," << pad.shape << ":";
+        for (int layer : pad.candidate_layers) {
+            out << layer << ",";
+        }
+        out << ";";
+    }
+    out << "graph_nodes:";
+    for (const auto& node : request.explicit_graph_nodes) {
+        out << node.id << ":";
+        appendGridPointKey(out, node.vertex);
+    }
+    out << "graph_edges:";
+    for (const auto& edge : request.explicit_graph_edges) {
+        out << edge.from_id << "," << edge.to_id << ";";
+    }
+}
+
+std::string rasterAnalysisPairKey(const RasterAnalysisPairRequest& request) {
+    std::ostringstream out;
+    out << "raster{";
+    appendRasterRequestKey(out, request.raster_request);
+    out << "}coverage{";
+    appendRasterRequestKey(out, request.coverage_request);
+    out << "}";
+    return out.str();
+}
+
 }  // namespace
 
 RasterResult rasterizeSelectorGeometry(const RasterRequest& request) {
@@ -434,6 +505,96 @@ RasterResult rasterizeSelectorGeometry(const RasterRequest& request) {
     result.boundary_vertices = sortedGridPoints(filtered);
     result.pad_boundary_groups = buildPadGroupsInternal(request);
     return result;
+}
+
+std::vector<RasterAnalysisResult> analyzeSelectorGeometryBatch(
+    const std::vector<RasterAnalysisPairRequest>& requests
+) {
+    std::vector<RasterAnalysisResult> results;
+    results.reserve(requests.size());
+
+    for (std::size_t index = 0; index < requests.size(); ++index) {
+        RasterAnalysisResult result;
+        result.raster = rasterizeSelectorGeometry(requests[index].raster_request);
+        result.coverage = analyzePadCoverage(requests[index].coverage_request);
+        result.cache_hit = false;
+        result.cache_source_index = static_cast<int>(index);
+        results.push_back(std::move(result));
+    }
+
+    return results;
+}
+
+std::vector<RasterGraphNode> graphNodesFromCandidate(const RasterCandidateGeometry& candidate) {
+    if (!candidate.explicit_graph_nodes.empty()) {
+        return candidate.explicit_graph_nodes;
+    }
+    const std::size_t count = std::min({
+        candidate.graph_node_ids.size(),
+        candidate.graph_node_x.size(),
+        candidate.graph_node_y.size(),
+        candidate.graph_node_z.size(),
+    });
+    std::vector<RasterGraphNode> nodes;
+    nodes.reserve(count);
+    for (std::size_t index = 0; index < count; ++index) {
+        RasterGraphNode node;
+        node.id = candidate.graph_node_ids[index];
+        node.vertex = GridPoint(
+            candidate.graph_node_x[index],
+            candidate.graph_node_y[index],
+            candidate.graph_node_z[index]
+        );
+        nodes.push_back(node);
+    }
+    return nodes;
+}
+
+std::vector<RasterGraphEdge> graphEdgesFromCandidate(const RasterCandidateGeometry& candidate) {
+    if (!candidate.explicit_graph_edges.empty()) {
+        return candidate.explicit_graph_edges;
+    }
+    const std::size_t count = std::min(candidate.graph_edge_from.size(), candidate.graph_edge_to.size());
+    std::vector<RasterGraphEdge> edges;
+    edges.reserve(count);
+    for (std::size_t index = 0; index < count; ++index) {
+        RasterGraphEdge edge;
+        edge.from_id = candidate.graph_edge_from[index];
+        edge.to_id = candidate.graph_edge_to[index];
+        edges.push_back(edge);
+    }
+    return edges;
+}
+
+std::vector<RasterAnalysisResult> analyzeSelectorGeometryCandidateBatch(
+    const RasterCandidateBatchRequest& request
+) {
+    std::vector<RasterAnalysisResult> results;
+    results.reserve(request.candidates.size());
+
+    for (std::size_t index = 0; index < request.candidates.size(); ++index) {
+        const auto& candidate = request.candidates[index];
+        RasterRequest raster_request = request.raster_base;
+        raster_request.segments = candidate.segments;
+        raster_request.vias = candidate.vias;
+        raster_request.explicit_graph_nodes = graphNodesFromCandidate(candidate);
+        raster_request.explicit_graph_edges = graphEdgesFromCandidate(candidate);
+
+        RasterRequest coverage_request = request.coverage_base;
+        coverage_request.segments = candidate.segments;
+        coverage_request.vias = candidate.vias;
+        coverage_request.explicit_graph_nodes = raster_request.explicit_graph_nodes;
+        coverage_request.explicit_graph_edges = raster_request.explicit_graph_edges;
+
+        RasterAnalysisResult result;
+        result.raster = rasterizeSelectorGeometry(raster_request);
+        result.coverage = analyzePadCoverage(coverage_request);
+        result.cache_hit = false;
+        result.cache_source_index = static_cast<int>(index);
+        results.push_back(std::move(result));
+    }
+
+    return results;
 }
 
 std::vector<std::vector<GridPoint>> buildPadBoundaryGroups(const RasterRequest& request) {

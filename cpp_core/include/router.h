@@ -23,5 +23,11 @@ std::vector<GridPoint> collectTerminalVertices(
 RasterResult rasterizeSelectorGeometry(const RasterRequest& request);
 std::vector<std::vector<GridPoint>> buildPadBoundaryGroups(const RasterRequest& request);
 PadCoverageResult analyzePadCoverage(const RasterRequest& request);
+std::vector<RasterAnalysisResult> analyzeSelectorGeometryBatch(
+    const std::vector<RasterAnalysisPairRequest>& requests
+);
+std::vector<RasterAnalysisResult> analyzeSelectorGeometryCandidateBatch(
+    const RasterCandidateBatchRequest& request
+);
 
 }  // namespace interactive_router

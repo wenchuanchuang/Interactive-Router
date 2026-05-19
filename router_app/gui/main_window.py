@@ -267,6 +267,42 @@ class MainWindow(QMainWindow):
             + "  # 估計繞失敗 net（有2個以上pad但沒有任何track/via）",
             flush=True,
         )
+        if result.still_unconnected:
+            print(
+                "freerouting_unconnected_status = still_unconnected"
+                + (
+                    f" ({result.unconnected_item_count} connection(s))"
+                    if result.unconnected_item_count is not None
+                    else ""
+                ),
+                flush=True,
+            )
+            if result.unconnected_report:
+                print(result.unconnected_report, flush=True)
+        else:
+            print("freerouting_unconnected_status = fully_connected", flush=True)
+        if result.attempted_profiles:
+            print(
+                "freerouting_profiles_attempted = " + ", ".join(result.attempted_profiles),
+                flush=True,
+            )
+        for profile_report in result.profile_reports:
+            profile = profile_report.get("profile", "(unknown)")
+            if profile_report.get("still_unconnected"):
+                count = profile_report.get("unconnected_item_count")
+                suffix = f" ({count})" if count is not None else ""
+                status = f"still_unconnected{suffix}"
+            else:
+                status = "fully_connected"
+            print(f"freerouting_profile_result {profile} = {status}", flush=True)
+        print(
+            f"freerouting_profile_selected = {result.selected_profile}",
+            flush=True,
+        )
+        if result.stdout_log_path is not None:
+            print(f"freerouting_stdout_log = {result.stdout_log_path}", flush=True)
+        if result.stderr_log_path is not None:
+            print(f"freerouting_stderr_log = {result.stderr_log_path}", flush=True)
 
     def _show_trace(self, track: TrackSegment) -> None:
         if self._board is not None:
@@ -478,6 +514,8 @@ class MainWindow(QMainWindow):
             ripped_net_ids,
             self.trace_panel.grid_steps_per_mm,
             final_board=self._board,
+            final_boards=list(self._freerouting_run.candidate_routed_boards),
+            freerouting_payload_paths=list(self._freerouting_run.candidate_ripup_payload_paths),
         )
         if outcome.result:
             self._candidate_outcome = RerouteOutcome(
