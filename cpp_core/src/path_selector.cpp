@@ -538,7 +538,7 @@ SelectionResult solveWithGurobi(const SelectionRequest& request, const std::vect
     GRBModel model = GRBModel(env);
 
     model.set(GRB_IntParam_Threads, 20);
-    model.set(GRB_DoubleParam_MIPGap, 0.1);
+    model.set(GRB_DoubleParam_MIPGap, 0.01);
     model.set(GRB_IntParam_LazyConstraints, 1);
 
     std::vector<std::vector<GRBVar>> path_choice;

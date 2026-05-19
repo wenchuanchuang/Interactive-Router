@@ -617,9 +617,13 @@ def _load_ripup_previews(payload_path: Path) -> list[FreeroutingRipupPreview]:
                     source_net_id = int(source_net_id) if source_net_id is not None else None
                 except Exception:
                     source_net_id = None
+                # Freerouting component exports can be stored under the net that
+                # triggered the ripup, while the component itself belongs to
+                # source_net_id. Use the component owner for selector membership.
+                effective_net_id = source_net_id if source_net_id is not None and source_net_id > 0 else net_id
                 previews.append(
                     FreeroutingRipupPreview(
-                        net_id=net_id,
+                        net_id=effective_net_id,
                         net_name=net_name,
                         segments=segments,
                         vias=vias,

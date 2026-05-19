@@ -15,14 +15,14 @@
     "job_timeout": "12:00:00",
     "max_passes": 9999,
     "stop_at_pass_minimum": 20,
-    "stagnation_pass_limit": 40,
-    "stagnation_score_threshold": 0.1,
+    "stagnation_pass_limit": 80,
+    "stagnation_score_threshold": 0.05,
     "optimizer": {},
     "scoring": {
       "default_preferred_direction_trace_cost": 1.0,
-      "default_undesired_direction_trace_cost": 1.05,
-      "via_costs": 20,
-      "start_ripup_costs": 20
+      "default_undesired_direction_trace_cost": 1.01,
+      "via_costs": 8,
+      "start_ripup_costs": 10
     }
   },
   "drc": {

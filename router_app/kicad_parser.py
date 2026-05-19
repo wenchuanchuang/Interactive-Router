@@ -47,6 +47,8 @@ class Via:
     diameter: float
     net_id: int
     net_name: str
+    start_layer: str = "F.Cu"
+    end_layer: str = "B.Cu"
 
 
 @dataclass(frozen=True)
@@ -59,21 +61,34 @@ class BoardData:
     backend: str = "sexpr"
     design_rules: dict[str, float] | None = None
     net_clearances: dict[int, float] | None = None
+    declared_copper_layers: tuple[str, ...] = tuple()
+    layer_aliases: dict[str, str] | None = None
 
     @property
     def copper_layers(self) -> list[str]:
-        layers = {track.layer for track in self.tracks}
+        # Prefer the board-declared copper stack. Inferring layers from only
+        # existing tracks/pads loses custom legacy names such as Route2/Route15.
+        layers = list(self.declared_copper_layers)
+        seen = set(layers)
+        for track in self.tracks:
+            if track.layer not in seen:
+                layers.append(track.layer)
+                seen.add(track.layer)
         if not layers:
             for footprint in self.footprints:
-                if footprint.layer.endswith(".Cu"):
-                    layers.add(footprint.layer)
+                if footprint.layer.endswith(".Cu") and footprint.layer not in seen:
+                    layers.append(footprint.layer)
+                    seen.add(footprint.layer)
                 for pad in footprint.pads:
-                    layers.update(
-                        layer
-                        for layer in pad.layers
-                        if layer in {"F.Cu", "B.Cu"} or layer.startswith("In")
-                    )
-        return sorted(layers, key=_layer_sort_key)
+                    for layer in pad.layers:
+                        if (
+                            layer in {"F.Cu", "B.Cu"}
+                            or layer.startswith("In")
+                            or layer.startswith("Route")
+                        ) and layer not in seen:
+                            layers.append(layer)
+                            seen.add(layer)
+        return layers if self.declared_copper_layers else sorted(layers, key=_layer_sort_key)
 
     @property
     def two_pin_net_ids(self) -> set[int]:
@@ -95,6 +110,7 @@ def load_board(path: str | Path) -> BoardData:
 def _load_board_with_pcbnew(path: str | Path) -> BoardData:
     pcbnew = _import_pcbnew()
     board_path = Path(path)
+    declared_layers, layer_aliases = _declared_copper_layers_from_file(board_path)
     load_path = _normalized_legacy_board_path(board_path) if _needs_normalized_pcbnew_load(board_path) else board_path
     try:
         board = pcbnew.LoadBoard(str(load_path))
@@ -120,6 +136,8 @@ def _load_board_with_pcbnew(path: str | Path) -> BoardData:
         backend="pcbnew-normalized" if load_path != board_path else "pcbnew",
         design_rules=_pcbnew_design_rules(board, pcbnew),
         net_clearances=_pcbnew_net_clearances(board, pcbnew),
+        declared_copper_layers=declared_layers,
+        layer_aliases=layer_aliases,
     )
 
 
@@ -127,6 +145,7 @@ def _load_board_with_sexpr(path: str | Path) -> BoardData:
     board_path = Path(path)
     text = board_path.read_text(encoding="utf-8")
     sexpr = _parse_sexpr(text)
+    declared_layers, layer_aliases = _declared_copper_layers_from_sexpr(sexpr)
     nets: dict[int, str] = {}
     tracks: list[TrackSegment] = []
     vias: list[Via] = []
@@ -160,7 +179,77 @@ def _load_board_with_sexpr(path: str | Path) -> BoardData:
         if footprint is not None:
             footprints.append(footprint)
 
-    return BoardData(path=board_path, nets=nets, tracks=tracks, footprints=footprints, vias=vias, backend="sexpr")
+    return BoardData(
+        path=board_path,
+        nets=nets,
+        tracks=tracks,
+        footprints=footprints,
+        vias=vias,
+        backend="sexpr",
+        declared_copper_layers=declared_layers,
+        layer_aliases=layer_aliases,
+    )
+
+
+def _declared_copper_layers_from_file(path: Path) -> tuple[tuple[str, ...], dict[str, str]]:
+    """Read the board layer table so custom copper layer names are preserved."""
+    try:
+        return _declared_copper_layers_from_text(path.read_text(encoding="utf-8", errors="ignore"))
+    except Exception:
+        return tuple(), {}
+
+
+def _declared_copper_layers_from_text(text: str) -> tuple[tuple[str, ...], dict[str, str]]:
+    """Parse declared copper layers from KiCad S-expressions."""
+    try:
+        return _declared_copper_layers_from_sexpr(_parse_sexpr(text))
+    except Exception:
+        return tuple(), {}
+
+
+def _declared_copper_layers_from_sexpr(sexpr: list[Any]) -> tuple[tuple[str, ...], dict[str, str]]:
+    """Return display copper layer names plus aliases from physical KiCad names."""
+    layers: list[str] = []
+    aliases: dict[str, str] = {}
+    seen: set[str] = set()
+    for layers_node in _top_level_nodes(sexpr, "layers"):
+        for layer_node in layers_node[1:]:
+            if not isinstance(layer_node, list) or len(layer_node) < 3:
+                continue
+            if str(layer_node[2]) != "signal":
+                continue
+            declared_name, layer_aliases = _declared_copper_layer_name_and_aliases(layer_node)
+            if not declared_name:
+                continue
+            aliases.update(layer_aliases)
+            if declared_name not in seen:
+                layers.append(declared_name)
+                seen.add(declared_name)
+    return tuple(layers), aliases
+
+
+def _declared_copper_layer_name_and_aliases(layer_node: list[Any]) -> tuple[str, dict[str, str]]:
+    """Choose the user-visible copper layer name and map physical aliases to it."""
+    raw_physical_name = str(layer_node[1]) if len(layer_node) >= 2 else ""
+    physical_name = _canonical_layer(raw_physical_name)
+    raw_user_name = str(layer_node[3]) if len(layer_node) >= 4 else ""
+    user_name = _canonical_layer(raw_user_name) if raw_user_name else ""
+    if physical_name == "F.Cu":
+        selected_name = "F.Cu"
+    elif physical_name == "B.Cu":
+        selected_name = "B.Cu"
+    elif user_name:
+        selected_name = user_name
+    else:
+        selected_name = physical_name
+
+    aliases: dict[str, str] = {}
+    for raw_name in (raw_physical_name, physical_name, raw_user_name, user_name):
+        if raw_name:
+            aliases[_canonical_layer(raw_name)] = selected_name
+            aliases[str(raw_name)] = selected_name
+    aliases[selected_name] = selected_name
+    return selected_name, aliases
 
 
 def _uses_legacy_layer_names(path: str | Path) -> bool:
@@ -223,19 +312,21 @@ def _legacy_version_number(text: str) -> int:
 
 
 def _has_non_copper_segments(text: str) -> bool:
+    declared_layers = set(_declared_copper_layers_from_text(text)[0])
     for segment in _top_level_segment_strings(text):
         layer = _segment_layer(segment)
-        if layer is not None and not _is_copper_layer(layer):
+        if layer is not None and layer not in declared_layers and not _is_copper_layer(layer):
             return True
     return False
 
 
 def _remove_non_copper_segments(text: str) -> str:
+    declared_layers = set(_declared_copper_layers_from_text(text)[0])
     pieces: list[str] = []
     cursor = 0
     for start, end, segment in _top_level_segment_ranges(text):
         layer = _segment_layer(segment)
-        if layer is not None and not _is_copper_layer(layer):
+        if layer is not None and layer not in declared_layers and not _is_copper_layer(layer):
             pieces.append(text[cursor:start])
             cursor = end
     pieces.append(text[cursor:])
@@ -282,7 +373,11 @@ def _segment_layer(segment: str) -> str | None:
 
 
 def _is_copper_layer(layer: str) -> bool:
-    return layer in {"F.Cu", "B.Cu", "Top", "Bottom"} or bool(re.fullmatch(r"In\d+\.Cu", layer))
+    return (
+        layer in {"F.Cu", "B.Cu", "Top", "Bottom"}
+        or bool(re.fullmatch(r"In\d+\.Cu", layer))
+        or bool(re.fullmatch(r"Route\d+", layer))
+    )
 
 
 def _remove_legacy_zone_fill_setting(text: str) -> str:
@@ -402,15 +497,41 @@ def _pcbnew_vias(board: Any, pcbnew: Any, nets: dict[int, str]) -> list[Via]:
             continue
         net_id = int(_call_or_default(item, "GetNetCode", 0))
         diameter = _pcbnew_via_diameter(board, item)
+        start_layer, end_layer = _pcbnew_via_layer_span(board, item)
         vias.append(
             Via(
                 center=_pcbnew_point_to_mm(item.GetPosition(), pcbnew),
                 diameter=_pcbnew_to_mm(diameter, pcbnew),
                 net_id=net_id,
                 net_name=_call_or_default(item, "GetNetname", nets.get(net_id, f"Net {net_id}")),
+                start_layer=start_layer,
+                end_layer=end_layer,
             )
         )
     return vias
+
+
+def _pcbnew_via_layer_span(board: Any, via: Any) -> tuple[str, str]:
+    """Read a via layer span when the pcbnew API exposes it."""
+    start_id = _call_or_default(via, "TopLayer", None)
+    end_id = _call_or_default(via, "BottomLayer", None)
+    if start_id is None:
+        start_id = _call_or_default(via, "GetTopLayer", None)
+    if end_id is None:
+        end_id = _call_or_default(via, "GetBottomLayer", None)
+    start_layer = _pcbnew_layer_name_by_id(board, start_id, "F.Cu")
+    end_layer = _pcbnew_layer_name_by_id(board, end_id, "B.Cu")
+    return start_layer, end_layer
+
+
+def _pcbnew_layer_name_by_id(board: Any, layer_id: Any, default: str) -> str:
+    """Convert a KiCad numeric layer id into the canonical parser layer name."""
+    try:
+        if layer_id is None:
+            return default
+        return _canonical_layer(board.GetLayerName(int(layer_id)))
+    except Exception:
+        return default
 
 
 def _pcbnew_via_diameter(board: Any, via: Any) -> int | float:
@@ -627,6 +748,9 @@ def _parse_via(node: list[Any], nets: dict[int, str]) -> Via | None:
     center = _pair(_child(node, "at"))
     diameter = _number(_child_value(node, "size"), default=0.6)
     net_id = _to_int(_child_value(node, "net"))
+    layers_node = _child(node, "layers")
+    start_layer = _canonical_layer(layers_node[1]) if layers_node is not None and len(layers_node) >= 3 else "F.Cu"
+    end_layer = _canonical_layer(layers_node[2]) if layers_node is not None and len(layers_node) >= 3 else "B.Cu"
 
     if center is None or net_id is None:
         return None
@@ -636,6 +760,8 @@ def _parse_via(node: list[Any], nets: dict[int, str]) -> Via | None:
         diameter=diameter,
         net_id=net_id,
         net_name=nets.get(net_id, f"Net {net_id}"),
+        start_layer=start_layer,
+        end_layer=end_layer,
     )
 
 

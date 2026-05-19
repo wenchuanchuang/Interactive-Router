@@ -755,7 +755,7 @@ def _selector_boundary_payload_from_export(
                         (
                             layer
                             for layer in getattr(pad, "layers", ())
-                            if layer in {"F.Cu", "B.Cu"} or layer.startswith("In")
+                            if layer in {"F.Cu", "B.Cu"} or layer.startswith("In") or layer.startswith("Route")
                         ),
                         "F.Cu",
                     )
@@ -1330,17 +1330,16 @@ def _collect_original_route_primitives(
     max_ripped_clearance: float,
     layer_index_board: BoardData | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    # Track/via geometry may come from a board that uses a different copper-layer
-    # index space than the selector board. Keep the source geometry on `board`,
-    # but map z indices through `layer_index_board` when one is provided so the
-    # selector sees a consistent layer numbering scheme.
+    # Track/via geometry may come from a board that uses different copper-layer
+    # names than the selector board. Cross-board mapping is based only on copper
+    # stack order: source layer index k maps to target layer index k.
     mapping_board = layer_index_board if layer_index_board is not None else board
     boundary_clearance = max(0.0, max_ripped_clearance) * 0.5
     segments: list[dict[str, Any]] = []
     for track in board.tracks:
         if int(track.net_id) != net_id:
             continue
-        z = _layer_index_from_name(mapping_board, track.layer)
+        z = _map_layer_index_by_stack_order(board, mapping_board, track.layer)
         if z is None:
             continue
         segments.append(
@@ -1354,27 +1353,86 @@ def _collect_original_route_primitives(
             }
         )
 
-    top_layer_index = _layer_index_from_name(mapping_board, "F.Cu")
-    bottom_layer_index = _layer_index_from_name(mapping_board, "B.Cu")
     default_z_end = max(0, int(getattr(result, "nz", 0)) - 1)
-    z_start = top_layer_index if top_layer_index is not None else 0
-    z_end = bottom_layer_index if bottom_layer_index is not None else default_z_end
     vias: list[dict[str, Any]] = []
     for via in board.vias:
         if int(via.net_id) != net_id:
             continue
+        center = (float(via.center[0]), float(via.center[1]))
+        diameter = float(via.diameter)
+        radius = diameter * 0.5 + boundary_clearance
+        z_values = _active_via_layer_indices(
+            source_board=board,
+            mapping_board=mapping_board,
+            net_id=net_id,
+            center=center,
+            radius_mm=max(radius, float(getattr(result, "grid_pitch", 0.0))),
+            segments=segments,
+        )
+        if not z_values:
+            start_z = _map_layer_index_by_stack_order(board, mapping_board, getattr(via, "start_layer", "F.Cu"))
+            end_z = _map_layer_index_by_stack_order(board, mapping_board, getattr(via, "end_layer", "B.Cu"))
+            z_values = [z for z in (start_z, end_z) if z is not None]
+        if not z_values:
+            z_values = [0, default_z_end]
+        z_start = min(z_values)
+        z_end = max(z_values)
         vias.append(
             {
-                "center": (float(via.center[0]), float(via.center[1])),
-                "diameter_mm": float(via.diameter),
-                "start_layer": "F.Cu",
-                "end_layer": "B.Cu",
-                "radius_mm": float(via.diameter) * 0.5 + boundary_clearance,
+                "center": center,
+                "diameter_mm": diameter,
+                "start_layer": _layer_name_for_z(mapping_board, z_start) or getattr(via, "start_layer", "F.Cu"),
+                "end_layer": _layer_name_for_z(mapping_board, z_end) or getattr(via, "end_layer", "B.Cu"),
+                "radius_mm": radius,
                 "z_start": z_start,
                 "z_end": z_end,
             }
         )
     return segments, vias
+
+
+def _active_via_layer_indices(
+    source_board: BoardData,
+    mapping_board: BoardData,
+    net_id: int,
+    center: tuple[float, float],
+    radius_mm: float,
+    segments: list[dict[str, Any]],
+) -> list[int]:
+    """Infer which selector layers a via actually connects in this candidate."""
+    active_layers: set[int] = set()
+    cx, cy = center
+    tolerance = max(radius_mm, 0.0) + 1e-6
+    for segment in segments:
+        start = segment.get("start", (0.0, 0.0))
+        end = segment.get("end", (0.0, 0.0))
+        if _distance_point_to_segment_mm(cx, cy, float(start[0]), float(start[1]), float(end[0]), float(end[1])) <= tolerance:
+            active_layers.add(int(segment.get("z", 0)))
+    for pad in _all_net_pads(source_board, net_id):
+        if not _point_inside_expanded_pad(cx, cy, pad, radius_mm):
+            continue
+        for layer in getattr(pad, "layers", ()):
+            z = _map_layer_index_by_stack_order(source_board, mapping_board, str(layer))
+            if z is not None:
+                active_layers.add(z)
+    return sorted(active_layers)
+
+
+def _distance_point_to_segment_mm(
+    px: float,
+    py: float,
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+) -> float:
+    """Measure the shortest 2D distance from a point to a segment."""
+    dx = x2 - x1
+    dy = y2 - y1
+    if abs(dx) < 1e-12 and abs(dy) < 1e-12:
+        return math.hypot(px - x1, py - y1)
+    t = max(0.0, min(1.0, ((px - x1) * dx + (py - y1) * dy) / (dx * dx + dy * dy)))
+    return math.hypot(px - (x1 + t * dx), py - (y1 + t * dy))
 
 
 def _collect_freerouting_occurrence_primitives(
@@ -1564,7 +1622,7 @@ def _cpp_raster_request(
         item.candidate_layers = [
             z
             for z, layer_name in enumerate(board.copper_layers)
-            if "*.Cu" in pad.layers or layer_name in pad.layers
+            if _pad_has_selector_layer(board, pad, layer_name)
         ]
         raster_pads.append(item)
     request.pads = raster_pads
@@ -2719,15 +2777,41 @@ def _boundary_payload_key(raw_vertices: list[dict[str, Any]]) -> tuple[tuple[int
 
 
 def _layer_index_from_name(board: BoardData, layer: str) -> int | None:
+    """Return a layer's local copper stack index inside one board."""
+    normalized = _resolve_board_layer_name(board, layer)
+    for index, name in enumerate(board.copper_layers):
+        if name == normalized:
+            return index
+    return None
+
+
+def _map_layer_index_by_stack_order(
+    source_board: BoardData,
+    target_board: BoardData,
+    source_layer: str,
+) -> int | None:
+    """Map a source-board layer to the target board using only stack order."""
+    source_layers = list(source_board.copper_layers)
+    target_layers = list(target_board.copper_layers)
+    if not source_layers or not target_layers:
+        return None
+    if len(source_layers) != len(target_layers):
+        return None
+    source_index = _layer_index_from_name(source_board, source_layer)
+    if source_index is None or source_index >= len(target_layers):
+        return None
+    return source_index
+
+
+def _resolve_board_layer_name(board: BoardData, layer: str) -> str:
+    """Resolve a layer label into this board's local copper stack label."""
     normalized = str(layer)
     if normalized == "Top":
         normalized = "F.Cu"
     elif normalized == "Bottom":
         normalized = "B.Cu"
-    for index, name in enumerate(board.copper_layers):
-        if name == normalized:
-            return index
-    return None
+    aliases = getattr(board, "layer_aliases", None) or {}
+    return str(aliases.get(normalized, aliases.get(str(layer), normalized)))
 
 
 def _load_freerouting_occurrences_by_net(
@@ -2766,13 +2850,19 @@ def _load_freerouting_occurrences_by_net(
             source_profile = _freerouting_payload_profile(payload_path)
             parsed = []
             for occurrence in occurrences:
-                parsed_occurrence = _parse_freerouting_occurrence_for_selector(occurrence)
+                parsed_occurrence = _parse_freerouting_occurrence_for_selector(occurrence, net_id)
                 if parsed_occurrence is None:
                     continue
                 parsed_occurrence["source_profile"] = source_profile
                 parsed.append(parsed_occurrence)
-            if parsed:
-                mapping.setdefault(net_id, []).extend(parsed)
+            for parsed_occurrence in parsed:
+                # The payload parent net can be the net that caused the ripup
+                # event, while source_net_id identifies the actual routed
+                # component owner. Route each occurrence to its real net bucket.
+                effective_net_id = int(parsed_occurrence.get("source_net_id", net_id) or net_id)
+                if effective_net_id <= 0:
+                    effective_net_id = net_id
+                mapping.setdefault(effective_net_id, []).append(parsed_occurrence)
     return mapping
 
 
@@ -2786,7 +2876,10 @@ def _freerouting_payload_profile(payload_path: Path) -> str:
     return "selected"
 
 
-def _parse_freerouting_occurrence_for_selector(occurrence: Any) -> dict[str, Any] | None:
+def _parse_freerouting_occurrence_for_selector(
+    occurrence: Any,
+    parent_net_id: int,
+) -> dict[str, Any] | None:
     """Convert one freerouting payload occurrence into selector primitives."""
     if not isinstance(occurrence, dict):
         return None
@@ -2828,11 +2921,16 @@ def _parse_freerouting_occurrence_for_selector(occurrence: Any) -> dict[str, Any
         )
     if not segs and not vias:
         return None
+    try:
+        source_net_id = int(occurrence.get("source_net_id", parent_net_id) or parent_net_id)
+    except Exception:
+        source_net_id = int(parent_net_id)
     return {
         "segments": segs,
         "vias": vias,
         "event_index": int(occurrence.get("event_index", 0)),
-        "source_net_id": occurrence.get("source_net_id"),
+        "source_net_id": source_net_id,
+        "payload_parent_net_id": int(parent_net_id),
         "graph": occurrence.get("graph"),
     }
 
@@ -2915,7 +3013,7 @@ def _pad_boundary_vertices_for_selector(
 
     candidate_layers = []
     for z, layer_name in enumerate(board.copper_layers):
-        if "*.Cu" in pad.layers or layer_name in pad.layers:
+        if _pad_has_selector_layer(board, pad, layer_name):
             candidate_layers.append(z)
     if not candidate_layers:
         return set()
@@ -3727,7 +3825,7 @@ def _closest_net_pad_for_vertex(
         for pad in footprint.pads:
             if (pad.net_id or 0) != net_id:
                 continue
-            if "*.Cu" not in pad.layers and layer_name not in pad.layers:
+            if not _pad_has_selector_layer(board, pad, layer_name):
                 continue
             dx = vx_mm - float(pad.center[0])
             dy = vy_mm - float(pad.center[1])
@@ -3776,10 +3874,21 @@ def _vertex_inside_pad_clearance(
     layer_name = _layer_name_for_z(board, vertex[2])
     if layer_name is None:
         return False
-    if "*.Cu" not in pad.layers and layer_name not in pad.layers:
+    if not _pad_has_selector_layer(board, pad, layer_name):
         return False
     x_mm, y_mm = _grid_vertex_to_mm(result, vertex)
     return _point_inside_expanded_pad(x_mm, y_mm, pad, clearance)
+
+
+def _pad_has_selector_layer(board: BoardData, pad: Any, layer_name: str) -> bool:
+    """Check pad membership by comparing local copper stack indices."""
+    pad_layers = tuple(getattr(pad, "layers", ()) or ())
+    if "*.Cu" in pad_layers:
+        return True
+    target_index = _layer_index_from_name(board, layer_name)
+    if target_index is None:
+        return False
+    return any(_layer_index_from_name(board, str(layer)) == target_index for layer in pad_layers)
 
 
 def _point_inside_expanded_pad(x_mm: float, y_mm: float, pad: Any, clearance: float) -> bool:
