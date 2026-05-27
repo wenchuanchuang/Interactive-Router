@@ -29,6 +29,7 @@ class RerouteOutcome:
     elapsed_seconds: float | None = None
     candidate_export_path: Path | None = None
     selector_external_only: bool = False
+    left_top_reference_board: BoardData | None = None
 
 
 def select_reroute_candidates(
@@ -62,7 +63,7 @@ def select_reroute_candidates(
     load_started_at = perf_counter()
     exported_boundary_by_net = _load_exported_boundary_vertices(outcome.candidate_export_path)
     selector_board = _load_selector_board(outcome.candidate_export_path)
-    freerouting_payload_paths = _load_freerouting_payload_paths(outcome.candidate_export_path)
+    freerouting_payload_paths = _load_external_payload_paths(outcome.candidate_export_path)
     max_ripped_clearance = _max_ripped_clearance(
         selector_board,
         [int(getattr(result, "net_id", 0)) for result in outcome.result],
@@ -102,6 +103,7 @@ def select_reroute_candidates(
             "original": 0,
             "final": 0,
             "freerouting": 0,
+            "pcbrouter": 0,
             "vertices": 0,
             "rejections": [],
             "missing_boundary": [],
@@ -182,6 +184,7 @@ def select_reroute_candidates(
             f"original={external_summary['original']} "
             f"final={external_summary['final']} "
             f"freerouting={external_summary['freerouting']} "
+            f"pcbrouter={external_summary['pcbrouter']} "
             f"boundary_vertices={external_summary['vertices']}",
             flush=True,
         )
@@ -213,6 +216,7 @@ def select_reroute_candidates(
                 f"original={external_summary['original']} "
                 f"final={external_summary['final']} "
                 f"freerouting={external_summary['freerouting']} "
+                f"pcbrouter={external_summary['pcbrouter']} "
                 f"rejections={rejection_text} "
                 f"missing_boundary={missing_boundary_text}"
             )
@@ -245,6 +249,12 @@ def select_reroute_candidates(
         int(getattr(result, "net_id", 0)): result
         for result in outcome.result
     }
+    gurobi_solution_selected = bool(cpp_result.ok) and str(cpp_result.solver).lower().startswith("gurobi")
+    selected_source_counts = {
+        "freerouting": 0,
+        "pcbrouter": 0,
+        "other": 0,
+    }
     for selection in selections:
         if not selection.selected_candidate_indices:
             print(
@@ -260,6 +270,9 @@ def select_reroute_candidates(
             preview = preview_items[selected_index] if 0 <= selected_index < len(preview_items) else None
             via_count = via_counts[selected_index] if 0 <= selected_index < len(via_counts) else None
             source = str(getattr(preview, "source", "unknown")) if preview is not None else "unknown"
+            if gurobi_solution_selected:
+                # Count selected candidates by external router family for terminal diagnostics.
+                selected_source_counts[_selected_external_router_source_bucket(source)] += 1
             source_net_id = int(getattr(preview, "source_net_id", selection.net_id)) if preview is not None else int(selection.net_id)
             occurrence_index = int(getattr(preview, "occurrence_index", 0)) if preview is not None else 0
             extra = f" occurrence_index={occurrence_index}" if occurrence_index > 0 else ""
@@ -275,8 +288,19 @@ def select_reroute_candidates(
                 f"via_count={via_text}",
                 flush=True,
             )
+    if gurobi_solution_selected:
+        print(
+            "selector_selected_source_counts = "
+            f"freerouting:{selected_source_counts['freerouting']}, "
+            f"pcbrouter:{selected_source_counts['pcbrouter']}, "
+            f"other:{selected_source_counts['other']}",
+            flush=True,
+        )
 
-    left_top_board = _freerouting_final_board_from_results(outcome.result)
+    # Report the board currently shown in the top-left canvas when the GUI
+    # supplies one. This keeps selector statistics comparable to the visible
+    # reference board without changing the candidate set or the Gurobi model.
+    left_top_board = outcome.left_top_reference_board or _freerouting_final_board_from_results(outcome.result)
     if left_top_board is not None:
         left_top_wire_length_mm = sum(
             math.hypot(track.end[0] - track.start[0], track.end[1] - track.start[1])
@@ -284,11 +308,11 @@ def select_reroute_candidates(
         )
         left_top_via_count = len(left_top_board.vias)
         print(
-            f"selector_left_top_total_via_count = {left_top_via_count}  # 左上 freerouting 最終結果總 via 數",
+            f"selector_left_top_total_via_count = {left_top_via_count}  # 左上顯示 board 總 via 數",
             flush=True,
         )
         print(
-            f"selector_left_top_total_wire_length_mm = {left_top_wire_length_mm:.3f}  # 左上 freerouting 最終結果總線長(mm)",
+            f"selector_left_top_total_wire_length_mm = {left_top_wire_length_mm:.3f}  # 左上顯示 board 總線長(mm)",
             flush=True,
         )
 
@@ -338,6 +362,16 @@ def _candidate_slot_count(item: Any) -> int:
         len(getattr(item, "candidate_terminal_coords", [])),
         len(getattr(item, "candidate_terminal_groups", [])),
     )
+
+
+def _selected_external_router_source_bucket(source: str) -> str:
+    """Return the external router family represented by a selected candidate source label."""
+    normalized = str(source).lower()
+    if "freerouting" in normalized:
+        return "freerouting"
+    if "pcbrouter" in normalized:
+        return "pcbrouter"
+    return "other"
 
 
 def _freerouting_final_board_from_results(results: list[Any] | None) -> BoardData | None:
@@ -940,104 +974,117 @@ def _append_external_candidates_for_selector(
                     flush=True,
                 )
 
-    collect_started_at = perf_counter()
-    original_segments, original_vias = _collect_original_route_primitives(
-        board=board,
-        result=result,
-        net_id=net_id,
-        max_ripped_clearance=max_ripped_clearance,
-    )
-    collect_total += perf_counter() - collect_started_at
-    cache_started_at = perf_counter()
-    (
-        original_raw,
-        original_cover_vertices,
-        original_pad_reason,
-        cache_hit,
-        raster_elapsed,
-        pad_reason_elapsed,
-    ) = _cached_cpp_external_candidate_analysis(
-        router_core,
-        board,
-        board,
-        result,
-        net_id,
-        net_id,
-        start_anchor,
-        goal_anchor,
-        original_segments,
-        original_vias,
-        None,
-        geometry_cache,
-    )
-    cache_total += perf_counter() - cache_started_at
-    raster_total += raster_elapsed
-    pad_reason_total += pad_reason_elapsed
-    summary["geometry_cache_hits"] = int(summary.get("geometry_cache_hits", 0)) + int(cache_hit)
-    summary["geometry_cache_misses"] = int(summary.get("geometry_cache_misses", 0)) + int(not cache_hit)
-    if original_pad_reason is not None:
-        summary.setdefault("rejections", []).append(f"original:{original_pad_reason}")
-        print(
-            f"selector_external_rejected_missing_pads net={net_id} source=original reason={original_pad_reason}",
-            flush=True,
-        )
-        for line in _external_candidate_pad_debug_lines(
-            board=board,
+    original_profiles = list(getattr(result, "original_candidate_profiles", []))
+    if not original_profiles:
+        original_profiles = [SimpleNamespace(board=board, net_id=net_id, source="original")]
+
+    for original_profile in original_profiles:
+        original_board = getattr(original_profile, "board", board)
+        try:
+            original_net_id = int(getattr(original_profile, "net_id", net_id))
+        except Exception:
+            original_net_id = net_id
+        original_source = str(getattr(original_profile, "source", "original") or "original")
+        collect_started_at = perf_counter()
+        original_segments, original_vias = _collect_original_route_primitives(
+            board=original_board,
             result=result,
-            net_id=net_id,
-            segments=original_segments,
-            vias=original_vias,
-            explicit_graph=None,
-            source_label="original",
+            net_id=original_net_id,
+            max_ripped_clearance=max_ripped_clearance,
+            layer_index_board=board,
+        )
+        collect_total += perf_counter() - collect_started_at
+        cache_started_at = perf_counter()
+        (
+            original_raw,
+            original_cover_vertices,
+            original_pad_reason,
+            cache_hit,
+            raster_elapsed,
+            pad_reason_elapsed,
+        ) = _cached_cpp_external_candidate_analysis(
+            router_core,
+            original_board,
+            board,
+            result,
+            net_id,
+            original_net_id,
+            start_anchor,
+            goal_anchor,
+            original_segments,
+            original_vias,
+            None,
+            geometry_cache,
+        )
+        cache_total += perf_counter() - cache_started_at
+        raster_total += raster_elapsed
+        pad_reason_total += pad_reason_elapsed
+        summary["geometry_cache_hits"] = int(summary.get("geometry_cache_hits", 0)) + int(cache_hit)
+        summary["geometry_cache_misses"] = int(summary.get("geometry_cache_misses", 0)) + int(not cache_hit)
+        if original_pad_reason is not None:
+            summary.setdefault("rejections", []).append(f"original:{original_source}:{original_pad_reason}")
+            print(
+                f"selector_external_rejected_missing_pads net={net_id} source=original profile={original_source} reason={original_pad_reason}",
+                flush=True,
+            )
+            for line in _external_candidate_pad_debug_lines(
+                board=board,
+                result=result,
+                net_id=net_id,
+                segments=original_segments,
+                vias=original_vias,
+                explicit_graph=None,
+                source_label=f"original profile={original_source}",
                 reason=original_pad_reason,
             ):
                 print(line, flush=True)
-    else:
-        candidate_append_started_at = perf_counter()
-        appended = _append_external_payload_candidate(
-            router_core=router_core,
-            board=board,
-            result=result,
-            start_anchor=start_anchor,
-            goal_anchor=goal_anchor,
-            raw_vertices=original_raw,
-            candidate_paths_grid=candidate_paths_grid,
-            candidate_paths_mm=candidate_paths_mm,
-            candidate_via_counts=candidate_via_counts,
-            candidate_cover_vertices=candidate_cover_vertices,
-            boundary_payload=boundary_payload,
-            candidate_preview_items=candidate_preview_items,
-            existing_keys=existing_keys,
-            segments=original_segments,
-            vias=original_vias,
-            cover_vertices_points=original_cover_vertices,
-            preview_item=_candidate_preview_item(
-                net_id,
-                original_segments,
-                original_vias,
-                0,
-                "original",
-                net_id,
-            ),
-        )
-        candidate_append_total += perf_counter() - candidate_append_started_at
-        if appended:
-            summary["original"] += 1
-            summary["vertices"] += len(original_raw)
         else:
-            summary.setdefault("missing_boundary", []).append("original")
-            print(
-                f"selector_external_missing_boundary net={net_id} source=original",
-                flush=True,
+            candidate_append_started_at = perf_counter()
+            appended = _append_external_payload_candidate(
+                router_core=router_core,
+                board=board,
+                result=result,
+                start_anchor=start_anchor,
+                goal_anchor=goal_anchor,
+                raw_vertices=original_raw,
+                candidate_paths_grid=candidate_paths_grid,
+                candidate_paths_mm=candidate_paths_mm,
+                candidate_via_counts=candidate_via_counts,
+                candidate_cover_vertices=candidate_cover_vertices,
+                boundary_payload=boundary_payload,
+                candidate_preview_items=candidate_preview_items,
+                existing_keys=existing_keys,
+                segments=original_segments,
+                vias=original_vias,
+                cover_vertices_points=original_cover_vertices,
+                preview_item=_candidate_preview_item(
+                    net_id,
+                    original_segments,
+                    original_vias,
+                    0,
+                    f"original:{original_source}",
+                    original_net_id,
+                ),
             )
+            candidate_append_total += perf_counter() - candidate_append_started_at
+            if appended:
+                summary["original"] += 1
+                summary["vertices"] += len(original_raw)
+            else:
+                summary.setdefault("missing_boundary", []).append(f"original:{original_source}")
+                print(
+                    f"selector_external_missing_boundary net={net_id} source=original profile={original_source}",
+                    flush=True,
+                )
 
     occurrence_entries: list[Any] = []
     for occurrence in freerouting_occurrences:
         occurrence_started_at = perf_counter()
         occurrence_count += 1
         occurrence_index = int(occurrence.get("event_index", 0))
+        source_backend = str(occurrence.get("source_backend", "freerouting") or "freerouting")
         source_profile = str(occurrence.get("source_profile", "selected") or "selected")
-        source_label = f"freerouting:{source_profile}"
+        source_label = source_backend if source_profile == "selected" else f"{source_backend}:{source_profile}"
         collect_started_at = perf_counter()
         occ_segments, occ_vias = _collect_freerouting_occurrence_primitives(
             board=board,
@@ -1150,7 +1197,10 @@ def _append_external_candidates_for_selector(
             )
             candidate_append_total += perf_counter() - candidate_append_started_at
             if appended:
-                summary["freerouting"] += 1
+                if source_backend == "pcbrouter":
+                    summary["pcbrouter"] += 1
+                else:
+                    summary["freerouting"] += 1
                 summary["vertices"] += len(occ_raw)
             else:
                 summary.setdefault("missing_boundary", []).append(f"{source_label}@E{occurrence_index}")
@@ -2847,12 +2897,14 @@ def _load_freerouting_occurrences_by_net(
             occurrences = net.get("occurrences", [])
             if not isinstance(occurrences, list) or not occurrences:
                 occurrences = [net]
-            source_profile = _freerouting_payload_profile(payload_path)
+            source_backend = _external_payload_backend(payload, payload_path)
+            source_profile = _freerouting_payload_profile(payload_path) if source_backend == "freerouting" else "selected"
             parsed = []
             for occurrence in occurrences:
                 parsed_occurrence = _parse_freerouting_occurrence_for_selector(occurrence, net_id)
                 if parsed_occurrence is None:
                     continue
+                parsed_occurrence["source_backend"] = source_backend
                 parsed_occurrence["source_profile"] = source_profile
                 parsed.append(parsed_occurrence)
             for parsed_occurrence in parsed:
@@ -2864,6 +2916,17 @@ def _load_freerouting_occurrences_by_net(
                     effective_net_id = net_id
                 mapping.setdefault(effective_net_id, []).append(parsed_occurrence)
     return mapping
+
+
+def _external_payload_backend(payload: dict[str, Any], payload_path: Path) -> str:
+    """Return the backend label used for selector debug output."""
+    backend = str(payload.get("backend", "") or payload.get("generator", "")).lower()
+    if "pcbrouter" in backend or "pcb_router" in backend:
+        return "pcbrouter"
+    name = Path(payload_path).name.lower()
+    if "pcbrouter" in name or "pcb_router" in name:
+        return "pcbrouter"
+    return "freerouting"
 
 
 def _freerouting_payload_profile(payload_path: Path) -> str:
@@ -2935,17 +2998,23 @@ def _parse_freerouting_occurrence_for_selector(
     }
 
 
-def _load_freerouting_payload_paths(candidate_export_path: Path | None) -> list[Path]:
-    """Read all freerouting payload files recorded in a selector manifest."""
+def _load_external_payload_paths(candidate_export_path: Path | None) -> list[Path]:
+    """Read all backend payload files recorded in a selector manifest."""
     if candidate_export_path is None or not Path(candidate_export_path).exists():
         return []
     try:
         payload = json.loads(Path(candidate_export_path).read_text(encoding="utf-8"))
     except Exception:
         return []
-    raw_paths = payload.get("freerouting_payload_paths", []) if isinstance(payload, dict) else []
-    if not isinstance(raw_paths, list):
+    if not isinstance(payload, dict):
         return []
+    raw_paths: list[Any] = []
+    for key in ("freerouting_payload_paths", "pcbrouter_payload_paths", "external_payload_paths"):
+        # Backend payloads share the same occurrence geometry schema; source
+        # metadata keeps freerouting and PcbRouter debug output separate.
+        value = payload.get(key, [])
+        if isinstance(value, list):
+            raw_paths.extend(value)
     paths: list[Path] = []
     for raw_path in raw_paths:
         path = Path(str(raw_path))
@@ -3059,10 +3128,15 @@ def build_freerouting_external_selector_outcome(
     grid_steps_per_mm: float = 10.0,
     final_board: BoardData | None = None,
     final_boards: list[BoardData] | None = None,
+    original_candidate_boards: list[BoardData] | None = None,
     freerouting_payload_paths: list[Path] | None = None,
+    pcbrouter_payload_paths: list[Path] | None = None,
+    external_payload_paths: list[Path] | None = None,
+    left_top_reference_board: BoardData | None = None,
+    backend_label: str = "external",
 ) -> RerouteOutcome:
     if not ripped_net_ids:
-        return RerouteOutcome(False, "No ripped nets were provided for freerouting selector input.")
+        return RerouteOutcome(False, f"No ripped nets were provided for {backend_label} selector input.")
 
     layers = board.copper_layers or ["F.Cu"]
     nz = len(layers)
@@ -3090,6 +3164,17 @@ def build_freerouting_external_selector_outcome(
             )
             for candidate_board in candidate_final_boards
         ]
+        # Keep translated routed input geometry as candidate sources only. They
+        # must not be stored in `board.tracks`, because selector grid bounds are
+        # computed from the selector board itself.
+        original_candidates = [
+            SimpleNamespace(
+                board=candidate_board,
+                net_id=int(_matching_net_id_by_name(candidate_board, net_name)),
+                source=str(Path(candidate_board.path).stem),
+            )
+            for candidate_board in (original_candidate_boards or [])
+        ]
         anchors = _choose_external_selector_anchors(board, net_id)
         if anchors is None:
             skipped.append(net_id)
@@ -3115,7 +3200,10 @@ def build_freerouting_external_selector_outcome(
                 final_candidate_board=final_board,
                 final_candidate_net_id=int(final_candidates[0].net_id if final_candidates else 0),
                 final_candidate_profiles=final_candidates,
+                original_candidate_profiles=original_candidates,
                 freerouting_payload_paths=[str(path) for path in (freerouting_payload_paths or [])],
+                pcbrouter_payload_paths=[str(path) for path in (pcbrouter_payload_paths or [])],
+                external_payload_paths=[str(path) for path in (external_payload_paths or [])],
                 start_vertices=[start_point],
                 goal_vertices=[goal_point],
                 candidate_paths_grid=[],
@@ -3131,7 +3219,7 @@ def build_freerouting_external_selector_outcome(
     if not results:
         return RerouteOutcome(
             False,
-            "No usable net anchors were found for freerouting external-only reroute.",
+            f"No usable net anchors were found for {backend_label} external-only reroute.",
             None,
             None,
             None,
@@ -3143,9 +3231,12 @@ def build_freerouting_external_selector_outcome(
         net_ids=[int(getattr(item, "net_id", 0)) for item in results],
         grid_steps_per_mm=grid_steps_per_mm,
         freerouting_payload_paths=freerouting_payload_paths or [],
+        pcbrouter_payload_paths=pcbrouter_payload_paths or [],
+        external_payload_paths=external_payload_paths or [],
+        backend_label=backend_label,
     )
     message = (
-        f"Freerouting external-only candidates prepared for {len(results)} nets."
+        f"{backend_label} external-only candidates prepared for {len(results)} nets."
         + (f" Skipped nets: {skipped}." if skipped else "")
     )
     return RerouteOutcome(
@@ -3155,6 +3246,7 @@ def build_freerouting_external_selector_outcome(
         None,
         export_path,
         True,
+        left_top_reference_board,
     )
 
 
@@ -3317,6 +3409,9 @@ def _write_selector_stub_manifest(
     net_ids: list[int],
     grid_steps_per_mm: float,
     freerouting_payload_paths: list[Path] | None = None,
+    pcbrouter_payload_paths: list[Path] | None = None,
+    external_payload_paths: list[Path] | None = None,
+    backend_label: str = "external",
 ) -> Path:
     root = Path(__file__).resolve().parents[1]
     export_dir = root / "out" / "candidate_path_exports"
@@ -3324,7 +3419,8 @@ def _write_selector_stub_manifest(
     board_stem = board.path.stem or "board"
     net_label = "-".join(str(net_id) for net_id in net_ids) or "none"
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    export_path = export_dir / f"{board_stem}__freerouting_external_only__nets_{net_label}__{timestamp}.json"
+    safe_backend = "".join(ch if ch.isalnum() or ch in ("_", "-") else "_" for ch in backend_label.lower())
+    export_path = export_dir / f"{board_stem}__{safe_backend}_external_only__nets_{net_label}__{timestamp}.json"
 
     payload = {
         "schema_version": 1,
@@ -3337,6 +3433,8 @@ def _write_selector_stub_manifest(
         "ripped_net_ids": list(net_ids),
         "grid_steps_per_mm": float(grid_steps_per_mm),
         "freerouting_payload_paths": [str(path) for path in (freerouting_payload_paths or [])],
+        "pcbrouter_payload_paths": [str(path) for path in (pcbrouter_payload_paths or [])],
+        "external_payload_paths": [str(path) for path in (external_payload_paths or [])],
         "results": [
             {"net_id": int(net_id), "candidate_boundary_vertices": []}
             for net_id in net_ids

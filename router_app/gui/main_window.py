@@ -26,6 +26,7 @@ from PyQt5.QtWidgets import (
 
 from router_app.freerouting_full import FreeroutingRunResult, run_freerouting_full
 from router_app.kicad_parser import BoardData, TrackSegment, load_board
+from router_app.pcb_router_full import PcbRouterRunResult, run_pcb_router_full
 from router_app.reroute_engine import (
     RerouteOutcome,
     build_freerouting_external_selector_outcome,
@@ -37,14 +38,16 @@ from router_app.gui.pcb_canvas import PcbCanvas, RoutePreviewCanvas
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, initial_file: str | None = None, freerouting_full: bool = False):
+    def __init__(self, initial_file: str | None = None, freerouting_full: bool = False, pcb_router: bool = False):
         super().__init__()
         self._board: BoardData | None = None
         self._original_board: BoardData | None = None
         self._candidate_outcome = None
         self._candidate_ripped_net_ids: set[int] = set()
         self._freerouting_full_enabled = freerouting_full
+        self._pcb_router_enabled = pcb_router
         self._freerouting_run: FreeroutingRunResult | None = None
+        self._pcb_router_run: PcbRouterRunResult | None = None
         self._freerouting_candidates_ready = False
 
         self.setWindowTitle("KiCad Auto Router Viewer")
@@ -148,8 +151,11 @@ class MainWindow(QMainWindow):
             self.open_board(file_name)
 
     def open_board(self, file_name: str) -> None:
-        if self._freerouting_full_enabled:
+        if self._freerouting_full_enabled and not self._pcb_router_enabled:
             self._open_board_with_freerouting(file_name)
+            return
+        if self._freerouting_full_enabled or self._pcb_router_enabled:
+            self._open_board_with_external_backends(file_name)
             return
         try:
             board = load_board(file_name)
@@ -196,6 +202,72 @@ class MainWindow(QMainWindow):
             flush=True,
         )
 
+    def _open_board_with_external_backends(self, file_name: str) -> None:
+        # Run requested external routers first, then keep every backend's final
+        # board and payload available to the selector candidate builder.
+        freerouting_result: FreeroutingRunResult | None = None
+        pcbrouter_result: PcbRouterRunResult | None = None
+        if self._freerouting_full_enabled:
+            try:
+                freerouting_result = run_freerouting_full(file_name)
+            except Exception as exc:
+                QMessageBox.critical(self, "freerouting-full failed", str(exc))
+                return
+        if self._pcb_router_enabled:
+            try:
+                pcbrouter_result = run_pcb_router_full(file_name)
+            except Exception as exc:
+                QMessageBox.critical(self, "pcb-router failed", str(exc))
+                return
+
+        self._freerouting_run = freerouting_result
+        self._pcb_router_run = pcbrouter_result
+        display_result = freerouting_result or pcbrouter_result
+        if display_result is None:
+            return
+
+        display_board = self._display_board_for_external_backends(file_name, display_result)
+        self._original_board = display_result.original_board
+        self._board = display_board
+        self._reset_candidate_generation_state()
+        self.canvas.load_board(display_board)
+        self._set_layers(display_board.copper_layers)
+        self.trace_panel.show_board(display_board)
+        self.trace_panel.set_grid_density_minimum(minimum_grid_steps_per_mm(display_board))
+        self._update_ripup_buttons()
+
+        previews = self._external_ripup_previews()
+        pad_count = sum(len(footprint.pads) for footprint in display_board.footprints)
+        self.statusBar().showMessage(
+            f"Loaded {display_board.path.name} via external backend: "
+            f"{len(display_board.tracks)} traces, {len(display_board.vias)} vias, "
+            f"{len(display_board.footprints)} components, {pad_count} pads, "
+            f"{len(display_board.two_pin_net_ids)} two-pin nets, "
+            f"{len({item.net_id for item in previews})} unique ripped nets, "
+            f"{len(previews)} ripped-net occurrences."
+        )
+
+        if freerouting_result is not None:
+            self._print_freerouting_summary(freerouting_result)
+        if pcbrouter_result is not None:
+            self._print_pcbrouter_summary(pcbrouter_result)
+
+    def _display_board_for_external_backends(self, file_name: str, display_result) -> BoardData:
+        """Return the board shown in the main canvas for external-router runs.
+
+        Routed reference inputs are user-provided comparison baselines. Keep
+        them visible in the top-left canvas while external routers and selector
+        candidates continue to use the canonical unrouted coordinate frame.
+        """
+        input_path = Path(file_name)
+        if self._is_routed_reference_input(input_path):
+            return load_board(input_path)
+        return display_result.routed_board
+
+    def _is_routed_reference_input(self, board_path: Path) -> bool:
+        """Return true when the opened file name represents a routed reference board."""
+        return ".routed" in board_path.stem
+
     def _open_board_with_freerouting(self, file_name: str) -> None:
         try:
             result = run_freerouting_full(file_name)
@@ -204,21 +276,22 @@ class MainWindow(QMainWindow):
             return
 
         self._freerouting_run = result
+        display_board = self._display_board_for_external_backends(file_name, result)
         self._original_board = result.original_board
-        self._board = result.routed_board
+        self._board = display_board
         self._reset_candidate_generation_state()
-        self.canvas.load_board(result.routed_board)
-        self._set_layers(result.routed_board.copper_layers)
-        self.trace_panel.show_board(result.routed_board)
-        self.trace_panel.set_grid_density_minimum(minimum_grid_steps_per_mm(result.routed_board))
+        self.canvas.load_board(display_board)
+        self._set_layers(display_board.copper_layers)
+        self.trace_panel.show_board(display_board)
+        self.trace_panel.set_grid_density_minimum(minimum_grid_steps_per_mm(display_board))
         self._update_ripup_buttons()
 
-        pad_count = sum(len(footprint.pads) for footprint in result.routed_board.footprints)
+        pad_count = sum(len(footprint.pads) for footprint in display_board.footprints)
         self.statusBar().showMessage(
-            f"Loaded {result.routed_board.path.name} via {result.routed_board.backend}: "
-            f"{len(result.routed_board.tracks)} traces, {len(result.routed_board.vias)} vias, "
-            f"{len(result.routed_board.footprints)} components, {pad_count} pads, "
-            f"{len(result.routed_board.two_pin_net_ids)} two-pin nets, "
+            f"Loaded {display_board.path.name} via {display_board.backend}: "
+            f"{len(display_board.tracks)} traces, {len(display_board.vias)} vias, "
+            f"{len(display_board.footprints)} components, {pad_count} pads, "
+            f"{len(display_board.two_pin_net_ids)} two-pin nets, "
             f"{result.unique_ripped_net_count} unique ripped nets, "
             f"{len(result.ripup_previews)} ripped-net occurrences."
         )
@@ -304,6 +377,78 @@ class MainWindow(QMainWindow):
         if result.stderr_log_path is not None:
             print(f"freerouting_stderr_log = {result.stderr_log_path}", flush=True)
 
+    def _print_freerouting_summary(self, result: FreeroutingRunResult) -> None:
+        # Keep the existing freerouting terminal summary available when multiple
+        # external backends are run together.
+        print(
+            f"freerouting_ripup_event_count = {result.ripup_event_count}  # freerouting 實際發生的拆線事件次數",
+            flush=True,
+        )
+        print(
+            f"interactive_router_unique_ripped_nets = {result.unique_ripped_net_count}  # Interactive-Router 拿到被拆 net 的去重總數",
+            flush=True,
+        )
+        total_wire_length_mm = sum(
+            hypot(track.end[0] - track.start[0], track.end[1] - track.start[1])
+            for track in result.routed_board.tracks
+        )
+        failed_net_ids = self._estimate_failed_nets(result.routed_board)
+        failed_net_labels = [
+            f"{net_id}:{result.routed_board.nets.get(net_id, f'Net {net_id}')}"
+            for net_id in failed_net_ids
+        ]
+        print(f"freerouting_total_wire_length_mm = {total_wire_length_mm:.3f}  # 左上繞線結果總線長(mm)", flush=True)
+        print(f"freerouting_total_via_count = {len(result.routed_board.vias)}  # 左上繞線結果總 via 數", flush=True)
+        print(
+            "freerouting_failed_nets_estimated = "
+            + (", ".join(failed_net_labels) if failed_net_labels else "(none)")
+            + "  # 估計繞失敗 net（有2個以上pad但沒有任何track/via）",
+            flush=True,
+        )
+        print(
+            "freerouting_unconnected_status = "
+            + (
+                "still_unconnected"
+                + (f" ({result.unconnected_item_count} connection(s))" if result.unconnected_item_count is not None else "")
+                if result.still_unconnected
+                else "fully_connected"
+            ),
+            flush=True,
+        )
+        if result.stdout_log_path is not None:
+            print(f"freerouting_stdout_log = {Path(result.stdout_log_path).resolve()}", flush=True)
+        if result.stderr_log_path is not None:
+            print(f"freerouting_stderr_log = {Path(result.stderr_log_path).resolve()}", flush=True)
+
+    def _print_pcbrouter_summary(self, result: PcbRouterRunResult) -> None:
+        # Print absolute artifact paths so PcbRouter runs are reproducible and debuggable.
+        total_wire_length_mm = sum(
+            hypot(track.end[0] - track.start[0], track.end[1] - track.start[1])
+            for track in result.routed_board.tracks
+        )
+        failed_net_labels = [
+            f"{net_id}:{result.routed_board.nets.get(net_id, f'Net {net_id}')}"
+            for net_id in result.failed_net_ids_estimated
+        ]
+        print(f"pcbrouter_ripup_event_count = {result.ripup_event_count}", flush=True)
+        print(f"pcbrouter_unique_ripped_nets = {result.unique_ripped_net_count}", flush=True)
+        print(f"pcbrouter_total_wire_length_mm = {total_wire_length_mm:.3f}", flush=True)
+        print(f"pcbrouter_total_via_count = {len(result.routed_board.vias)}", flush=True)
+        print(
+            "pcbrouter_failed_nets_estimated = "
+            + (", ".join(failed_net_labels) if failed_net_labels else "(none)"),
+            flush=True,
+        )
+        print(f"pcbrouter_routed_board = {Path(result.routed_board_path).resolve()}", flush=True)
+        if result.ripup_payload_path is not None:
+            print(f"pcbrouter_ripup_payload = {Path(result.ripup_payload_path).resolve()}", flush=True)
+        else:
+            print("pcbrouter_ripup_payload = (none)", flush=True)
+        if result.stdout_log_path is not None:
+            print(f"pcbrouter_stdout_log = {Path(result.stdout_log_path).resolve()}", flush=True)
+        if result.stderr_log_path is not None:
+            print(f"pcbrouter_stderr_log = {Path(result.stderr_log_path).resolve()}", flush=True)
+
     def _show_trace(self, track: TrackSegment) -> None:
         if self._board is not None:
             self.trace_panel.show_trace(self._board, track)
@@ -327,10 +472,10 @@ class MainWindow(QMainWindow):
             self._show_status_counts("Rip-up undone")
 
     def _update_ripup_buttons(self, *_args) -> None:
-        if self._freerouting_full_enabled:
+        if self._freerouting_full_enabled or self._pcb_router_enabled:
             self.rip_up_button.setEnabled(False)
             self.undo_rip_up_button.setEnabled(False)
-            self.generate_candidates_button.setEnabled(bool(self._freerouting_run and self._freerouting_run.ripup_previews))
+            self.generate_candidates_button.setEnabled(bool(self._external_ripup_previews()))
             self.reroute_button.setEnabled(
                 self._freerouting_candidates_ready
                 and self._candidate_outcome is not None
@@ -357,8 +502,8 @@ class MainWindow(QMainWindow):
         self._update_ripup_buttons()
 
     def _generate_candidates_for_ripped_nets(self) -> None:
-        if self._freerouting_full_enabled:
-            self._show_freerouting_ripped_routes()
+        if self._freerouting_full_enabled or self._pcb_router_enabled:
+            self._show_external_backend_ripped_routes()
             return
         if self._board is None:
             return
@@ -386,9 +531,9 @@ class MainWindow(QMainWindow):
         self._update_ripup_buttons()
 
     def _reroute_selected_removed_nets(self) -> None:
-        if self._freerouting_full_enabled:
-            if self._board is None or self._freerouting_run is None:
-                self.statusBar().showMessage("freerouting-full result is not available.")
+        if self._freerouting_full_enabled or self._pcb_router_enabled:
+            if self._board is None or not self._external_ripup_previews():
+                self.statusBar().showMessage("External router result is not available.")
                 return
             if self._candidate_outcome is None or not self._candidate_outcome.result:
                 self.statusBar().showMessage("Generate candidates first, then reroute.")
@@ -404,7 +549,7 @@ class MainWindow(QMainWindow):
                 )
                 return
 
-            ripped_net_ids = {item.net_id for item in self._freerouting_run.ripup_previews}
+            ripped_net_ids = {item.net_id for item in self._external_ripup_previews()}
             selected_preview = self._build_selected_preview_results(self._candidate_outcome.result, selection)
             if selected_preview:
                 self.route_preview.show_routes(selected_preview, self._board, ripped_net_ids)
@@ -460,32 +605,68 @@ class MainWindow(QMainWindow):
         self._candidate_outcome = None
         self._candidate_ripped_net_ids = set()
         self._freerouting_candidates_ready = False
-        if self._freerouting_full_enabled:
-            self.route_preview.show_message("Generate candidates to show freerouting ripped routes")
+        if self._freerouting_full_enabled or self._pcb_router_enabled:
+            self.route_preview.show_message("Generate candidates to show external ripped routes")
         else:
             self.route_preview.show_message("Generate candidates first")
 
-    def _show_freerouting_ripped_routes(self) -> None:
-        if self._board is None or self._freerouting_run is None:
-            self.route_preview.show_message("freerouting-full result is not available")
-            return
-        if not self._freerouting_run.ripup_previews:
-            self.route_preview.show_message("freerouting did not report ripped routes")
-            self.statusBar().showMessage("freerouting completed without ripped-route preview data.")
+    def _external_ripup_previews(self) -> list[object]:
+        # Keep backend previews as one stream for the GUI and selector setup.
+        previews: list[object] = []
+        if self._freerouting_run is not None:
+            previews.extend(self._freerouting_run.ripup_previews)
+        if self._pcb_router_run is not None:
+            previews.extend(self._pcb_router_run.ripup_previews)
+        return previews
+
+    def _external_final_boards(self) -> list[BoardData]:
+        # Feed every requested backend final board to the selector; exact dedup
+        # happens later in candidate append without changing the Gurobi model.
+        boards: list[BoardData] = []
+        if self._freerouting_run is not None:
+            boards.extend(self._freerouting_run.candidate_routed_boards)
+        if self._pcb_router_run is not None:
+            boards.append(self._pcb_router_run.routed_board)
+        return boards
+
+    def _external_original_candidate_boards(self) -> list[BoardData]:
+        # Preserve shifted routed input geometry as candidates without letting
+        # those tracks/vias expand the selector board bounds.
+        boards: list[BoardData] = []
+        if self._freerouting_run is not None and self._freerouting_run.original_candidate_board is not None:
+            boards.append(self._freerouting_run.original_candidate_board)
+        if self._pcb_router_run is not None and self._pcb_router_run.original_candidate_board is not None:
+            boards.append(self._pcb_router_run.original_candidate_board)
+        return boards
+
+    def _freerouting_payload_paths(self) -> list[Path]:
+        if self._freerouting_run is None:
+            return []
+        return list(self._freerouting_run.candidate_ripup_payload_paths)
+
+    def _pcbrouter_payload_paths(self) -> list[Path]:
+        if self._pcb_router_run is None or self._pcb_router_run.ripup_payload_path is None:
+            return []
+        return [self._pcb_router_run.ripup_payload_path]
+
+    def _show_external_backend_ripped_routes(self) -> None:
+        previews = self._external_ripup_previews()
+        if self._board is None or not previews:
+            self.route_preview.show_message("External router result is not available")
             return
 
-        ripped_net_ids = {item.net_id for item in self._freerouting_run.ripup_previews}
+        ripped_net_ids = {item.net_id for item in previews}
         overlay_net_ids = []
-        for item in self._freerouting_run.ripup_previews:
+        for item in previews:
             if item.occurrence_index > 0:
                 overlay_net_ids.append(f"{item.net_id}@E{item.occurrence_index}")
             else:
                 overlay_net_ids.append(str(item.net_id))
-        segment_count = sum(len(item.segments) for item in self._freerouting_run.ripup_previews)
-        via_count = sum(len(item.vias) for item in self._freerouting_run.ripup_previews)
-        truncated_count = sum(1 for item in self._freerouting_run.ripup_previews if item.truncated)
+        segment_count = sum(len(item.segments) for item in previews)
+        via_count = sum(len(item.vias) for item in previews)
+        truncated_count = sum(1 for item in previews if item.truncated)
         truncated_labels = []
-        for item in self._freerouting_run.ripup_previews:
+        for item in previews:
             if not item.truncated:
                 continue
             if item.occurrence_index > 0:
@@ -493,18 +674,18 @@ class MainWindow(QMainWindow):
             else:
                 truncated_labels.append(str(item.net_id))
         self.trace_panel.show_ripped_nets(self._board, ripped_net_ids)
-        self.route_preview.show_routes(self._freerouting_run.ripup_previews, self._board, ripped_net_ids)
+        self.route_preview.show_routes(previews, self._board, ripped_net_ids)
         print(
-            "freerouting_ripped_occurrences = "
+            "external_ripped_occurrences = "
             + ", ".join(overlay_net_ids),
             flush=True,
         )
         print(
-            f"freerouting_truncated_occurrence_count = {truncated_count}",
+            f"external_truncated_occurrence_count = {truncated_count}",
             flush=True,
         )
         print(
-            "freerouting_truncated_occurrences = "
+            "external_truncated_occurrences = "
             + (", ".join(truncated_labels) if truncated_labels else "(none)"),
             flush=True,
         )
@@ -513,9 +694,13 @@ class MainWindow(QMainWindow):
             selector_board,
             ripped_net_ids,
             self.trace_panel.grid_steps_per_mm,
-            final_board=self._board,
-            final_boards=list(self._freerouting_run.candidate_routed_boards),
-            freerouting_payload_paths=list(self._freerouting_run.candidate_ripup_payload_paths),
+            final_board=None,
+            final_boards=self._external_final_boards(),
+            original_candidate_boards=self._external_original_candidate_boards(),
+            freerouting_payload_paths=self._freerouting_payload_paths(),
+            pcbrouter_payload_paths=self._pcbrouter_payload_paths(),
+            left_top_reference_board=self._board,
+            backend_label="external",
         )
         if outcome.result:
             self._candidate_outcome = RerouteOutcome(
@@ -525,6 +710,7 @@ class MainWindow(QMainWindow):
                 elapsed_seconds=outcome.elapsed_seconds,
                 candidate_export_path=outcome.candidate_export_path,
                 selector_external_only=True,
+                left_top_reference_board=outcome.left_top_reference_board,
             )
         else:
             self._candidate_outcome = None
@@ -536,15 +722,15 @@ class MainWindow(QMainWindow):
                 flush=True,
             )
         print(
-            "freerouting_selector_candidate_status = "
+            "external_selector_candidate_status = "
             + ("ready" if self._freerouting_candidates_ready else "failed")
             + f"  # {outcome.message}",
             flush=True,
         )
         suffix = f" {truncated_count} net previews were truncated." if truncated_count else ""
         self.statusBar().showMessage(
-            f"Showing freerouting ripped routes for {len(ripped_net_ids)} unique nets "
-            f"across {len(self._freerouting_run.ripup_previews)} occurrences, "
+            f"Showing external ripped routes for {len(ripped_net_ids)} unique nets "
+            f"across {len(previews)} occurrences, "
             f"{segment_count} segments, {via_count} vias.{suffix}"
         )
         self._update_ripup_buttons()

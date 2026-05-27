@@ -7,10 +7,11 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+from typing import Iterable
 
 import pcbnew
 
-from router_app.kicad_parser import BoardData, load_board
+from router_app.kicad_parser import BoardData, TrackSegment, Via, load_board
 
 
 @dataclass(frozen=True)
@@ -43,6 +44,7 @@ class FreeroutingRipupPreview:
 @dataclass(frozen=True)
 class FreeroutingRunResult:
     original_board: BoardData
+    original_candidate_board: BoardData | None
     routed_board: BoardData
     ripup_previews: list[FreeroutingRipupPreview]
     work_dir: Path
@@ -70,6 +72,7 @@ class FreeroutingRunResult:
 
 def run_freerouting_full(board_path: str | Path) -> FreeroutingRunResult:
     board_path = Path(board_path).resolve()
+    router_source_board_path = _canonical_router_source_board(board_path)
     app_root = Path(__file__).resolve().parents[2]
     workspace_root = app_root.parent
     freerouting_root = workspace_root / "freerouting"
@@ -82,6 +85,7 @@ def run_freerouting_full(board_path: str | Path) -> FreeroutingRunResult:
 
     dsn_path = work_dir / "freerouting.dsn"
     ses_path = work_dir / "freerouting.ses"
+    unrouted_input_board_path = work_dir / f"{board_path.stem}.freerouting.input_unrouted.kicad_pcb"
     routed_board_path = work_dir / f"{board_path.stem}.freerouting.routed.kicad_pcb"
     ripup_payload_path = work_dir / "freerouting_ripped_routes.json"
     metadata_path = work_dir / "run_metadata.json"
@@ -90,6 +94,7 @@ def run_freerouting_full(board_path: str | Path) -> FreeroutingRunResult:
     for artifact in (
         dsn_path,
         ses_path,
+        unrouted_input_board_path,
         routed_board_path,
         ripup_payload_path,
         metadata_path,
@@ -103,13 +108,15 @@ def run_freerouting_full(board_path: str | Path) -> FreeroutingRunResult:
     home_dir.mkdir(parents=True, exist_ok=True)
     profile_paths = _ensure_freerouting_profiles(home_dir)
 
-    _export_dsn(board_path, dsn_path)
+    _write_board_without_tracks_and_vias(router_source_board_path, unrouted_input_board_path)
+    _export_dsn(unrouted_input_board_path, dsn_path)
+    _normalize_dsn_pcb_name(dsn_path, router_source_board_path.stem)
     _force_dsn_snap_angle_fortyfive(dsn_path)
     stable_stage = _run_freerouting_stage(
         profile_name="stable",
         profile_config_path=profile_paths["stable"],
         jar_path=jar_path,
-        board_path=board_path,
+        board_path=unrouted_input_board_path,
         dsn_path=dsn_path,
         ripup_payload_path=work_dir / "freerouting.stable_ripped_routes.json",
         ses_path=work_dir / "freerouting.stable.ses",
@@ -126,7 +133,7 @@ def run_freerouting_full(board_path: str | Path) -> FreeroutingRunResult:
             profile_name="aggressive",
             profile_config_path=profile_paths["aggressive"],
             jar_path=jar_path,
-            board_path=board_path,
+            board_path=unrouted_input_board_path,
             dsn_path=dsn_path,
             ripup_payload_path=work_dir / "freerouting.aggressive_ripped_routes.json",
             ses_path=work_dir / "freerouting.aggressive.ses",
@@ -147,7 +154,10 @@ def run_freerouting_full(board_path: str | Path) -> FreeroutingRunResult:
     _copy_stage_artifact(selected_stage["stderr_log_path"], stderr_log_path)
     run_report = dict(selected_stage["run_report"])
 
-    original_board = load_board(board_path)
+    original_board, original_candidate_board = _load_selector_original_board(
+        input_board_path=board_path,
+        router_source_board_path=router_source_board_path,
+    )
     routed_board = load_board(routed_board_path)
     candidate_routed_boards = tuple(
         load_board(Path(stage["routed_board_path"]))
@@ -220,6 +230,8 @@ def run_freerouting_full(board_path: str | Path) -> FreeroutingRunResult:
 
     metadata = {
         "board": str(board_path),
+        "router_source_board": str(router_source_board_path),
+        "unrouted_input_board": str(unrouted_input_board_path),
         "dsn": str(dsn_path),
         "ses": str(ses_path),
         "routed_board": str(routed_board_path),
@@ -247,6 +259,7 @@ def run_freerouting_full(board_path: str | Path) -> FreeroutingRunResult:
 
     return FreeroutingRunResult(
         original_board=original_board,
+        original_candidate_board=original_candidate_board,
         routed_board=routed_board,
         ripup_previews=ripup_previews,
         work_dir=work_dir,
@@ -282,6 +295,366 @@ def _export_dsn(board_path: Path, dsn_path: Path) -> None:
         raise RuntimeError(f"pcbnew failed to export Specctra DSN: {dsn_path}")
 
 
+def _normalize_dsn_pcb_name(dsn_path: Path, pcb_name: str) -> None:
+    """Make DSN identity stable across equivalent temporary file paths.
+
+    KiCad writes the output DSN path into the top-level `(pcb "...")` form.
+    Two byte-identical input boards exported from different work directories
+    would otherwise produce different DSN files, which can perturb downstream
+    router metadata and deterministic comparisons.
+    """
+    text = dsn_path.read_text(encoding="utf-8")
+    normalized = re.sub(r'\A\(pcb\s+"[^"]*"', f'(pcb "{pcb_name}"', text, count=1)
+    if normalized != text:
+        dsn_path.write_text(normalized, encoding="utf-8")
+
+
+def _canonical_router_source_board(board_path: Path) -> Path:
+    """Choose the board coordinate frame used by external routers.
+
+    Routed reference boards can be simple translations of their sibling
+    unrouted input. Running a heuristic router in the translated coordinate
+    frame can change rounding and tie-breaking, so external routers use the
+    sibling unrouted board when it is an exact translated match. The routed
+    input geometry is still kept later as a shifted selector candidate.
+    """
+    sibling = _find_sibling_unrouted_board(board_path)
+    if sibling is None:
+        return board_path
+    try:
+        dx, dy = _board_translation_from_common_pads(source_board=sibling, target_board=board_path)
+    except Exception:
+        return board_path
+    print(f"freerouting_router_source_board = {sibling.resolve()}", flush=True)
+    print(f"freerouting_input_to_source_translation_mm = dx={dx:.6f} dy={dy:.6f}", flush=True)
+    print("freerouting_router_input_strategy = sibling_unrouted_coordinate_frame", flush=True)
+    return sibling
+
+
+def _load_selector_original_board(input_board_path: Path, router_source_board_path: Path) -> tuple[BoardData, BoardData | None]:
+    """Load selector baseline data and preserve shifted routed input geometry.
+
+    The selector must live in the same coordinate frame as the external router
+    output. When the user opened a translated routed reference board, keep the
+    selector board itself equal to the sibling unrouted board so routed tracks do
+    not change grid bounds. The shifted routed geometry is returned separately
+    as an original candidate source.
+    """
+    if input_board_path == router_source_board_path:
+        return load_board(input_board_path), None
+
+    source_board = load_board(router_source_board_path)
+    input_board = load_board(input_board_path)
+    dx, dy = _board_translation_from_common_pads(source_board=router_source_board_path, target_board=input_board_path)
+    translated_tracks = [
+        TrackSegment(
+            start=(track.start[0] - dx, track.start[1] - dy),
+            end=(track.end[0] - dx, track.end[1] - dy),
+            width=track.width,
+            layer=track.layer,
+            net_id=track.net_id,
+            net_name=track.net_name,
+        )
+        for track in input_board.tracks
+    ]
+    translated_vias = [
+        Via(
+            center=(via.center[0] - dx, via.center[1] - dy),
+            diameter=via.diameter,
+            net_id=via.net_id,
+            net_name=via.net_name,
+            start_layer=via.start_layer,
+            end_layer=via.end_layer,
+        )
+        for via in input_board.vias
+    ]
+    print(
+        "freerouting_original_candidate_translation_mm = "
+        f"dx={-dx:.6f} dy={-dy:.6f} tracks={len(translated_tracks)} vias={len(translated_vias)}",
+        flush=True,
+    )
+    translated_candidate_board = BoardData(
+        path=router_source_board_path,
+        nets=source_board.nets,
+        tracks=translated_tracks,
+        footprints=source_board.footprints,
+        vias=translated_vias,
+        backend=f"{source_board.backend}+translated-original",
+        design_rules=source_board.design_rules,
+        net_clearances=source_board.net_clearances,
+        declared_copper_layers=source_board.declared_copper_layers,
+        layer_aliases=source_board.layer_aliases,
+    )
+    return source_board, translated_candidate_board
+
+
+def _write_board_without_tracks_and_vias(board_path: Path, output_path: Path) -> None:
+    """Save a temporary board copy with all routed track/via items removed.
+
+    The input board is still loaded later as the selector's original board, so
+    existing routed geometry remains available as an "original" candidate. This
+    temporary copy is only used as freerouting's DSN/SES base board, matching
+    PcbRouter's behavior of routing from a cleared board. Some routed reference
+    boards omit Edge.Cuts, so missing outlines are recovered from a matching
+    sibling unrouted board and translated into this board's coordinate frame.
+    """
+    text = board_path.read_text(encoding="utf-8")
+    text = _remove_top_level_board_items(text, {"segment", "via"})
+    if not _extract_top_level_edge_cut_items(text):
+        sibling = _find_sibling_unrouted_board(board_path)
+        if sibling is None:
+            raise RuntimeError(
+                "freerouting input board has no Edge.Cuts, and no matching sibling "
+                f"unrouted board was found for outline recovery: {board_path}"
+            )
+        sibling_text = sibling.read_text(encoding="utf-8")
+        edge_cut_items = _extract_top_level_edge_cut_items(sibling_text)
+        if not edge_cut_items:
+            raise RuntimeError(
+                "freerouting input board has no Edge.Cuts, and the matching sibling "
+                f"board also has no Edge.Cuts: input={board_path} sibling={sibling}"
+            )
+        dx, dy = _board_translation_from_common_pads(source_board=sibling, target_board=board_path)
+        translated_edge_cut_items = [_translate_edge_cut_item(item, dx, dy) for item in edge_cut_items]
+        text = _insert_top_level_items_before_board_end(text, translated_edge_cut_items)
+        print(f"freerouting_edge_cuts_source = {sibling.resolve()}", flush=True)
+        print(f"freerouting_edge_cuts_translation_mm = dx={dx:.6f} dy={dy:.6f}", flush=True)
+        print("freerouting_input_strategy = translated_edge_cuts", flush=True)
+    # Keep the legacy general section consistent for tools that still read it.
+    text = re.sub(r"(?m)(^\s*\(tracks\s+)\d+(\)\s*$)", r"\g<1>0\2", text, count=1)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(text, encoding="utf-8")
+
+
+def _find_sibling_unrouted_board(board_path: Path) -> Path | None:
+    """Find a likely unrouted board next to a routed reference board."""
+    candidates: list[Path] = []
+    stem = board_path.stem
+    if stem.endswith(".routed"):
+        candidates.append(board_path.with_name(stem[: -len(".routed")] + ".unrouted" + board_path.suffix))
+    if ".routed." in stem:
+        # Paper/result files may be named like
+        # `bm2.unrouted.routed.ours.bestSolutionWithMerging.kicad_pcb`;
+        # the canonical external-router input is the prefix before `.routed`.
+        candidates.append(board_path.with_name(stem.split(".routed.", 1)[0] + board_path.suffix))
+    candidates.append(board_path.with_name(board_path.name.replace(".routed.", ".unrouted.")))
+
+    seen: set[Path] = set()
+    for candidate in candidates:
+        candidate = candidate.resolve()
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if candidate.exists() and candidate != board_path:
+            return candidate
+    return None
+
+
+def _extract_top_level_edge_cut_items(text: str) -> list[str]:
+    """Collect top-level KiCad drawing items on the Edge.Cuts layer."""
+    items: list[str] = []
+    for start, end, item_text in _top_level_form_ranges(text):
+        if _form_symbol(item_text) in {"gr_line", "gr_arc", "gr_circle", "gr_curve", "gr_poly", "gr_rect"}:
+            if re.search(r"\(layer\s+(?:\"Edge\.Cuts\"|Edge\.Cuts)\)", item_text):
+                items.append(text[start:end].rstrip())
+    return items
+
+
+def _insert_top_level_items_before_board_end(text: str, items: list[str]) -> str:
+    """Insert top-level board items immediately before the closing board paren."""
+    insert_at = len(text.rstrip()) - 1
+    if insert_at < 0 or text[insert_at] != ")":
+        raise RuntimeError("Could not find the closing KiCad board parenthesis for Edge.Cuts insertion.")
+    insertion = "\n" + "\n".join(items) + "\n"
+    return text[:insert_at] + insertion + text[insert_at:]
+
+
+def _top_level_form_ranges(text: str) -> list[tuple[int, int, str]]:
+    """Return ranges for forms directly under the `(kicad_pcb ...)` root."""
+    ranges: list[tuple[int, int, str]] = []
+    depth = 0
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char == '"':
+            index = _skip_quoted_string(text, index + 1)
+            continue
+        if char == "(":
+            if depth == 1:
+                end = _matching_paren_end(text, index)
+                if end is not None:
+                    ranges.append((index, end, text[index:end]))
+                    index = end
+                    continue
+            depth += 1
+        elif char == ")":
+            depth = max(0, depth - 1)
+        index += 1
+    return ranges
+
+
+def _form_symbol(form_text: str) -> str:
+    """Read the leading symbol from a KiCad S-expression form."""
+    match = re.match(r"\s*\(\s*([^\s\)]+)", form_text)
+    return match.group(1) if match else ""
+
+
+def _board_translation_from_common_pads(source_board: Path, target_board: Path) -> tuple[float, float]:
+    """Calculate a constant source-to-target board translation from common pads."""
+    source_pads = _pad_centers_by_key(load_board(source_board))
+    target_pads = _pad_centers_by_key(load_board(target_board))
+    common_keys = sorted(set(source_pads) & set(target_pads))
+    if len(common_keys) < 3:
+        raise RuntimeError(
+            "Could not recover Edge.Cuts from sibling board because too few "
+            f"common pads were found: source={source_board} target={target_board}"
+        )
+
+    offsets = [
+        (target_pads[key][0] - source_pads[key][0], target_pads[key][1] - source_pads[key][1])
+        for key in common_keys
+    ]
+    dx = _median(value[0] for value in offsets)
+    dy = _median(value[1] for value in offsets)
+    max_deviation = max(max(abs(item_dx - dx), abs(item_dy - dy)) for item_dx, item_dy in offsets)
+    if max_deviation > 0.01:
+        raise RuntimeError(
+            "Could not recover Edge.Cuts from sibling board because common pads "
+            f"are not a simple translation: max_deviation_mm={max_deviation:.6f} "
+            f"source={source_board} target={target_board}"
+        )
+    return dx, dy
+
+
+def _pad_centers_by_key(board: BoardData) -> dict[tuple[str, str], tuple[float, float]]:
+    """Index pad centers by footprint reference and pad name."""
+    centers: dict[tuple[str, str], tuple[float, float]] = {}
+    for footprint in board.footprints:
+        for pad in footprint.pads:
+            centers[(footprint.reference, pad.name)] = pad.center
+    return centers
+
+
+def _median(values: Iterable[float]) -> float:
+    """Return the median value for translation estimation."""
+    ordered = sorted(values)
+    if not ordered:
+        raise RuntimeError("Cannot calculate a median from an empty value list.")
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2.0
+
+
+_EDGE_CUT_POINT_RE = re.compile(
+    r"\((start|end|center|mid|xy)\s+([-+]?\d+(?:\.\d+)?)\s+([-+]?\d+(?:\.\d+)?)"
+)
+
+
+def _translate_edge_cut_item(item_text: str, dx: float, dy: float) -> str:
+    """Translate coordinate-bearing Edge.Cuts forms by a board-frame offset."""
+
+    def replace_point(match: re.Match[str]) -> str:
+        symbol = match.group(1)
+        x = float(match.group(2)) + dx
+        y = float(match.group(3)) + dy
+        return f"({symbol} {_format_mm(x)} {_format_mm(y)}"
+
+    return _EDGE_CUT_POINT_RE.sub(replace_point, item_text)
+
+
+def _format_mm(value: float) -> str:
+    """Format KiCad millimeter coordinates with stable compact precision."""
+    text = f"{value:.6f}".rstrip("0").rstrip(".")
+    return text if text and text != "-0" else "0"
+
+
+def _remove_top_level_board_items(text: str, item_names: set[str]) -> str:
+    """Remove top-level KiCad board forms whose symbol is in item_names.
+
+    Tracks and vias are top-level `(segment ...)` / `(via ...)` forms in KiCad
+    PCB files. Footprint-local graphics remain untouched because they are nested
+    deeper than the board root.
+    """
+    ranges: list[tuple[int, int]] = []
+    depth = 0
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char == '"':
+            index = _skip_quoted_string(text, index + 1)
+            continue
+        if char == "(":
+            if depth == 1:
+                symbol = _sexpr_symbol_at(text, index + 1)
+                if symbol in item_names:
+                    end = _matching_paren_end(text, index)
+                    if end is not None:
+                        ranges.append((index, end))
+                        index = end
+                        continue
+            depth += 1
+        elif char == ")":
+            depth = max(0, depth - 1)
+        index += 1
+
+    if not ranges:
+        return text
+    pieces: list[str] = []
+    previous = 0
+    for start, end in ranges:
+        pieces.append(text[previous:start])
+        previous = end
+    pieces.append(text[previous:])
+    return "".join(pieces)
+
+
+def _skip_quoted_string(text: str, index: int) -> int:
+    """Return the first index after a quoted KiCad string."""
+    escaped = False
+    while index < len(text):
+        char = text[index]
+        if char == '"' and not escaped:
+            return index + 1
+        escaped = char == "\\" and not escaped
+        if char != "\\":
+            escaped = False
+        index += 1
+    return len(text)
+
+
+def _sexpr_symbol_at(text: str, index: int) -> str:
+    """Read the first S-expression symbol after an opening parenthesis."""
+    while index < len(text) and text[index].isspace():
+        index += 1
+    start = index
+    while index < len(text) and not text[index].isspace() and text[index] not in "()":
+        index += 1
+    return text[start:index]
+
+
+def _matching_paren_end(text: str, start: int) -> int | None:
+    """Return the exclusive end offset of the S-expression at start."""
+    depth = 0
+    index = start
+    while index < len(text):
+        char = text[index]
+        if char == '"':
+            index = _skip_quoted_string(text, index + 1)
+            continue
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                end = index + 1
+                while end < len(text) and text[end] in " \t\r\n":
+                    end += 1
+                return end
+        index += 1
+    return None
+
+
 def _force_dsn_snap_angle_fortyfive(dsn_path: Path) -> None:
     if not dsn_path.exists():
         raise RuntimeError(f"DSN file was not found for snap-angle patch: {dsn_path}")
@@ -301,7 +674,31 @@ def _force_dsn_snap_angle_fortyfive(dsn_path: Path) -> None:
     dsn_path.write_text(patched_text, encoding="utf-8")
 
 
+def _sanitize_ses_for_kicad_import(ses_path: Path) -> int:
+    """Remove SES placement blocks that KiCad's importer rejects.
+
+    Freerouting may emit an empty component-name block for mounting-hole style
+    items, for example ``(component`` followed directly by ``(place @HOLE0 ...)``.
+    KiCad's SES importer returns False on that block even though it does not
+    carry routed copper.  Removing only these empty component blocks preserves
+    all routed network data while allowing the imported board to be created.
+    """
+    text = ses_path.read_text(encoding="utf-8", errors="replace")
+    empty_component_pattern = re.compile(
+        r"(?ms)^[ \t]*\(component[ \t]*\r?\n"
+        r"(?:[ \t]*\(place[^\r\n]*\)[ \t]*\r?\n)+"
+        r"[ \t]*\)[ \t]*(?:\r?\n)?"
+    )
+    sanitized_text, removed_count = empty_component_pattern.subn("", text)
+    if removed_count > 0:
+        ses_path.write_text(sanitized_text, encoding="utf-8")
+    return removed_count
+
+
 def _import_ses(board_path: Path, ses_path: Path, routed_board_path: Path) -> None:
+    removed_empty_components = _sanitize_ses_for_kicad_import(ses_path)
+    if removed_empty_components:
+        print(f"freerouting_ses_empty_component_blocks_removed = {removed_empty_components}")
     board = pcbnew.LoadBoard(str(board_path))
     if board is None:
         raise RuntimeError(f"pcbnew failed to load board for SES import: {board_path}")

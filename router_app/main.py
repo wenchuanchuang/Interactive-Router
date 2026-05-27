@@ -12,10 +12,11 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("board", nargs="?")
     parser.add_argument("--freerouting-full", action="store_true")
+    parser.add_argument("--pcb-router", action="store_true")
     args = parser.parse_args(sys.argv[1:])
 
     app = QApplication([sys.argv[0]])
-    window = MainWindow(args.board, freerouting_full=args.freerouting_full)
+    window = MainWindow(args.board, freerouting_full=args.freerouting_full, pcb_router=args.pcb_router)
     window.show()
     return app.exec_()
 
