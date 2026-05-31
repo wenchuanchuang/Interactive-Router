@@ -185,6 +185,8 @@ struct NetCandidateSet {
     std::vector<std::vector<GridPoint>> candidate_paths_grid;
     std::vector<std::vector<Point2D>> candidate_paths_mm;
     std::vector<int> candidate_via_counts;
+    std::vector<int> candidate_bend_counts;
+    std::vector<double> candidate_lengths_mm;
     std::vector<std::vector<GridPoint>> candidate_boundary_vertices;
     std::vector<std::vector<GridPoint>> candidate_cover_vertices;
     std::vector<std::vector<GridPoint>> candidate_terminal_coords;

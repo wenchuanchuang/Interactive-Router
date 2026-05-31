@@ -86,16 +86,22 @@ def select_reroute_candidates(
         candidate_paths_grid: list[list[Any]]
         candidate_paths_mm: list[list[Any]]
         candidate_via_counts: list[int]
+        candidate_bend_counts: list[int]
+        candidate_lengths_mm: list[float]
         candidate_cover_vertices: list[list[Any]]
         if outcome.selector_external_only:
             candidate_paths_grid = []
             candidate_paths_mm = []
             candidate_via_counts = []
+            candidate_bend_counts = []
+            candidate_lengths_mm = []
             candidate_cover_vertices = []
         else:
             candidate_paths_grid = list(getattr(result, "candidate_paths_grid", []))
             candidate_paths_mm = list(getattr(result, "candidate_paths_mm", []))
             candidate_via_counts = list(getattr(result, "candidate_via_counts", []))
+            candidate_bend_counts = list(getattr(result, "candidate_bend_counts", []))
+            candidate_lengths_mm = list(getattr(result, "candidate_lengths_mm", []))
             candidate_cover_vertices = list(getattr(result, "candidate_cover_vertices", []))
         boundary_payload = list(exported_boundary_by_net.get(item.net_id, []))
         candidate_preview_items: list[Any] = []
@@ -172,6 +178,27 @@ def select_reroute_candidates(
             item.candidate_terminal_groups,
             item.candidate_terminal_coords,
         )
+        candidate_lengths_mm = _candidate_lengths_for_selector(
+            candidate_paths_mm,
+            candidate_preview_items,
+            len(item.candidate_boundary_vertices),
+        )
+        candidate_bend_counts = _candidate_bend_counts_for_selector(
+            router_core=router_core,
+            board=selector_board,
+            result=result,
+            candidate_paths_grid=candidate_paths_grid,
+            candidate_preview_items=candidate_preview_items,
+            candidate_terminal_groups=item.candidate_terminal_groups,
+            candidate_count=len(item.candidate_boundary_vertices),
+        )
+        item.candidate_lengths_mm = candidate_lengths_mm
+        item.candidate_bend_counts = candidate_bend_counts
+        try:
+            setattr(result, "candidate_lengths_mm", candidate_lengths_mm)
+            setattr(result, "candidate_bend_counts", candidate_bend_counts)
+        except Exception:
+            pass
         normalize_elapsed = perf_counter() - normalize_started_at
         net_elapsed = perf_counter() - net_started_at
         candidate_prep_total += net_elapsed
@@ -265,10 +292,12 @@ def select_reroute_candidates(
         route_result = result_by_net.get(int(selection.net_id))
         preview_items = list(getattr(route_result, "candidate_preview_items", [])) if route_result is not None else []
         via_counts = list(getattr(route_result, "candidate_via_counts", [])) if route_result is not None else []
+        bend_counts = list(getattr(route_result, "candidate_bend_counts", [])) if route_result is not None else []
         for raw_index in selection.selected_candidate_indices:
             selected_index = int(raw_index)
             preview = preview_items[selected_index] if 0 <= selected_index < len(preview_items) else None
             via_count = via_counts[selected_index] if 0 <= selected_index < len(via_counts) else None
+            bend_count = bend_counts[selected_index] if 0 <= selected_index < len(bend_counts) else None
             source = str(getattr(preview, "source", "unknown")) if preview is not None else "unknown"
             if gurobi_solution_selected:
                 # Count selected candidates by external router family for terminal diagnostics.
@@ -278,6 +307,7 @@ def select_reroute_candidates(
             extra = f" occurrence_index={occurrence_index}" if occurrence_index > 0 else ""
             source_net_extra = f" source_net_id={source_net_id}"
             via_text = str(via_count) if via_count is not None else "unknown"
+            bend_text = str(bend_count) if bend_count is not None else "unknown"
             print(
                 "selector_selected_candidate "
                 f"net={selection.net_id} "
@@ -285,7 +315,8 @@ def select_reroute_candidates(
                 f"source={source}"
                 f"{extra}"
                 f"{source_net_extra} "
-                f"via_count={via_text}",
+                f"via_count={via_text} "
+                f"bend_count={bend_text}",
                 flush=True,
             )
     if gurobi_solution_selected:
@@ -357,6 +388,8 @@ def _candidate_slot_count(item: Any) -> int:
         len(getattr(item, "candidate_paths_grid", [])),
         len(getattr(item, "candidate_paths_mm", [])),
         len(getattr(item, "candidate_via_counts", [])),
+        len(getattr(item, "candidate_bend_counts", [])),
+        len(getattr(item, "candidate_lengths_mm", [])),
         len(getattr(item, "candidate_boundary_vertices", [])),
         len(getattr(item, "candidate_cover_vertices", [])),
         len(getattr(item, "candidate_terminal_coords", [])),
@@ -372,6 +405,192 @@ def _selected_external_router_source_bucket(source: str) -> str:
     if "pcbrouter" in normalized:
         return "pcbrouter"
     return "other"
+
+
+def _candidate_lengths_for_selector(
+    candidate_paths_mm: list[list[Any]],
+    candidate_preview_items: list[Any],
+    candidate_count: int,
+) -> list[float]:
+    """Return one physical wire-length coefficient for each selector candidate."""
+    lengths: list[float] = []
+    external_offset = len(candidate_paths_mm)
+    for candidate_idx in range(candidate_count):
+        if candidate_idx < len(candidate_paths_mm):
+            lengths.append(_path_length_mm(candidate_paths_mm[candidate_idx]))
+            continue
+        preview_idx = candidate_idx - external_offset
+        preview = candidate_preview_items[preview_idx] if 0 <= preview_idx < len(candidate_preview_items) else None
+        lengths.append(_preview_wire_length_mm(preview))
+    return lengths
+
+
+def _candidate_bend_counts_for_selector(
+    router_core: Any,
+    board: BoardData | None,
+    result: Any,
+    candidate_paths_grid: list[list[Any]],
+    candidate_preview_items: list[Any],
+    candidate_terminal_groups: list[list[list[Any]]],
+    candidate_count: int,
+) -> list[int]:
+    """Return pad-aware bend-count coefficients for each selector candidate.
+
+    Bends inside terminal pad areas are ignored because those local access
+    wiggles are pad-contact artifacts rather than meaningful routing turns.
+    """
+    bend_counts: list[int] = []
+    external_offset = len(candidate_paths_grid)
+    for candidate_idx in range(candidate_count):
+        terminal_groups = (
+            candidate_terminal_groups[candidate_idx]
+            if candidate_idx < len(candidate_terminal_groups)
+            else []
+        )
+        pad_boxes = _terminal_group_grid_boxes(terminal_groups)
+        if candidate_idx < len(candidate_paths_grid) and candidate_paths_grid[candidate_idx]:
+            bend_counts.append(_grid_path_bend_count_outside_pads(candidate_paths_grid[candidate_idx], pad_boxes))
+            continue
+        preview_idx = candidate_idx - external_offset
+        preview = candidate_preview_items[preview_idx] if 0 <= preview_idx < len(candidate_preview_items) else None
+        bend_counts.append(_preview_bend_count_outside_pads(router_core, board, result, preview, pad_boxes))
+    return bend_counts
+
+
+def _path_length_mm(path_mm: list[Any]) -> float:
+    """Measure a polyline in millimeters using only its XY distance."""
+    total = 0.0
+    for start, end in zip(path_mm, path_mm[1:]):
+        sx = float(getattr(start, "x", 0.0))
+        sy = float(getattr(start, "y", 0.0))
+        ex = float(getattr(end, "x", 0.0))
+        ey = float(getattr(end, "y", 0.0))
+        total += math.hypot(ex - sx, ey - sy)
+    return total
+
+
+def _preview_wire_length_mm(preview: Any | None) -> float:
+    """Measure external-router preview segments in millimeters."""
+    total = 0.0
+    for segment in list(getattr(preview, "segments", []) or []):
+        start = tuple(getattr(segment, "start", (0.0, 0.0)))
+        end = tuple(getattr(segment, "end", (0.0, 0.0)))
+        if len(start) < 2 or len(end) < 2:
+            continue
+        total += math.hypot(float(end[0]) - float(start[0]), float(end[1]) - float(start[1]))
+    return total
+
+
+def _terminal_group_grid_boxes(
+    terminal_groups: list[list[Any]],
+) -> list[tuple[int, int, int, int, set[int]]]:
+    """Build coarse grid-space pad boxes from terminal group vertices."""
+    boxes: list[tuple[int, int, int, int, set[int]]] = []
+    for group in terminal_groups:
+        vertices = [_grid_point_to_vertex_tuple(point) for point in group]
+        if not vertices:
+            continue
+        xs = [vertex[0] for vertex in vertices]
+        ys = [vertex[1] for vertex in vertices]
+        zs = {vertex[2] for vertex in vertices}
+        boxes.append((min(xs), max(xs), min(ys), max(ys), zs))
+    return boxes
+
+
+def _grid_vertex_inside_pad_box(
+    vertex: tuple[int, int, int],
+    pad_boxes: list[tuple[int, int, int, int, set[int]]],
+) -> bool:
+    """Return true when a grid vertex lies inside a terminal pad box."""
+    x, y, z = vertex
+    for min_x, max_x, min_y, max_y, layers in pad_boxes:
+        if z in layers and min_x <= x <= max_x and min_y <= y <= max_y:
+            return True
+    return False
+
+
+def _normalized_grid_axis(
+    start: tuple[int, int, int],
+    end: tuple[int, int, int],
+) -> tuple[int, int] | None:
+    """Return an orientation-only XY direction for bend comparisons."""
+    dx = int(end[0]) - int(start[0])
+    dy = int(end[1]) - int(start[1])
+    if dx == 0 and dy == 0:
+        return None
+    divisor = math.gcd(abs(dx), abs(dy)) or 1
+    nx = dx // divisor
+    ny = dy // divisor
+    if nx < 0 or (nx == 0 and ny < 0):
+        nx = -nx
+        ny = -ny
+    return nx, ny
+
+
+def _grid_path_bend_count_outside_pads(
+    path_grid: list[Any],
+    pad_boxes: list[tuple[int, int, int, int, set[int]]],
+) -> int:
+    """Count ordered path bends while resetting direction inside terminal pads."""
+    vertices: list[tuple[int, int, int]] = []
+    for point in path_grid:
+        vertex = _grid_point_to_vertex_tuple(point)
+        if not vertices or vertices[-1] != vertex:
+            vertices.append(vertex)
+
+    bend_count = 0
+    previous_axis: tuple[int, int] | None = None
+    for start, end in zip(vertices, vertices[1:]):
+        axis = _normalized_grid_axis(start, end)
+        if axis is None:
+            continue
+        if _grid_vertex_inside_pad_box(start, pad_boxes) or _grid_vertex_inside_pad_box(end, pad_boxes):
+            previous_axis = None if _grid_vertex_inside_pad_box(end, pad_boxes) else axis
+            continue
+        if previous_axis is not None and previous_axis != axis:
+            bend_count += 1
+        previous_axis = axis
+    return bend_count
+
+
+def _preview_bend_count_outside_pads(
+    router_core: Any,
+    board: BoardData | None,
+    result: Any,
+    preview: Any | None,
+    pad_boxes: list[tuple[int, int, int, int, set[int]]],
+) -> int:
+    """Count bends in an unordered external-router segment graph."""
+    if board is None or preview is None:
+        return 0
+    adjacency: dict[tuple[int, int, int], set[tuple[int, int, int]]] = {}
+    for segment in list(getattr(preview, "segments", []) or []):
+        layer_name = str(getattr(segment, "layer", "F.Cu") or "F.Cu")
+        layer_index = _layer_index_from_name(board, layer_name) or 0
+        start = tuple(getattr(segment, "start", (0.0, 0.0)))
+        end = tuple(getattr(segment, "end", (0.0, 0.0)))
+        if len(start) < 2 or len(end) < 2:
+            continue
+        start_vertex = _mm_to_grid_vertex(result, float(start[0]), float(start[1]), layer_index)
+        end_vertex = _mm_to_grid_vertex(result, float(end[0]), float(end[1]), layer_index)
+        if start_vertex == end_vertex:
+            continue
+        adjacency.setdefault(start_vertex, set()).add(end_vertex)
+        adjacency.setdefault(end_vertex, set()).add(start_vertex)
+
+    bend_count = 0
+    for vertex, neighbors in adjacency.items():
+        if _grid_vertex_inside_pad_box(vertex, pad_boxes):
+            continue
+        axes = {
+            axis
+            for neighbor in neighbors
+            for axis in [_normalized_grid_axis(vertex, neighbor)]
+            if axis is not None
+        }
+        if len(axes) > 1:
+            bend_count += len(axes) - 1
+    return bend_count
 
 
 def _freerouting_final_board_from_results(results: list[Any] | None) -> BoardData | None:

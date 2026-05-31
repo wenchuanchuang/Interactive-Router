@@ -188,6 +188,8 @@ PYBIND11_MODULE(router_core, m) {
         .def_readwrite("candidate_paths_grid", &NetCandidateSet::candidate_paths_grid)
         .def_readwrite("candidate_paths_mm", &NetCandidateSet::candidate_paths_mm)
         .def_readwrite("candidate_via_counts", &NetCandidateSet::candidate_via_counts)
+        .def_readwrite("candidate_bend_counts", &NetCandidateSet::candidate_bend_counts)
+        .def_readwrite("candidate_lengths_mm", &NetCandidateSet::candidate_lengths_mm)
         .def_readwrite("candidate_boundary_vertices", &NetCandidateSet::candidate_boundary_vertices)
         .def_readwrite("candidate_cover_vertices", &NetCandidateSet::candidate_cover_vertices)
         .def_readwrite("candidate_terminal_coords", &NetCandidateSet::candidate_terminal_coords)
