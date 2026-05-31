@@ -58,6 +58,7 @@ constexpr std::uint64_t kPackedZMask = (1ULL << kPackedZBits) - 1ULL;
 struct CandidateRecord {
     int candidate_index = -1;
     int via_count = 0;
+    int bend_count = 0;
     double length_mm = 0.0;
     std::vector<PackedVertexId> occupied_vertices;
     std::vector<PackedVertexId> cover_vertices;
@@ -125,6 +126,8 @@ std::size_t candidateCount(const NetCandidateSet& net) {
         net.candidate_paths_grid.size(),
         net.candidate_paths_mm.size(),
         net.candidate_via_counts.size(),
+        net.candidate_bend_counts.size(),
+        net.candidate_lengths_mm.size(),
         net.candidate_boundary_vertices.size(),
         net.candidate_cover_vertices.size(),
         net.candidate_terminal_coords.size(),
@@ -247,6 +250,28 @@ SelectionResult fallbackShortestSelection(const SelectionRequest& request, const
             if (via_a != via_b) {
                 return via_a < via_b;
             }
+            int bend_a = static_cast<std::size_t>(a) < net.candidate_bend_counts.size()
+                ? net.candidate_bend_counts[static_cast<std::size_t>(a)]
+                : 0;
+            int bend_b = static_cast<std::size_t>(b) < net.candidate_bend_counts.size()
+                ? net.candidate_bend_counts[static_cast<std::size_t>(b)]
+                : 0;
+            if (bend_a != bend_b) {
+                return bend_a < bend_b;
+            }
+            double length_a = static_cast<std::size_t>(a) < net.candidate_lengths_mm.size()
+                ? net.candidate_lengths_mm[static_cast<std::size_t>(a)]
+                : static_cast<std::size_t>(a) < net.candidate_paths_mm.size()
+                ? pathLengthMm(net.candidate_paths_mm[static_cast<std::size_t>(a)])
+                : 0.0;
+            double length_b = static_cast<std::size_t>(b) < net.candidate_lengths_mm.size()
+                ? net.candidate_lengths_mm[static_cast<std::size_t>(b)]
+                : static_cast<std::size_t>(b) < net.candidate_paths_mm.size()
+                ? pathLengthMm(net.candidate_paths_mm[static_cast<std::size_t>(b)])
+                : 0.0;
+            if (length_a != length_b) {
+                return length_a < length_b;
+            }
             std::size_t boundary_a = static_cast<std::size_t>(a) < net.candidate_boundary_vertices.size()
                 ? net.candidate_boundary_vertices[static_cast<std::size_t>(a)].size()
                 : 0u;
@@ -292,7 +317,17 @@ std::vector<NetRecord> buildNetRecords(const SelectionRequest& request, bool* tr
             candidate.via_count = candidate_idx < net.candidate_via_counts.size()
                 ? net.candidate_via_counts[candidate_idx]
                 : 0;
-            candidate.length_mm = 0.0;
+            candidate.bend_count = candidate_idx < net.candidate_bend_counts.size()
+                ? net.candidate_bend_counts[candidate_idx]
+                : 0;
+            // Store the physical path length for the final lexicographic
+            // objective. Explicit lengths cover external-router candidates
+            // that are represented by primitives instead of ordered paths.
+            candidate.length_mm = candidate_idx < net.candidate_lengths_mm.size()
+                ? net.candidate_lengths_mm[candidate_idx]
+                : candidate_idx < net.candidate_paths_mm.size()
+                ? pathLengthMm(net.candidate_paths_mm[candidate_idx])
+                : 0.0;
 
             if (candidate_idx < net.candidate_boundary_vertices.size() &&
                 !net.candidate_boundary_vertices[candidate_idx].empty()) {
@@ -349,6 +384,12 @@ std::vector<NetRecord> buildNetRecords(const SelectionRequest& request, bool* tr
         std::sort(candidates.begin(), candidates.end(), [](const CandidateRecord& a, const CandidateRecord& b) {
             if (a.via_count != b.via_count) {
                 return a.via_count < b.via_count;
+            }
+            if (a.bend_count != b.bend_count) {
+                return a.bend_count < b.bend_count;
+            }
+            if (a.length_mm != b.length_mm) {
+                return a.length_mm < b.length_mm;
             }
             if (a.occupied_vertices.size() != b.occupied_vertices.size()) {
                 return a.occupied_vertices.size() < b.occupied_vertices.size();
@@ -533,12 +574,12 @@ SelectionResult solveWithGurobi(const SelectionRequest& request, const std::vect
     // allow several partial candidates as long as each pad is covered and each
     // candidate group contributes at most one selected path.
     // Shared non-terminal vertices remain mutually exclusive across different nets.
-    // Objective: minimize via_count * pathChoice.
+    // Objective: lexicographically minimize via count, bend count, then wire length.
     GRBEnv env = GRBEnv();
     GRBModel model = GRBModel(env);
 
     model.set(GRB_IntParam_Threads, 20);
-    model.set(GRB_DoubleParam_MIPGap, 0.01);
+    //model.set(GRB_DoubleParam_MIPGap, 0.01);
     model.set(GRB_IntParam_LazyConstraints, 1);
 
     std::vector<std::vector<GRBVar>> path_choice;
@@ -885,13 +926,20 @@ SelectionResult solveWithGurobi(const SelectionRequest& request, const std::vect
         }
     }
 
-    GRBLinExpr obj = 0.0;
+    GRBLinExpr via_obj = 0.0;
+    GRBLinExpr bend_obj = 0.0;
+    GRBLinExpr length_obj = 0.0;
     for (std::size_t g = 0; g < records.size(); ++g) {
         for (std::size_t p = 0; p < records[g].candidates.size(); ++p) {
-            obj += static_cast<double>(records[g].candidates[p].via_count) * path_choice[g][p];
+            via_obj += static_cast<double>(records[g].candidates[p].via_count) * path_choice[g][p];
+            bend_obj += static_cast<double>(records[g].candidates[p].bend_count) * path_choice[g][p];
+            length_obj += records[g].candidates[p].length_mm * path_choice[g][p];
         }
     }
-    model.setObjective(obj, GRB_MINIMIZE);
+    model.set(GRB_IntAttr_ModelSense, GRB_MINIMIZE);
+    model.setObjectiveN(via_obj, 0, 3, 1.0, 0.0, 0.0, "MinViaCount");
+    model.setObjectiveN(bend_obj, 1, 2, 1.0, 0.0, 0.0, "MinBendCount");
+    model.setObjectiveN(length_obj, 2, 1, 1.0, 0.0, 0.0, "MinWireLengthMm");
     GroupConnectivityLazyCallback connectivity_callback(multi_group_net, group_choice, group_edge_vars);
     model.setCallback(&connectivity_callback);
     model.optimize();
@@ -900,14 +948,14 @@ SelectionResult solveWithGurobi(const SelectionRequest& request, const std::vect
     if (status == GRB_INFEASIBLE) {
         SelectionResult fail;
         fail.ok = false;
-        fail.solver = "gurobi-cpp-via-min";
+        fail.solver = "gurobi-cpp-via-bend-length-lex";
         fail.message = "Gurobi model is infeasible.";
         return fail;
     }
     if (status != GRB_OPTIMAL && status != GRB_SUBOPTIMAL && status != GRB_TIME_LIMIT && status != GRB_INTERRUPTED) {
         SelectionResult fail;
         fail.ok = false;
-        fail.solver = "gurobi-cpp-via-min";
+        fail.solver = "gurobi-cpp-via-bend-length-lex";
         fail.message = "Gurobi solve failed with status " + std::to_string(status) + ".";
         return fail;
     }
@@ -931,14 +979,25 @@ SelectionResult solveWithGurobi(const SelectionRequest& request, const std::vect
         }
     }
 
-    const double objective = model.get(GRB_DoubleAttr_ObjVal);
+    model.set(GRB_IntParam_ObjNumber, 0);
+    const double via_objective = model.get(GRB_DoubleAttr_ObjNVal);
+    model.set(GRB_IntParam_ObjNumber, 1);
+    const double bend_objective = model.get(GRB_DoubleAttr_ObjNVal);
+    model.set(GRB_IntParam_ObjNumber, 2);
+    const double length_objective = model.get(GRB_DoubleAttr_ObjNVal);
+    std::cout
+        << "selector_gurobi_objective_mode = lexicographic(via_count, bend_count, wire_length_mm)" << '\n'
+        << "selector_gurobi_objective_via_count = " << via_objective << '\n'
+        << "selector_gurobi_objective_bend_count = " << bend_objective << '\n'
+        << "selector_gurobi_objective_wire_length_mm = " << length_objective
+        << std::endl;
     return buildSelectionResultFromChoice(
         request,
         records,
         chosen,
-        "gurobi-cpp-via-min",
-        objective,
-        "Solved by Gurobi with terminal/collision constraints and via-min objective."
+        "gurobi-cpp-via-bend-length-lex",
+        via_objective,
+        "Solved by Gurobi with terminal/collision constraints and lexicographic via-count/bend-count/wire-length objective."
     );
 }
 #endif
@@ -990,7 +1049,7 @@ SelectionResult selectCandidatePaths(const SelectionRequest& request) {
             if (!request.allow_fallback) {
                 SelectionResult fail;
                 fail.ok = false;
-                fail.solver = "gurobi-cpp-via-min";
+                fail.solver = "gurobi-cpp-via-bend-length-lex";
                 fail.message = "Gurobi exception: " + ex.getMessage();
                 return fail;
             }
@@ -1002,7 +1061,7 @@ SelectionResult selectCandidatePaths(const SelectionRequest& request) {
             if (!request.allow_fallback) {
                 SelectionResult fail;
                 fail.ok = false;
-                fail.solver = "gurobi-cpp-via-min";
+                fail.solver = "gurobi-cpp-via-bend-length-lex";
                 fail.message = "Unknown Gurobi exception.";
                 return fail;
             }
