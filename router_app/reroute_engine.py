@@ -327,6 +327,8 @@ def select_reroute_candidates(
             f"other:{selected_source_counts['other']}",
             flush=True,
         )
+        for line in _selected_topology_diagnostics(selector_board, outcome.result, selections):
+            print(line, flush=True)
 
     # Report the board currently shown in the top-left canvas when the GUI
     # supplies one. This keeps selector statistics comparable to the visible
@@ -405,6 +407,441 @@ def _selected_external_router_source_bucket(source: str) -> str:
     if "pcbrouter" in normalized:
         return "pcbrouter"
     return "other"
+
+
+class _TopologyUnionFind:
+    """Track electrical connected components for selected candidate geometry."""
+
+    def __init__(self) -> None:
+        self.parent: dict[Any, Any] = {}
+
+    def add(self, node: Any) -> None:
+        """Register a graph node without changing any existing component."""
+        if node not in self.parent:
+            self.parent[node] = node
+
+    def find(self, node: Any) -> Any:
+        """Return a stable representative for the node component."""
+        self.add(node)
+        parent = self.parent[node]
+        if parent != node:
+            self.parent[node] = self.find(parent)
+        return self.parent[node]
+
+    def union(self, left: Any, right: Any) -> None:
+        """Merge two nodes into the same electrical component."""
+        left_root = self.find(left)
+        right_root = self.find(right)
+        if left_root != right_root:
+            self.parent[right_root] = left_root
+
+
+def _selected_topology_diagnostics(
+    board: BoardData | None,
+    results: list[Any] | None,
+    selections: list[PyNetSelection],
+) -> list[str]:
+    """Report post-selection net topology without changing the Gurobi model.
+
+    The check builds an electrical graph from the selected preview geometry and
+    then groups pads by connected component. Power-like nets receive a heuristic
+    source/outlet role check; ordinary signal nets are reported as role-unknown
+    because KiCad does not normally encode driver/receiver semantics.
+    """
+    if board is None or not results or not selections:
+        return []
+
+    result_by_net = {int(getattr(result, "net_id", 0)): result for result in results}
+    checked_nets = 0
+    split_pin_group_nets = 0
+    source_exit_warning_nets = 0
+    unknown_role_nets = 0
+    padless_component_total = 0
+    detail_lines: list[str] = []
+
+    for selection in selections:
+        net_id = int(selection.net_id)
+        route_result = result_by_net.get(net_id)
+        if route_result is None or not selection.selected_candidate_indices:
+            continue
+        preview_items = list(getattr(route_result, "candidate_preview_items", []))
+        selected_previews = [
+            preview_items[int(index)]
+            for index in selection.selected_candidate_indices
+            if 0 <= int(index) < len(preview_items)
+        ]
+        if not selected_previews:
+            continue
+
+        pad_entries = _topology_pad_entries(board, net_id)
+        # Skip small nets: two- and three-pin nets cannot express the multi-source
+        # topology ambiguity this diagnostic is meant to catch.
+        if len(pad_entries) <= 3:
+            continue
+
+        checked_nets += 1
+        net_name = board.nets.get(net_id, str(getattr(selected_previews[0], "net_name", "")))
+        components, padless_components = _selected_net_pin_components(
+            board,
+            net_id,
+            pad_entries,
+            selected_previews,
+        )
+        padless_component_total += padless_components
+        pin_components = [component for component in components if component["pads"]]
+        if len(pin_components) < 2 and padless_components <= 0:
+            continue
+
+        split_pin_group_nets += 1 if len(pin_components) >= 2 else 0
+        policy = _net_topology_role_policy(net_name)
+        status = "ok"
+        if policy == "signal_unknown":
+            status = "unknown_signal_roles"
+            unknown_role_nets += 1
+        else:
+            role_warning = any(
+                not component["source_hints"] or not component["outlet_hints"]
+                for component in pin_components
+            )
+            if role_warning:
+                status = "missing_source_or_outlet_hint"
+                source_exit_warning_nets += 1
+
+        details = "; ".join(
+            _format_topology_component(index, component)
+            for index, component in enumerate(pin_components[:6])
+        )
+        if len(pin_components) > 6:
+            details += f"; omitted_components={len(pin_components) - 6}"
+        if padless_components:
+            details = (details + "; " if details else "") + f"padless_copper_components={padless_components}"
+        detail_lines.append(
+            "selector_topology_net "
+            f"net={net_id} "
+            f"net_name={net_name!r} "
+            f"pin_count={len(pad_entries)} "
+            f"pin_groups={len(pin_components)} "
+            f"source_policy={policy} "
+            f"status={status} "
+            f"components={details or '(none)'}"
+        )
+
+    lines = [
+        "selector_topology_summary "
+        f"checked_nets={checked_nets} "
+        f"split_pin_group_nets={split_pin_group_nets} "
+        f"source_exit_warning_nets={source_exit_warning_nets} "
+        f"unknown_role_nets={unknown_role_nets} "
+        f"padless_copper_components={padless_component_total}"
+    ]
+    lines.extend(detail_lines[:40])
+    if len(detail_lines) > 40:
+        lines.append(f"selector_topology_omitted_net_count = {len(detail_lines) - 40}")
+    return lines
+
+
+def _selected_net_pin_components(
+    board: BoardData,
+    net_id: int,
+    pad_entries: list[tuple[str, str, str, Any]],
+    selected_previews: list[Any],
+) -> tuple[list[dict[str, Any]], int]:
+    """Build selected-route components and list pads contained by each one."""
+    union_find = _TopologyUnionFind()
+    segment_entries: list[dict[str, Any]] = []
+    via_entries: list[dict[str, Any]] = []
+
+    for label, _reference, _pad_name, _pad in pad_entries:
+        union_find.add(("pad", label))
+
+    for preview_index, preview in enumerate(selected_previews):
+        for segment_index, segment in enumerate(list(getattr(preview, "segments", []) or [])):
+            start = tuple(getattr(segment, "start", (0.0, 0.0)))
+            end = tuple(getattr(segment, "end", (0.0, 0.0)))
+            if len(start) < 2 or len(end) < 2:
+                continue
+            layer_index = _layer_index_from_name(board, str(getattr(segment, "layer", "F.Cu") or "F.Cu"))
+            if layer_index is None:
+                continue
+            start_node = ("xy", layer_index, *_topology_xy_key(float(start[0]), float(start[1])))
+            end_node = ("xy", layer_index, *_topology_xy_key(float(end[0]), float(end[1])))
+            union_find.union(start_node, end_node)
+            segment_entries.append(
+                {
+                    "start": (float(start[0]), float(start[1])),
+                    "end": (float(end[0]), float(end[1])),
+                    "layer": layer_index,
+                    "width": float(getattr(segment, "width", 0.0) or 0.0),
+                    "node": start_node,
+                    "preview_index": preview_index,
+                    "segment_index": segment_index,
+                }
+            )
+
+        for via in list(getattr(preview, "vias", []) or []):
+            center = tuple(getattr(via, "center", (0.0, 0.0)))
+            if len(center) < 2:
+                continue
+            start_layer = _layer_index_from_name(board, str(getattr(via, "start_layer", "F.Cu") or "F.Cu"))
+            end_layer = _layer_index_from_name(board, str(getattr(via, "end_layer", "B.Cu") or "B.Cu"))
+            if start_layer is None or end_layer is None:
+                continue
+            low_layer, high_layer = sorted((start_layer, end_layer))
+            previous_node = None
+            via_nodes = []
+            for layer_index in range(low_layer, high_layer + 1):
+                node = ("xy", layer_index, *_topology_xy_key(float(center[0]), float(center[1])))
+                union_find.add(node)
+                via_nodes.append((layer_index, node))
+                if previous_node is not None:
+                    union_find.union(previous_node, node)
+                previous_node = node
+            via_entries.append(
+                {
+                    "center": (float(center[0]), float(center[1])),
+                    "diameter": float(getattr(via, "diameter", 0.0) or 0.0),
+                    "nodes": via_nodes,
+                }
+            )
+
+    _connect_overlapping_topology_segments(union_find, segment_entries)
+    _connect_vias_to_topology_segments(union_find, via_entries, segment_entries)
+    _connect_pads_to_topology_geometry(union_find, board, pad_entries, segment_entries, via_entries)
+
+    components_by_root: dict[Any, dict[str, Any]] = {}
+    for label, reference, pad_name, pad in pad_entries:
+        root = union_find.find(("pad", label))
+        component = components_by_root.setdefault(root, {"pads": [], "source_hints": [], "outlet_hints": []})
+        component["pads"].append(label)
+        if _pad_has_source_hint(board.nets.get(net_id, ""), reference, pad_name):
+            component["source_hints"].append(label)
+        else:
+            component["outlet_hints"].append(label)
+
+    copper_roots = {
+        union_find.find(entry["node"])
+        for entry in segment_entries
+    }
+    for via_entry in via_entries:
+        for _layer_index, node in via_entry["nodes"]:
+            copper_roots.add(union_find.find(node))
+    pad_roots = set(components_by_root)
+    padless_components = len(copper_roots - pad_roots)
+
+    components = list(components_by_root.values())
+    components.sort(key=lambda component: (-len(component["pads"]), component["pads"]))
+    return components, padless_components
+
+
+def _connect_overlapping_topology_segments(
+    union_find: _TopologyUnionFind,
+    segment_entries: list[dict[str, Any]],
+) -> None:
+    """Connect same-layer selected segments that physically touch or cross."""
+    for index, left in enumerate(segment_entries):
+        for right in segment_entries[index + 1:]:
+            if int(left["layer"]) != int(right["layer"]):
+                continue
+            if _segments_intersect_or_touch(left["start"], left["end"], right["start"], right["end"]):
+                union_find.union(left["node"], right["node"])
+
+
+def _connect_vias_to_topology_segments(
+    union_find: _TopologyUnionFind,
+    via_entries: list[dict[str, Any]],
+    segment_entries: list[dict[str, Any]],
+) -> None:
+    """Connect vias to selected segments that pass through their center."""
+    for via_entry in via_entries:
+        center = via_entry["center"]
+        radius = max(float(via_entry["diameter"]) * 0.5, 0.001)
+        node_by_layer = {int(layer): node for layer, node in via_entry["nodes"]}
+        for segment in segment_entries:
+            layer = int(segment["layer"])
+            via_node = node_by_layer.get(layer)
+            if via_node is None:
+                continue
+            if _point_to_segment_distance(center, segment["start"], segment["end"]) <= radius + 1e-6:
+                union_find.union(via_node, segment["node"])
+
+
+def _connect_pads_to_topology_geometry(
+    union_find: _TopologyUnionFind,
+    board: BoardData,
+    pad_entries: list[tuple[str, str, str, Any]],
+    segment_entries: list[dict[str, Any]],
+    via_entries: list[dict[str, Any]],
+) -> None:
+    """Attach pad nodes to any selected same-net route geometry touching them."""
+    for label, _reference, _pad_name, pad in pad_entries:
+        pad_node = ("pad", label)
+        for segment in segment_entries:
+            layer_name = _layer_name_for_z(board, int(segment["layer"]))
+            if layer_name is None or not _pad_has_selector_layer(board, pad, layer_name):
+                continue
+            if _segment_intersects_pad_body(segment["start"], segment["end"], pad):
+                union_find.union(pad_node, segment["node"])
+        for via_entry in via_entries:
+            for layer_index, via_node in via_entry["nodes"]:
+                layer_name = _layer_name_for_z(board, int(layer_index))
+                if layer_name is None or not _pad_has_selector_layer(board, pad, layer_name):
+                    continue
+                if _point_inside_expanded_pad(via_entry["center"][0], via_entry["center"][1], pad, 0.0):
+                    union_find.union(pad_node, via_node)
+
+
+def _topology_pad_entries(board: BoardData, net_id: int) -> list[tuple[str, str, str, Any]]:
+    """Return labeled pads for one net, preserving footprint references."""
+    entries: list[tuple[str, str, str, Any]] = []
+    for footprint in board.footprints:
+        reference = str(getattr(footprint, "reference", "") or "")
+        for pad in footprint.pads:
+            if (pad.net_id or 0) != net_id:
+                continue
+            pad_name = str(getattr(pad, "name", "") or "")
+            entries.append((f"{reference}:{pad_name}", reference, pad_name, pad))
+    entries.sort(key=lambda entry: entry[0])
+    return entries
+
+
+def _format_topology_component(index: int, component: dict[str, Any]) -> str:
+    """Format a compact pin-component summary for terminal output."""
+    pads = list(component.get("pads", []))
+    sources = list(component.get("source_hints", []))
+    outlets = list(component.get("outlet_hints", []))
+    pad_text = ",".join(pads[:8]) + ("..." if len(pads) > 8 else "")
+    return (
+        f"component={index}:pins={len(pads)}:"
+        f"source_hints={len(sources)}:"
+        f"outlet_hints={len(outlets)}:"
+        f"pads=[{pad_text}]"
+    )
+
+
+def _net_topology_role_policy(net_name: str) -> str:
+    """Classify whether a net has a useful source/outlet heuristic."""
+    normalized = str(net_name).upper().replace("/", "")
+    if any(token in normalized for token in ("GND", "GROUND", "VSS", "AGND", "DGND")):
+        return "ground_heuristic"
+    power_tokens = ("VCC", "VDD", "VIN", "VBAT", "VBUS", "3V3", "3.3V", "5V", "+3", "+5")
+    if any(token in normalized for token in power_tokens):
+        return "power_heuristic"
+    return "signal_unknown"
+
+
+def _pad_has_source_hint(net_name: str, reference: str, pad_name: str) -> bool:
+    """Guess whether a pad is a source/root for power-style topology reports."""
+    policy = _net_topology_role_policy(net_name)
+    if policy == "signal_unknown":
+        return False
+    ref = reference.upper()
+    pad = pad_name.upper()
+    source_prefixes = ("J", "JP", "P", "CN", "CON", "USB", "B", "BT", "BAT")
+    if ref.startswith(source_prefixes):
+        return True
+    if policy == "ground_heuristic" and any(token in pad for token in ("GND", "VSS", "GROUND")):
+        return True
+    if policy == "power_heuristic" and any(token in pad for token in ("VIN", "VBUS", "BAT", "VOUT", "OUT")):
+        return True
+    return False
+
+
+def _topology_xy_key(x_mm: float, y_mm: float) -> tuple[int, int]:
+    """Quantize millimeter coordinates for exact endpoint-style topology keys."""
+    scale = 10000.0
+    return int(round(x_mm * scale)), int(round(y_mm * scale))
+
+
+def _segment_intersects_pad_body(
+    start: tuple[float, float],
+    end: tuple[float, float],
+    pad: Any,
+) -> bool:
+    """Return true when a segment touches the physical pad shape."""
+    local_start = _pad_local_point(start[0], start[1], pad)
+    local_end = _pad_local_point(end[0], end[1], pad)
+    half_x = float(pad.size[0]) * 0.5
+    half_y = float(pad.size[1]) * 0.5
+    if half_x <= 0.0 or half_y <= 0.0:
+        return False
+    shape = str(getattr(pad, "shape", "")).lower()
+    if shape in {"circle", "oval", "ellipse"}:
+        scaled_start = (local_start[0] / half_x, local_start[1] / half_y)
+        scaled_end = (local_end[0] / half_x, local_end[1] / half_y)
+        return _point_to_segment_distance((0.0, 0.0), scaled_start, scaled_end) <= 1.0 + 1e-9
+    if _point_inside_rect(local_start, half_x, half_y) or _point_inside_rect(local_end, half_x, half_y):
+        return True
+    corners = [
+        (-half_x, -half_y),
+        (half_x, -half_y),
+        (half_x, half_y),
+        (-half_x, half_y),
+    ]
+    return any(
+        _segments_intersect_or_touch(local_start, local_end, corners[index], corners[(index + 1) % 4])
+        for index in range(4)
+    )
+
+
+def _pad_local_point(x_mm: float, y_mm: float, pad: Any) -> tuple[float, float]:
+    """Convert a board-space point into the pad's rotated local frame."""
+    cx = float(pad.center[0])
+    cy = float(pad.center[1])
+    angle = float(getattr(pad, "rotation_degrees", 0.0)) * math.pi / 180.0
+    dx = x_mm - cx
+    dy = y_mm - cy
+    return dx * cos(angle) + dy * sin(angle), -dx * sin(angle) + dy * cos(angle)
+
+
+def _point_inside_rect(point: tuple[float, float], half_x: float, half_y: float) -> bool:
+    """Check an axis-aligned local point against a rectangle."""
+    return abs(point[0]) <= half_x + 1e-9 and abs(point[1]) <= half_y + 1e-9
+
+
+def _segments_intersect_or_touch(
+    a_start: tuple[float, float],
+    a_end: tuple[float, float],
+    b_start: tuple[float, float],
+    b_end: tuple[float, float],
+) -> bool:
+    """Return true when two 2D segments intersect or touch."""
+    def orientation(p: tuple[float, float], q: tuple[float, float], r: tuple[float, float]) -> float:
+        return (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
+
+    def on_segment(p: tuple[float, float], q: tuple[float, float], r: tuple[float, float]) -> bool:
+        return (
+            min(p[0], r[0]) - 1e-9 <= q[0] <= max(p[0], r[0]) + 1e-9
+            and min(p[1], r[1]) - 1e-9 <= q[1] <= max(p[1], r[1]) + 1e-9
+        )
+
+    o1 = orientation(a_start, a_end, b_start)
+    o2 = orientation(a_start, a_end, b_end)
+    o3 = orientation(b_start, b_end, a_start)
+    o4 = orientation(b_start, b_end, a_end)
+    if o1 * o2 < -1e-12 and o3 * o4 < -1e-12:
+        return True
+    return (
+        abs(o1) <= 1e-9 and on_segment(a_start, b_start, a_end)
+        or abs(o2) <= 1e-9 and on_segment(a_start, b_end, a_end)
+        or abs(o3) <= 1e-9 and on_segment(b_start, a_start, b_end)
+        or abs(o4) <= 1e-9 and on_segment(b_start, a_end, b_end)
+    )
+
+
+def _point_to_segment_distance(
+    point: tuple[float, float],
+    start: tuple[float, float],
+    end: tuple[float, float],
+) -> float:
+    """Measure the shortest XY distance from a point to a segment."""
+    dx = end[0] - start[0]
+    dy = end[1] - start[1]
+    length2 = dx * dx + dy * dy
+    if length2 <= 1e-18:
+        return math.hypot(point[0] - start[0], point[1] - start[1])
+    t = max(0.0, min(1.0, ((point[0] - start[0]) * dx + (point[1] - start[1]) * dy) / length2))
+    projection = (start[0] + t * dx, start[1] + t * dy)
+    return math.hypot(point[0] - projection[0], point[1] - projection[1])
 
 
 def _candidate_lengths_for_selector(

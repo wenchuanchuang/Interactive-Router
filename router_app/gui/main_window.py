@@ -226,7 +226,12 @@ class MainWindow(QMainWindow):
         if display_result is None:
             return
 
-        display_board = self._display_board_for_external_backends(file_name, display_result)
+        display_board = self._display_board_for_external_backends(
+            file_name,
+            display_result,
+            freerouting_result=freerouting_result,
+            pcbrouter_result=pcbrouter_result,
+        )
         self._original_board = display_result.original_board
         self._board = display_board
         self._reset_candidate_generation_state()
@@ -238,6 +243,7 @@ class MainWindow(QMainWindow):
 
         previews = self._external_ripup_previews()
         pad_count = sum(len(footprint.pads) for footprint in display_board.footprints)
+        print(f"external_left_top_display_board = {Path(display_board.path).resolve()}", flush=True)
         self.statusBar().showMessage(
             f"Loaded {display_board.path.name} via external backend: "
             f"{len(display_board.tracks)} traces, {len(display_board.vias)} vias, "
@@ -252,16 +258,30 @@ class MainWindow(QMainWindow):
         if pcbrouter_result is not None:
             self._print_pcbrouter_summary(pcbrouter_result)
 
-    def _display_board_for_external_backends(self, file_name: str, display_result) -> BoardData:
+    def _display_board_for_external_backends(
+        self,
+        file_name: str,
+        display_result,
+        freerouting_result: FreeroutingRunResult | None = None,
+        pcbrouter_result: PcbRouterRunResult | None = None,
+    ) -> BoardData:
         """Return the board shown in the main canvas for external-router runs.
 
         Routed reference inputs are user-provided comparison baselines. Keep
         them visible in the top-left canvas while external routers and selector
         candidates continue to use the canonical unrouted coordinate frame.
+        For unrouted inputs with multiple external routers, show the backend
+        final board with fewer vias so the visible baseline matches the simpler
+        completed route.
         """
         input_path = Path(file_name)
         if self._is_routed_reference_input(input_path):
             return load_board(input_path)
+        if freerouting_result is not None and pcbrouter_result is not None:
+            freerouting_vias = len(freerouting_result.routed_board.vias)
+            pcbrouter_vias = len(pcbrouter_result.routed_board.vias)
+            if pcbrouter_vias < freerouting_vias:
+                return pcbrouter_result.routed_board
         return display_result.routed_board
 
     def _is_routed_reference_input(self, board_path: Path) -> bool:
@@ -654,6 +674,14 @@ class MainWindow(QMainWindow):
         if self._board is None or not previews:
             self.route_preview.show_message("External router result is not available")
             return
+        display_offset = self._selector_to_display_offset_mm()
+        display_previews = self._translate_route_previews_for_display(previews, display_offset)
+        if display_offset != (0.0, 0.0):
+            print(
+                "external_preview_translation_mm = "
+                f"dx={display_offset[0]:.6f} dy={display_offset[1]:.6f}",
+                flush=True,
+            )
 
         ripped_net_ids = {item.net_id for item in previews}
         overlay_net_ids = []
@@ -674,7 +702,7 @@ class MainWindow(QMainWindow):
             else:
                 truncated_labels.append(str(item.net_id))
         self.trace_panel.show_ripped_nets(self._board, ripped_net_ids)
-        self.route_preview.show_routes(previews, self._board, ripped_net_ids)
+        self.route_preview.show_routes(display_previews, self._board, ripped_net_ids)
         print(
             "external_ripped_occurrences = "
             + ", ".join(overlay_net_ids),
@@ -736,6 +764,7 @@ class MainWindow(QMainWindow):
         self._update_ripup_buttons()
 
     def _build_selected_preview_results(self, route_results, selection) -> list[object]:
+        display_offset = self._selector_to_display_offset_mm()
         selected_by_net: dict[int, list[int]] = {}
         for net_selection in selection.selections:
             if not net_selection.selected_candidate_indices:
@@ -757,18 +786,91 @@ class MainWindow(QMainWindow):
                 if selected_index < 0:
                     continue
                 if selected_index < len(candidate_preview_items):
-                    preview_results.append(candidate_preview_items[selected_index])
+                    preview_results.append(
+                        self._translate_route_preview_for_display(candidate_preview_items[selected_index], display_offset)
+                    )
                     continue
                 if selected_index >= len(candidate_grid) or selected_index >= len(candidate_mm):
                     continue
                 preview_results.append(
-                    SimpleNamespace(
-                        net_id=net_id,
-                        candidate_paths_grid=[candidate_grid[selected_index]],
-                        candidate_paths_mm=[candidate_mm[selected_index]],
+                    self._translate_route_preview_for_display(
+                        SimpleNamespace(
+                            net_id=net_id,
+                            candidate_paths_grid=[candidate_grid[selected_index]],
+                            candidate_paths_mm=[candidate_mm[selected_index]],
+                        ),
+                        display_offset,
                     )
                 )
         return preview_results
+
+    def _selector_to_display_offset_mm(self) -> tuple[float, float]:
+        """Return the coordinate offset from selector-board space to display-board space.
+
+        External routers may run on a sibling `.unrouted` board while the GUI
+        shows a routed reference board. Candidate generation must stay in the
+        selector board's coordinate frame, but preview overlays need this pure
+        display translation so pads and route geometry line up visually.
+        """
+        if self._original_board is None or self._board is None:
+            return (0.0, 0.0)
+        if self._original_board is self._board or self._original_board.path == self._board.path:
+            return (0.0, 0.0)
+        try:
+            return _board_translation_from_common_pads(self._original_board, self._board)
+        except ValueError as exc:
+            print(f"external_preview_translation_status = unavailable reason={exc}", flush=True)
+            return (0.0, 0.0)
+
+    def _translate_route_previews_for_display(self, previews: list[object], offset: tuple[float, float]) -> list[object]:
+        """Translate a list of preview objects into the currently displayed board frame."""
+        if offset == (0.0, 0.0):
+            return previews
+        return [self._translate_route_preview_for_display(preview, offset) for preview in previews]
+
+    def _translate_route_preview_for_display(self, preview: object, offset: tuple[float, float]) -> object:
+        """Translate preview geometry without mutating selector-owned candidate data."""
+        dx, dy = offset
+        if dx == 0.0 and dy == 0.0:
+            return preview
+
+        translated = SimpleNamespace(**getattr(preview, "__dict__", {}))
+        if hasattr(preview, "net_id"):
+            translated.net_id = getattr(preview, "net_id")
+        if hasattr(preview, "net_name"):
+            translated.net_name = getattr(preview, "net_name")
+        if hasattr(preview, "truncated"):
+            translated.truncated = getattr(preview, "truncated")
+        if hasattr(preview, "occurrence_index"):
+            translated.occurrence_index = getattr(preview, "occurrence_index")
+        if hasattr(preview, "source_net_id"):
+            translated.source_net_id = getattr(preview, "source_net_id")
+        if hasattr(preview, "source"):
+            translated.source = getattr(preview, "source")
+        if hasattr(preview, "preview_kind"):
+            translated.preview_kind = getattr(preview, "preview_kind")
+
+        if hasattr(preview, "segments"):
+            translated.segments = [
+                _translated_preview_segment(segment, dx, dy)
+                for segment in list(getattr(preview, "segments", []))
+            ]
+        if hasattr(preview, "vias"):
+            translated.vias = [
+                _translated_preview_via(via, dx, dy)
+                for via in list(getattr(preview, "vias", []))
+            ]
+        if hasattr(preview, "candidate_paths_mm"):
+            translated.candidate_paths_mm = [
+                [_translated_preview_point(point, dx, dy) for point in path]
+                for path in list(getattr(preview, "candidate_paths_mm", []))
+            ]
+        if hasattr(preview, "path_mm"):
+            translated.path_mm = [
+                _translated_preview_point(point, dx, dy)
+                for point in list(getattr(preview, "path_mm", []))
+            ]
+        return translated
 
     def _set_layers(self, layers: list[str]) -> None:
         self.layer_combo.blockSignals(True)
@@ -901,4 +1003,87 @@ class TracePanel(QFrame):
 
         for net_id in sorted(ripped_net_ids):
             self.ripped_list.addItem(f"{net_id}: {board.nets.get(net_id, f'Net {net_id}')}")
+
+
+def _board_translation_from_common_pads(source_board: BoardData, target_board: BoardData) -> tuple[float, float]:
+    """Calculate a constant source-to-target translation from matching pad centers."""
+    source_pads = _pad_centers_by_reference(source_board)
+    target_pads = _pad_centers_by_reference(target_board)
+    common_keys = sorted(set(source_pads) & set(target_pads))
+    if len(common_keys) < 2:
+        raise ValueError("too_few_common_pads")
+
+    offsets = [
+        (
+            target_pads[key][0] - source_pads[key][0],
+            target_pads[key][1] - source_pads[key][1],
+        )
+        for key in common_keys
+    ]
+    dx = _median(value[0] for value in offsets)
+    dy = _median(value[1] for value in offsets)
+    max_deviation = max(max(abs(item_dx - dx), abs(item_dy - dy)) for item_dx, item_dy in offsets)
+    if max_deviation > 0.01:
+        raise ValueError(f"not_simple_translation max_deviation_mm={max_deviation:.6f}")
+    return dx, dy
+
+
+def _pad_centers_by_reference(board: BoardData) -> dict[tuple[str, str], tuple[float, float]]:
+    """Index pad centers by footprint reference and pad name for board-frame matching."""
+    centers: dict[tuple[str, str], tuple[float, float]] = {}
+    for footprint in board.footprints:
+        for pad in footprint.pads:
+            centers[(footprint.reference, pad.name)] = pad.center
+    return centers
+
+
+def _median(values: object) -> float:
+    """Return the median value from a finite numeric iterable."""
+    ordered = sorted(float(value) for value in values)
+    if not ordered:
+        raise ValueError("empty_values")
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2.0
+
+
+def _translated_preview_segment(segment: object, dx: float, dy: float) -> SimpleNamespace:
+    """Return a display-only segment translated by the board-frame offset."""
+    return SimpleNamespace(
+        layer=str(getattr(segment, "layer", "F.Cu")),
+        start=_translated_xy_tuple(getattr(segment, "start", (0.0, 0.0)), dx, dy),
+        end=_translated_xy_tuple(getattr(segment, "end", (0.0, 0.0)), dx, dy),
+        width=float(getattr(segment, "width", 0.2)),
+    )
+
+
+def _translated_preview_via(via: object, dx: float, dy: float) -> SimpleNamespace:
+    """Return a display-only via translated by the board-frame offset."""
+    return SimpleNamespace(
+        center=_translated_xy_tuple(getattr(via, "center", (0.0, 0.0)), dx, dy),
+        diameter=float(getattr(via, "diameter", 0.6)),
+        start_layer=str(getattr(via, "start_layer", "F.Cu")),
+        end_layer=str(getattr(via, "end_layer", "B.Cu")),
+    )
+
+
+def _translated_preview_point(point: object, dx: float, dy: float) -> SimpleNamespace:
+    """Return a display-only path point translated by the board-frame offset."""
+    if isinstance(point, (tuple, list)) and len(point) >= 2:
+        x = float(point[0])
+        y = float(point[1])
+    else:
+        x = float(getattr(point, "x", 0.0))
+        y = float(getattr(point, "y", 0.0))
+    return SimpleNamespace(
+        x=x + dx,
+        y=y + dy,
+    )
+
+
+def _translated_xy_tuple(value: object, dx: float, dy: float) -> tuple[float, float]:
+    """Translate a two-value coordinate tuple by the board-frame offset."""
+    x, y = value
+    return (float(x) + dx, float(y) + dy)
 
