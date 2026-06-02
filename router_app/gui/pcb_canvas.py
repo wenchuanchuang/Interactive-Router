@@ -225,8 +225,9 @@ class PcbCanvas(QGraphicsView):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        if self._board is not None:
-            self.fit_board()
+        # Do not call fitInView from resizeEvent. Qt can emit another resize/layout
+        # pass after fitInView updates the viewport transform and scroll bars, which
+        # can trap the GUI in a resize -> fit -> resize loop on some boards.
 
     def wheelEvent(self, event) -> None:
         delta = event.angleDelta().y()
@@ -305,18 +306,21 @@ class PcbCanvas(QGraphicsView):
             x, y = footprint.position
             outline_rect = QRectF(x * self._scale - 14, y * self._scale - 14, 28, 28)
 
-        if pad_rects or footprint.reference:
-            outline = QGraphicsRectItem(outline_rect.adjusted(-8, -8, 8, 8))
-            outline_pen = QPen(QColor("#f0f3f8"), 1.4, Qt.DashLine)
-            outline_pen.setCosmetic(True)
-            outline.setPen(outline_pen)
-            fill = QColor("#eef1f7")
-            fill.setAlpha(24)
-            outline.setBrush(QBrush(fill))
-            outline.setZValue(1.5)
-            display_layers = tuple(footprint_layers) or _component_layers_from_footprint(footprint.layer)
-            self._component_items.append((outline, display_layers))
-            self._scene.addItem(outline)
+        # Component outline boxes are intentionally hidden for now; pads and
+        # reference labels remain visible so the board stays readable without
+        # extra dashed footprint bounds in each comparison pane.
+        # if pad_rects or footprint.reference:
+        #     outline = QGraphicsRectItem(outline_rect.adjusted(-8, -8, 8, 8))
+        #     outline_pen = QPen(QColor("#f0f3f8"), 1.4, Qt.DashLine)
+        #     outline_pen.setCosmetic(True)
+        #     outline.setPen(outline_pen)
+        #     fill = QColor("#eef1f7")
+        #     fill.setAlpha(24)
+        #     outline.setBrush(QBrush(fill))
+        #     outline.setZValue(1.5)
+        #     display_layers = tuple(footprint_layers) or _component_layers_from_footprint(footprint.layer)
+        #     self._component_items.append((outline, display_layers))
+        #     self._scene.addItem(outline)
 
         x, y = footprint.position
         label = QGraphicsTextItem(footprint.reference)
@@ -561,36 +565,43 @@ class RoutePreviewCanvas(QGraphicsView):
                 self._scene.addItem(item)
 
         for track in board.tracks:
-            if track.net_id in ripped_net_ids:
-                continue
+            # Keep ripped nets visible as a faint reference in the preview.
+            # This makes differences between the original route and the
+            # selected replacement route visible without changing solver data.
+            is_ripped_reference = track.net_id in ripped_net_ids
             x1 = (track.start[0] - min_x) * scale
             y1 = (track.start[1] - min_y) * scale
             x2 = (track.end[0] - min_x) * scale
             y2 = (track.end[1] - min_y) * scale
             color = _layer_color(track.layer)
-            color.setAlpha(95)
+            color.setAlpha(42 if is_ripped_reference else 95)
             pen = QPen(
                 color,
-                max(track.width * scale, 1.6),
-                _layer_pen_style(track.layer),
+                max(track.width * scale, 1.2 if is_ripped_reference else 1.6),
+                Qt.DashLine if is_ripped_reference else _layer_pen_style(track.layer),
                 Qt.RoundCap,
                 Qt.RoundJoin,
             )
             item = self._scene.addLine(x1, y1, x2, y2, pen)
-            item.setZValue(_layer_z_value(track.layer))
+            item.setZValue(_layer_z_value(track.layer) - (0.5 if is_ripped_reference else 0.0))
 
         for via in board.vias:
-            if via.net_id in ripped_net_ids:
-                continue
+            # Draw original vias on ripped nets faintly so via changes remain
+            # comparable against the highlighted selected candidate.
+            is_ripped_reference = via.net_id in ripped_net_ids
             radius = max(via.diameter * scale * 0.5, 2.2)
             x = (via.center[0] - min_x) * scale
             y = (via.center[1] - min_y) * scale
             item = QGraphicsEllipseItem(x - radius, y - radius, radius * 2, radius * 2)
-            item.setBrush(QBrush(QColor("#2d343d")))
-            pen = QPen(QColor("#dfe6ef"), 1.0)
+            via_brush = QColor("#2d343d")
+            via_brush.setAlpha(75 if is_ripped_reference else 210)
+            item.setBrush(QBrush(via_brush))
+            via_pen = QColor("#dfe6ef")
+            via_pen.setAlpha(95 if is_ripped_reference else 255)
+            pen = QPen(via_pen, 1.0)
             pen.setCosmetic(True)
             item.setPen(pen)
-            item.setZValue(8)
+            item.setZValue(7.5 if is_ripped_reference else 8)
             self._scene.addItem(item)
 
 
