@@ -512,13 +512,29 @@ std::vector<RasterAnalysisResult> analyzeSelectorGeometryBatch(
 ) {
     std::vector<RasterAnalysisResult> results;
     results.reserve(requests.size());
+    std::unordered_map<std::string, std::size_t> analysis_cache;
+    analysis_cache.reserve(requests.size());
 
     for (std::size_t index = 0; index < requests.size(); ++index) {
+        // Reuse raster and pad-coverage work only when the full selector-visible
+        // request is exactly identical. This preserves every candidate identity
+        // while avoiding repeated geometry analysis for duplicate candidates.
+        const std::string key = rasterAnalysisPairKey(requests[index]);
+        const auto cache_it = analysis_cache.find(key);
+        if (cache_it != analysis_cache.end()) {
+            RasterAnalysisResult cached = results[cache_it->second];
+            cached.cache_hit = true;
+            cached.cache_source_index = static_cast<int>(cache_it->second);
+            results.push_back(std::move(cached));
+            continue;
+        }
+
         RasterAnalysisResult result;
         result.raster = rasterizeSelectorGeometry(requests[index].raster_request);
         result.coverage = analyzePadCoverage(requests[index].coverage_request);
         result.cache_hit = false;
         result.cache_source_index = static_cast<int>(index);
+        analysis_cache.emplace(key, index);
         results.push_back(std::move(result));
     }
 
@@ -571,6 +587,8 @@ std::vector<RasterAnalysisResult> analyzeSelectorGeometryCandidateBatch(
 ) {
     std::vector<RasterAnalysisResult> results;
     results.reserve(request.candidates.size());
+    std::unordered_map<std::string, std::size_t> analysis_cache;
+    analysis_cache.reserve(request.candidates.size());
 
     for (std::size_t index = 0; index < request.candidates.size(); ++index) {
         const auto& candidate = request.candidates[index];
@@ -586,11 +604,27 @@ std::vector<RasterAnalysisResult> analyzeSelectorGeometryCandidateBatch(
         coverage_request.explicit_graph_nodes = raster_request.explicit_graph_nodes;
         coverage_request.explicit_graph_edges = raster_request.explicit_graph_edges;
 
+        RasterAnalysisPairRequest pair_request;
+        pair_request.raster_request = raster_request;
+        pair_request.coverage_request = coverage_request;
+        // Keep duplicate candidates as separate choices, but share the expensive
+        // raster and pad-coverage result when their exact primitive input matches.
+        const std::string key = rasterAnalysisPairKey(pair_request);
+        const auto cache_it = analysis_cache.find(key);
+        if (cache_it != analysis_cache.end()) {
+            RasterAnalysisResult cached = results[cache_it->second];
+            cached.cache_hit = true;
+            cached.cache_source_index = static_cast<int>(cache_it->second);
+            results.push_back(std::move(cached));
+            continue;
+        }
+
         RasterAnalysisResult result;
         result.raster = rasterizeSelectorGeometry(raster_request);
         result.coverage = analyzePadCoverage(coverage_request);
         result.cache_hit = false;
         result.cache_source_index = static_cast<int>(index);
+        analysis_cache.emplace(key, index);
         results.push_back(std::move(result));
     }
 

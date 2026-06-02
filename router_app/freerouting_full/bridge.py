@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 import json
 import os
@@ -7,11 +8,16 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+from time import perf_counter
 from typing import Iterable
 
 import pcbnew
 
 from router_app.kicad_parser import BoardData, TrackSegment, Via, load_board
+
+
+FREEROUTING_PROFILE_SCHEMA = "interactive_router_freerouting_profiles_v1"
+BoardCache = dict[Path, BoardData]
 
 
 @dataclass(frozen=True)
@@ -70,9 +76,10 @@ class FreeroutingRunResult:
     stderr_log_path: Path | None = None
 
 
-def run_freerouting_full(board_path: str | Path) -> FreeroutingRunResult:
+def run_freerouting_full(board_path: str | Path, profile_manifest_path: str | Path | None = None) -> FreeroutingRunResult:
     board_path = Path(board_path).resolve()
-    router_source_board_path = _canonical_router_source_board(board_path)
+    board_cache: BoardCache = {}
+    router_source_board_path = _canonical_router_source_board(board_path, board_cache)
     app_root = Path(__file__).resolve().parents[2]
     workspace_root = app_root.parent
     freerouting_root = workspace_root / "freerouting"
@@ -112,40 +119,29 @@ def run_freerouting_full(board_path: str | Path) -> FreeroutingRunResult:
     _export_dsn(unrouted_input_board_path, dsn_path)
     _normalize_dsn_pcb_name(dsn_path, router_source_board_path.stem)
     _force_dsn_snap_angle_fortyfive(dsn_path)
-    stable_stage = _run_freerouting_stage(
-        profile_name="stable",
-        profile_config_path=profile_paths["stable"],
+    started_at = perf_counter()
+    stage_results = _run_freerouting_profiles(
+        profile_paths=profile_paths,
+        profile_manifest_path=profile_manifest_path or os.environ.get("INTERACTIVE_ROUTER_REPLAY_PROFILE_MANIFEST"),
         jar_path=jar_path,
         board_path=unrouted_input_board_path,
         dsn_path=dsn_path,
-        ripup_payload_path=work_dir / "freerouting.stable_ripped_routes.json",
-        ses_path=work_dir / "freerouting.stable.ses",
-        routed_board_path=work_dir / f"{board_path.stem}.freerouting.stable.routed.kicad_pcb",
+        routed_board_stem=board_path.stem,
+        work_dir=work_dir,
         app_root=app_root,
-        stdout_log_path=work_dir / "freerouting.stable.stdout.log",
-        stderr_log_path=work_dir / "freerouting.stable.stderr.log",
+        max_workers=_profile_max_workers(),
     )
-    attempted_profiles = ["stable"]
-    selected_stage = stable_stage
-    stage_results = [stable_stage]
-    if bool(stable_stage["run_report"]["still_unconnected"]):
-        aggressive_stage = _run_freerouting_stage(
-            profile_name="aggressive",
-            profile_config_path=profile_paths["aggressive"],
-            jar_path=jar_path,
-            board_path=unrouted_input_board_path,
-            dsn_path=dsn_path,
-            ripup_payload_path=work_dir / "freerouting.aggressive_ripped_routes.json",
-            ses_path=work_dir / "freerouting.aggressive.ses",
-            routed_board_path=work_dir / f"{board_path.stem}.freerouting.aggressive.routed.kicad_pcb",
-            app_root=app_root,
-            stdout_log_path=work_dir / "freerouting.aggressive.stdout.log",
-            stderr_log_path=work_dir / "freerouting.aggressive.stderr.log",
-        )
-        attempted_profiles.append("aggressive")
-        stage_results.append(aggressive_stage)
-        if _is_stage_better(aggressive_stage, stable_stage):
-            selected_stage = aggressive_stage
+    elapsed_sec = perf_counter() - started_at
+    if not stage_results:
+        raise RuntimeError("freerouting did not produce any profile result.")
+    attempted_profiles = [str(stage["profile_name"]) for stage in stage_results]
+    selected_stage = min(
+        stage_results,
+        key=lambda stage: (
+            _unconnected_count(stage),
+            len(_load_board_cached(Path(stage["routed_board_path"]), board_cache).vias),
+        ),
+    )
 
     _copy_stage_artifact(selected_stage["ses_path"], ses_path)
     _copy_stage_artifact(selected_stage["routed_board_path"], routed_board_path)
@@ -157,10 +153,11 @@ def run_freerouting_full(board_path: str | Path) -> FreeroutingRunResult:
     original_board, original_candidate_board = _load_selector_original_board(
         input_board_path=board_path,
         router_source_board_path=router_source_board_path,
+        board_cache=board_cache,
     )
-    routed_board = load_board(routed_board_path)
+    routed_board = _load_board_cached(routed_board_path, board_cache)
     candidate_routed_boards = tuple(
-        load_board(Path(stage["routed_board_path"]))
+        _load_board_cached(Path(stage["routed_board_path"]), board_cache)
         for stage in stage_results
     )
     candidate_routed_board_paths = tuple(Path(stage["routed_board_path"]) for stage in stage_results)
@@ -207,25 +204,19 @@ def run_freerouting_full(board_path: str | Path) -> FreeroutingRunResult:
 
     stage_reports = [
         {
-            "profile": stable_stage["profile_name"],
-            "still_unconnected": stable_stage["run_report"]["still_unconnected"],
-            "unconnected_item_count": stable_stage["run_report"]["unconnected_item_count"],
-            "stdout_log": str(stable_stage["stdout_log_path"]),
-            "stderr_log": str(stable_stage["stderr_log_path"]),
-        },
-        *(
-            [
-                {
-                    "profile": aggressive_stage["profile_name"],
-                    "still_unconnected": aggressive_stage["run_report"]["still_unconnected"],
-                    "unconnected_item_count": aggressive_stage["run_report"]["unconnected_item_count"],
-                    "stdout_log": str(aggressive_stage["stdout_log_path"]),
-                    "stderr_log": str(aggressive_stage["stderr_log_path"]),
-                }
-            ]
-            if "aggressive_stage" in locals()
-            else []
-        ),
+            "router": "freerouting",
+            "profile": stage["profile_name"],
+            "profile_config": str(stage["profile_config_path"]),
+            "order_strategy": stage.get("order_strategy", "natural"),
+            "order_seed": stage.get("order_seed"),
+            "still_unconnected": stage["run_report"]["still_unconnected"],
+            "unconnected_item_count": stage["run_report"]["unconnected_item_count"],
+            "routed_board_path": str(stage["routed_board_path"]),
+            "ripup_payload_path": str(stage["ripup_payload_path"]),
+            "stdout_log": str(stage["stdout_log_path"]),
+            "stderr_log": str(stage["stderr_log_path"]),
+        }
+        for stage in stage_results
     ]
 
     metadata = {
@@ -252,10 +243,13 @@ def run_freerouting_full(board_path: str | Path) -> FreeroutingRunResult:
         "attempted_profiles": attempted_profiles,
         "selected_profile": selected_stage["profile_name"],
         "stage_reports": stage_reports,
+        "schema": FREEROUTING_PROFILE_SCHEMA,
+        "elapsed_sec": elapsed_sec,
         "stdout_log": str(stdout_log_path),
         "stderr_log": str(stderr_log_path),
     }
     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    print(f"freerouting_profile_manifest = {metadata_path.resolve()}", flush=True)
 
     return FreeroutingRunResult(
         original_board=original_board,
@@ -309,7 +303,7 @@ def _normalize_dsn_pcb_name(dsn_path: Path, pcb_name: str) -> None:
         dsn_path.write_text(normalized, encoding="utf-8")
 
 
-def _canonical_router_source_board(board_path: Path) -> Path:
+def _canonical_router_source_board(board_path: Path, board_cache: BoardCache | None = None) -> Path:
     """Choose the board coordinate frame used by external routers.
 
     Routed reference boards can be simple translations of their sibling
@@ -322,7 +316,7 @@ def _canonical_router_source_board(board_path: Path) -> Path:
     if sibling is None:
         return board_path
     try:
-        dx, dy = _board_translation_from_common_pads(source_board=sibling, target_board=board_path)
+        dx, dy = _board_translation_from_common_pads(source_board=sibling, target_board=board_path, board_cache=board_cache)
     except Exception:
         return board_path
     print(f"freerouting_router_source_board = {sibling.resolve()}", flush=True)
@@ -331,7 +325,11 @@ def _canonical_router_source_board(board_path: Path) -> Path:
     return sibling
 
 
-def _load_selector_original_board(input_board_path: Path, router_source_board_path: Path) -> tuple[BoardData, BoardData | None]:
+def _load_selector_original_board(
+    input_board_path: Path,
+    router_source_board_path: Path,
+    board_cache: BoardCache | None = None,
+) -> tuple[BoardData, BoardData | None]:
     """Load selector baseline data and preserve shifted routed input geometry.
 
     The selector must live in the same coordinate frame as the external router
@@ -341,11 +339,15 @@ def _load_selector_original_board(input_board_path: Path, router_source_board_pa
     as an original candidate source.
     """
     if input_board_path == router_source_board_path:
-        return load_board(input_board_path), None
+        return _load_board_cached(input_board_path, board_cache), None
 
-    source_board = load_board(router_source_board_path)
-    input_board = load_board(input_board_path)
-    dx, dy = _board_translation_from_common_pads(source_board=router_source_board_path, target_board=input_board_path)
+    source_board = _load_board_cached(router_source_board_path, board_cache)
+    input_board = _load_board_cached(input_board_path, board_cache)
+    dx, dy = _board_translation_from_common_pads(
+        source_board=router_source_board_path,
+        target_board=input_board_path,
+        board_cache=board_cache,
+    )
     translated_tracks = [
         TrackSegment(
             start=(track.start[0] - dx, track.start[1] - dy),
@@ -499,10 +501,14 @@ def _form_symbol(form_text: str) -> str:
     return match.group(1) if match else ""
 
 
-def _board_translation_from_common_pads(source_board: Path, target_board: Path) -> tuple[float, float]:
+def _board_translation_from_common_pads(
+    source_board: Path,
+    target_board: Path,
+    board_cache: BoardCache | None = None,
+) -> tuple[float, float]:
     """Calculate a constant source-to-target board translation from common pads."""
-    source_pads = _pad_centers_by_key(load_board(source_board))
-    target_pads = _pad_centers_by_key(load_board(target_board))
+    source_pads = _pad_centers_by_key(_load_board_cached(source_board, board_cache))
+    target_pads = _pad_centers_by_key(_load_board_cached(target_board, board_cache))
     common_keys = sorted(set(source_pads) & set(target_pads))
     if len(common_keys) < 3:
         raise RuntimeError(
@@ -524,6 +530,18 @@ def _board_translation_from_common_pads(source_board: Path, target_board: Path) 
             f"source={source_board} target={target_board}"
         )
     return dx, dy
+
+
+def _load_board_cached(board_path: Path, board_cache: BoardCache | None = None) -> BoardData:
+    """Load a board once per bridge run and reuse it for metadata-only reads."""
+    if board_cache is None:
+        return load_board(board_path)
+    key = Path(board_path).resolve()
+    cached = board_cache.get(key)
+    if cached is None:
+        cached = load_board(key)
+        board_cache[key] = cached
+    return cached
 
 
 def _pad_centers_by_key(board: BoardData) -> dict[tuple[str, str], tuple[float, float]]:
@@ -714,13 +732,14 @@ def _run_freerouting(
     dsn_path: Path,
     ses_path: Path,
     ripup_payload_path: Path,
-    app_root: Path,
+    home_dir: Path,
     profile_config_path: Path,
     stdout_log_path: Path,
     stderr_log_path: Path,
+    order_strategy: str = "natural",
+    order_seed: int | None = None,
 ) -> dict[str, object]:
     java_exe = _resolve_java_executable()
-    home_dir = app_root / ".freerouting-home"
     home_dir.mkdir(parents=True, exist_ok=True)
     active_config_path = home_dir / "freerouting.json"
     shutil.copyfile(profile_config_path, active_config_path)
@@ -745,6 +764,9 @@ def _run_freerouting(
     ]
     env = os.environ.copy()
     env["FREEROUTING__USER_DATA_PATH"] = str(home_dir)
+    env["FREEROUTING_ITEM_ORDER_STRATEGY"] = order_strategy
+    if order_seed is not None:
+        env["FREEROUTING_ITEM_ORDER_SEED"] = str(order_seed)
     completed = subprocess.run(
         command,
         cwd=str(jar_path.parents[2]),
@@ -778,23 +800,34 @@ def _run_freerouting_stage(
     app_root: Path,
     stdout_log_path: Path,
     stderr_log_path: Path,
+    order_strategy: str = "natural",
+    order_seed: int | None = None,
+    home_dir: Path | None = None,
 ) -> dict[str, object]:
     for artifact in (ripup_payload_path, ses_path, routed_board_path, stdout_log_path, stderr_log_path):
         if artifact.exists():
             artifact.unlink()
+    if home_dir is None:
+        home_dir = app_root / ".freerouting-home" / profile_name
     run_report = _run_freerouting(
         jar_path=jar_path,
         dsn_path=dsn_path,
         ses_path=ses_path,
         ripup_payload_path=ripup_payload_path,
-        app_root=app_root,
+        home_dir=home_dir,
         profile_config_path=profile_config_path,
         stdout_log_path=stdout_log_path,
         stderr_log_path=stderr_log_path,
+        order_strategy=order_strategy,
+        order_seed=order_seed,
     )
     _import_ses(board_path, ses_path, routed_board_path)
     return {
         "profile_name": profile_name,
+        "profile_config_path": profile_config_path,
+        "order_strategy": order_strategy,
+        "order_seed": order_seed,
+        "home_dir": home_dir,
         "run_report": run_report,
         "ripup_payload_path": ripup_payload_path,
         "ses_path": ses_path,
@@ -802,6 +835,117 @@ def _run_freerouting_stage(
         "stdout_log_path": stdout_log_path,
         "stderr_log_path": stderr_log_path,
     }
+
+
+def _run_freerouting_profiles(
+    profile_paths: dict[str, Path],
+    profile_manifest_path: str | Path | None,
+    jar_path: Path,
+    board_path: Path,
+    dsn_path: Path,
+    routed_board_stem: str,
+    work_dir: Path,
+    app_root: Path,
+    max_workers: int,
+) -> list[dict[str, object]]:
+    """Run freerouting profiles in isolated home directories and collect artifacts."""
+    profile_specs = _freerouting_profile_specs(profile_paths, profile_manifest_path)
+    profile_root = work_dir / "profiles"
+    if profile_root.exists():
+        shutil.rmtree(profile_root)
+    profile_root.mkdir(parents=True, exist_ok=True)
+    print(
+        "freerouting_profiles = "
+        + ", ".join(spec["name"] for spec in profile_specs)
+        + f"  # max_parallel={max_workers}",
+        flush=True,
+    )
+
+    results: list[dict[str, object]] = []
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(profile_specs))) as executor:
+        future_to_spec = {}
+        for spec in profile_specs:
+            profile_name = str(spec["name"])
+            stage_dir = profile_root / _safe_profile_name(profile_name)
+            stage_dir.mkdir(parents=True, exist_ok=True)
+            future = executor.submit(
+                _run_freerouting_stage,
+                profile_name=profile_name,
+                profile_config_path=Path(spec["config_path"]),
+                jar_path=jar_path,
+                board_path=board_path,
+                dsn_path=dsn_path,
+                ripup_payload_path=stage_dir / f"freerouting.{profile_name}_ripped_routes.json",
+                ses_path=stage_dir / f"freerouting.{profile_name}.ses",
+                routed_board_path=stage_dir / f"{routed_board_stem}.freerouting.{profile_name}.routed.kicad_pcb",
+                app_root=app_root,
+                stdout_log_path=stage_dir / f"freerouting.{profile_name}.stdout.log",
+                stderr_log_path=stage_dir / f"freerouting.{profile_name}.stderr.log",
+                order_strategy=str(spec.get("order_strategy", "natural")),
+                order_seed=spec.get("order_seed"),
+                home_dir=stage_dir / "home",
+            )
+            future_to_spec[future] = spec
+        for future in as_completed(future_to_spec):
+            spec = future_to_spec[future]
+            try:
+                results.append(future.result())
+            except Exception as exc:
+                print(f"freerouting_profile_failed {spec['name']} reason={exc}", flush=True)
+    order_by_name = {str(spec["name"]): index for index, spec in enumerate(profile_specs)}
+    results.sort(key=lambda stage: order_by_name.get(str(stage["profile_name"]), 10**9))
+    return results
+
+
+def _freerouting_profile_specs(profile_paths: dict[str, Path], profile_manifest_path: str | Path | None = None) -> list[dict[str, object]]:
+    """Return the diversity profile list used by the freerouting bridge."""
+    if profile_manifest_path:
+        manifest_file = Path(profile_manifest_path)
+        if manifest_file.exists():
+            manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+            raw_profiles = manifest.get("profiles", []) if isinstance(manifest, dict) else []
+            profiles = []
+            for raw in raw_profiles:
+                if not isinstance(raw, dict) or str(raw.get("router", "freerouting")) != "freerouting":
+                    continue
+                profile_name = str(raw.get("profile") or raw.get("name") or "stable")
+                config_path = Path(str(raw.get("profile_config") or profile_paths.get(profile_name, profile_paths["stable"])))
+                profiles.append({
+                    "name": profile_name,
+                    "config_path": config_path,
+                    "order_strategy": str(raw.get("order_strategy", "natural")),
+                    "order_seed": raw.get("order_seed", 0),
+                })
+            if profiles:
+                return profiles
+    light_profiles = [
+        {"name": "stable", "config_path": profile_paths["stable"], "order_strategy": "natural", "order_seed": 0},
+        {"name": "aggressive", "config_path": profile_paths["aggressive"], "order_strategy": "natural", "order_seed": 0},
+        {"name": "random_seed_1", "config_path": profile_paths["stable"], "order_strategy": "random", "order_seed": 1},
+    ]
+    if os.environ.get("INTERACTIVE_ROUTER_PROFILE_SET", "diversity_light") != "diversity_full":
+        return light_profiles
+    return [
+        *light_profiles,
+        {"name": "high_via", "config_path": profile_paths["high_via"], "order_strategy": "natural", "order_seed": 0},
+        {"name": "reverse", "config_path": profile_paths["stable"], "order_strategy": "reverse", "order_seed": 0},
+        {"name": "short_airline", "config_path": profile_paths["stable"], "order_strategy": "short_airline_first", "order_seed": 0},
+    ]
+
+
+def _profile_max_workers() -> int:
+    """Limit external profile process parallelism to avoid memory spikes."""
+    try:
+        value = int(os.environ.get("INTERACTIVE_ROUTER_PROFILE_MAX_PARALLEL", "2"))
+    except ValueError:
+        value = 2
+    return max(1, min(value, 4))
+
+
+def _safe_profile_name(name: str) -> str:
+    """Make a profile name safe for folder and artifact names."""
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("._")
+    return safe or "profile"
 
 
 def _copy_stage_artifact(source: Path, destination: Path) -> None:
@@ -827,13 +971,17 @@ def _is_stage_better(candidate_stage: dict[str, object], baseline_stage: dict[st
 def _ensure_freerouting_profiles(home_dir: Path) -> dict[str, Path]:
     stable_path = home_dir / "freerouting.stable.json"
     aggressive_path = home_dir / "freerouting.aggressive.json"
+    high_via_path = home_dir / "freerouting.high_via.json"
     if not stable_path.exists():
         stable_path.write_text(json.dumps(_default_freerouting_profile(home_dir, "stable"), indent=2), encoding="utf-8")
     if not aggressive_path.exists():
         aggressive_path.write_text(json.dumps(_default_freerouting_profile(home_dir, "aggressive"), indent=2), encoding="utf-8")
+    if not high_via_path.exists():
+        high_via_path.write_text(json.dumps(_default_freerouting_profile(home_dir, "high_via"), indent=2), encoding="utf-8")
     return {
         "stable": stable_path,
         "aggressive": aggressive_path,
+        "high_via": high_via_path,
     }
 
 
@@ -920,6 +1068,13 @@ def _default_freerouting_profile(home_dir: Path, profile_name: str) -> dict[str,
         scoring["default_undesired_direction_trace_cost"] = 1.01
         scoring["via_costs"] = 8
         scoring["start_ripup_costs"] = 10
+    if profile_name == "high_via":
+        router = base["router"]
+        assert isinstance(router, dict)
+        scoring = router["scoring"]
+        assert isinstance(scoring, dict)
+        scoring["via_costs"] = 60
+        scoring["start_ripup_costs"] = 30
     return base
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 import json
 import os
@@ -7,12 +8,15 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+from time import perf_counter
 from typing import Iterable
 
 from router_app.kicad_parser import BoardData, TrackSegment, Via, load_board
 
 
 PCBROUTER_GRID_SCALE = 10 # default is 10
+PCBROUTER_PROFILE_SCHEMA = "interactive_router_pcbrouter_profiles_v1"
+BoardCache = dict[Path, BoardData]
 
 
 @dataclass(frozen=True)
@@ -44,6 +48,20 @@ class PcbRouterRipupPreview:
 
 
 @dataclass(frozen=True)
+class PcbRouterProfile:
+    name: str
+    order_strategy: str = "natural"
+    order_seed: int | None = None
+    grid_scale: int = PCBROUTER_GRID_SCALE
+    num_iterations: int | None = None
+    enlarge_boundary: int | None = None
+    layer_change_weight: float | None = None
+    track_obstacle_weight: float | None = None
+    track_obstacle_step_size: float | None = None
+    via_obstacle_step_size: float | None = None
+
+
+@dataclass(frozen=True)
 class PcbRouterRunResult:
     original_board: BoardData
     original_candidate_board: BoardData | None
@@ -52,6 +70,13 @@ class PcbRouterRunResult:
     work_dir: Path
     routed_board_path: Path
     ripup_payload_path: Path | None
+    candidate_routed_boards: tuple[BoardData, ...] = ()
+    candidate_routed_board_paths: tuple[Path, ...] = ()
+    candidate_ripup_payload_paths: tuple[Path, ...] = ()
+    attempted_profiles: tuple[str, ...] = ()
+    selected_profile: str = "natural"
+    profile_reports: tuple[dict[str, object], ...] = ()
+    profile_manifest_path: Path | None = None
     unique_ripped_net_count: int = 0
     ripup_event_count: int = 0
     stdout_log_path: Path | None = None
@@ -59,78 +84,139 @@ class PcbRouterRunResult:
     failed_net_ids_estimated: tuple[int, ...] = ()
 
 
-def run_pcb_router_full(board_path: str | Path) -> PcbRouterRunResult:
-    """Run PcbRouter as an Interactive-Router backend and collect its artifacts."""
+def run_pcb_router_full(board_path: str | Path, profile_manifest_path: str | Path | None = None) -> PcbRouterRunResult:
+    """Run one or more PcbRouter profiles and collect every candidate artifact."""
     board_path = Path(board_path).resolve()
-    router_source_board_path = _canonical_router_source_board(board_path)
+    board_cache: BoardCache = {}
+    router_source_board_path = _canonical_router_source_board(board_path, board_cache)
     app_root = Path(__file__).resolve().parents[2]
     work_dir = app_root / "out" / "pcb_router_full" / board_path.stem
     work_dir.mkdir(parents=True, exist_ok=True)
 
     routed_board_path = work_dir / f"{board_path.stem}.pcbrouter.routed.kicad_pcb"
     ripup_payload_path = work_dir / "pcbrouter_ripped_routes.json"
-    stdout_log_path = work_dir / "pcbrouter.stdout.log"
-    stderr_log_path = work_dir / "pcbrouter.stderr.log"
-    pcbrouter_input_path = work_dir / f"{board_path.stem}.kicad_pcb"
-    for artifact in (routed_board_path, ripup_payload_path, stdout_log_path, stderr_log_path, pcbrouter_input_path):
+    metadata_path = work_dir / "pcbrouter_profile_manifest.json"
+    stdout_log_path = work_dir / "pcbrouter.selected.stdout.log"
+    stderr_log_path = work_dir / "pcbrouter.selected.stderr.log"
+    for artifact in (routed_board_path, ripup_payload_path, metadata_path, stdout_log_path, stderr_log_path):
         if artifact.exists():
             artifact.unlink()
 
-    output_dir = work_dir / "output"
-    if output_dir.exists():
-        shutil.rmtree(output_dir)
-    # PcbRouter writes its routed board and ripup payload to relative output/log folders.
-    # Create them before launch because the Windows build reports an error instead of
-    # creating missing directories in some code paths.
-    output_dir.mkdir(parents=True, exist_ok=True)
-    (work_dir / "log").mkdir(parents=True, exist_ok=True)
-
-    pcbrouter_input_path = _prepare_pcbrouter_input_board(router_source_board_path, pcbrouter_input_path)
     exe_path = _find_pcbrouter_executable(app_root)
-    # Pass the grid scale explicitly so PcbRouter uses 0.01 mm cells
-    # (gridFactor = 1 / 100) without rebuilding the executable.
-    pcbrouter_command = [str(exe_path), str(pcbrouter_input_path), str(PCBROUTER_GRID_SCALE)]
-    print(f"pcbrouter_grid_scale = {PCBROUTER_GRID_SCALE}", flush=True)
-    print(f"pcbrouter_grid_pitch_mm = {1.0 / PCBROUTER_GRID_SCALE:.5f}", flush=True)
-    with stdout_log_path.open("w", encoding="utf-8", errors="replace") as stdout_log, stderr_log_path.open(
-        "w", encoding="utf-8", errors="replace"
-    ) as stderr_log:
-        process = subprocess.run(
-            pcbrouter_command,
-            cwd=str(work_dir),
-            stdout=stdout_log,
-            stderr=stderr_log,
-            text=True,
-            check=False,
-        )
-    if process.returncode != 0:
-        raise RuntimeError(
-            "PcbRouter failed with exit code "
-            f"{process.returncode}. stdout={stdout_log_path.resolve()} stderr={stderr_log_path.resolve()}"
-        )
+    profiles = _load_pcbrouter_profiles(profile_manifest_path or os.environ.get("INTERACTIVE_ROUTER_REPLAY_PROFILE_MANIFEST"))
+    max_workers = _profile_max_workers()
+    print(
+        "pcbrouter_profiles = "
+        + ", ".join(profile.name for profile in profiles)
+        + f"  # max_parallel={max_workers}",
+        flush=True,
+    )
 
-    produced_board = _find_pcbrouter_routed_board(output_dir, board_path.stem)
-    if produced_board is None:
-        raise RuntimeError(
-            f"PcbRouter completed but no routed board was found under {output_dir.resolve()}. "
-            f"stdout={stdout_log_path.resolve()} stderr={stderr_log_path.resolve()}"
-        )
-    shutil.copyfile(produced_board, routed_board_path)
+    started_at = perf_counter()
+    stage_results = _run_pcbrouter_profiles(
+        profiles=profiles,
+        board_stem=board_path.stem,
+        router_source_board_path=router_source_board_path,
+        work_dir=work_dir,
+        exe_path=exe_path,
+        max_workers=max_workers,
+        final_repair_enabled=False,
+    )
+    elapsed_sec = perf_counter() - started_at
+    if not stage_results:
+        raise RuntimeError("PcbRouter did not produce any profile result.")
 
-    produced_payload = output_dir / "pcbrouter_ripped_routes.json"
-    final_payload_path: Path | None = None
-    if produced_payload.exists():
-        shutil.copyfile(produced_payload, ripup_payload_path)
-        final_payload_path = ripup_payload_path
+    raw_selected_stage = min(
+        stage_results,
+        key=lambda stage: (
+            len(stage["failed_net_ids_estimated"]),
+            len(stage["routed_board"].vias),
+            sum(len(item.segments) for item in stage["ripup_previews"]),
+        ),
+    )
+    repaired_started_at = perf_counter()
+    try:
+        selected_stage = _run_pcbrouter_profile_stage(
+            profile=raw_selected_stage["profile"],
+            board_stem=board_path.stem,
+            router_source_board_path=router_source_board_path,
+            profile_root=work_dir / "selected_repair_profile",
+            exe_path=exe_path,
+            final_repair_enabled=True,
+        )
+        selected_stage["selected_repair_elapsed_sec"] = perf_counter() - repaired_started_at
+        stage_results.append(selected_stage)
+    except Exception as exc:
+        # Keep the raw selected profile if selected-only repair fails, so the
+        # bridge still returns a reproducible router result instead of losing
+        # all candidates from successful diversity profiles.
+        print(f"pcbrouter_selected_repair_failed {raw_selected_stage['profile'].name} reason={exc}", flush=True)
+        selected_stage = raw_selected_stage
+    _copy_stage_artifact(Path(selected_stage["routed_board_path"]), routed_board_path)
+    if selected_stage["ripup_payload_path"] is not None:
+        _copy_stage_artifact(Path(selected_stage["ripup_payload_path"]), ripup_payload_path)
+        final_payload_path: Path | None = ripup_payload_path
+    else:
+        final_payload_path = None
+    _copy_stage_artifact(Path(selected_stage["stdout_log_path"]), stdout_log_path)
+    _copy_stage_artifact(Path(selected_stage["stderr_log_path"]), stderr_log_path)
 
     original_board, original_candidate_board = _load_selector_original_board(
         input_board_path=board_path,
         router_source_board_path=router_source_board_path,
+        board_cache=board_cache,
     )
-    routed_board = load_board(routed_board_path)
-    ripup_previews = _load_ripup_previews(final_payload_path) if final_payload_path is not None else []
-    ripup_event_count = _read_ripup_event_count(final_payload_path)
-    failed_net_ids_estimated = tuple(_estimate_failed_nets(routed_board))
+    routed_board = selected_stage["routed_board"]
+    candidate_routed_boards = tuple(stage["routed_board"] for stage in stage_results)
+    candidate_routed_board_paths = tuple(Path(stage["routed_board_path"]) for stage in stage_results)
+    candidate_ripup_payload_paths = tuple(
+        Path(stage["ripup_payload_path"])
+        for stage in stage_results
+        if stage["ripup_payload_path"] is not None
+    )
+    ripup_previews = [
+        preview
+        for stage in stage_results
+        for preview in stage["ripup_previews"]
+    ]
+    ripup_event_count = sum(int(stage["ripup_event_count"]) for stage in stage_results)
+    failed_net_ids_estimated = tuple(selected_stage["failed_net_ids_estimated"])
+    profile_reports = tuple(_stage_report_for_manifest(stage) for stage in stage_results)
+    metadata = {
+        "schema": PCBROUTER_PROFILE_SCHEMA,
+        "board": str(board_path),
+        "router_source_board": str(router_source_board_path),
+        "selected_profile": selected_stage["profile"].name,
+        "raw_selected_profile": raw_selected_stage["profile"].name,
+        "non_selected_profile_repair": "skipped",
+        "selected_profile_repair": bool(selected_stage is not raw_selected_stage),
+        "max_parallel_profiles": max_workers,
+        "elapsed_sec": elapsed_sec,
+        "profiles": list(profile_reports),
+    }
+    metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    print(f"pcbrouter_profile_manifest = {metadata_path.resolve()}", flush=True)
+    for report in profile_reports:
+        print(
+            "pcbrouter_profile_result "
+            f"{report['name']} = failed_nets={len(report['failed_net_ids_estimated'])} "
+            f"vias={report['via_count']} payload={report['ripup_payload_path']}",
+            flush=True,
+        )
+        timing = report.get("timing", {})
+        if isinstance(timing, dict):
+            print(
+                "pcbrouter_profile_timing "
+                f"{report['name']} "
+                f"prepare_sec={float(timing.get('prepare_sec', 0.0)):.3f} "
+                f"subprocess_sec={float(timing.get('subprocess_sec', 0.0)):.3f} "
+                f"artifact_collect_sec={float(timing.get('artifact_collect_sec', 0.0)):.3f} "
+                f"parser_sec={float(timing.get('internal_parser_sec', 0.0)):.3f} "
+                f"route_output_drc_sec={float(timing.get('internal_route_output_drc_sec', 0.0)):.3f} "
+                f"repair_sec={float(timing.get('internal_repair_sec', 0.0)):.3f} "
+                f"total_sec={float(timing.get('stage_total_sec', 0.0)):.3f}",
+                flush=True,
+            )
 
     return PcbRouterRunResult(
         original_board=original_board,
@@ -140,12 +226,340 @@ def run_pcb_router_full(board_path: str | Path) -> PcbRouterRunResult:
         work_dir=work_dir,
         routed_board_path=routed_board_path,
         ripup_payload_path=final_payload_path,
+        candidate_routed_boards=candidate_routed_boards,
+        candidate_routed_board_paths=candidate_routed_board_paths,
+        candidate_ripup_payload_paths=candidate_ripup_payload_paths,
+        attempted_profiles=tuple(profile.name for profile in profiles),
+        selected_profile=str(selected_stage["profile"].name),
+        profile_reports=profile_reports,
+        profile_manifest_path=metadata_path.resolve(),
         unique_ripped_net_count=len({item.net_id for item in ripup_previews}),
         ripup_event_count=ripup_event_count,
         stdout_log_path=stdout_log_path.resolve(),
         stderr_log_path=stderr_log_path.resolve(),
         failed_net_ids_estimated=failed_net_ids_estimated,
     )
+
+
+def _load_pcbrouter_profiles(manifest_path: str | Path | None = None) -> tuple[PcbRouterProfile, ...]:
+    """Load reproducible PcbRouter profiles from a manifest or use diversity defaults."""
+    if manifest_path:
+        manifest_file = Path(manifest_path)
+        if manifest_file.exists():
+            manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+            raw_profiles = manifest.get("profiles", []) if isinstance(manifest, dict) else []
+            profiles = [
+                _pcbrouter_profile_from_mapping(raw)
+                for raw in raw_profiles
+                if isinstance(raw, dict) and str(raw.get("router", "pcbrouter")) == "pcbrouter"
+            ]
+            if profiles:
+                return tuple(profiles)
+
+    light_profiles = (
+        PcbRouterProfile(name="natural", order_strategy="natural", order_seed=1470295829),
+        PcbRouterProfile(name="reverse", order_strategy="reverse", order_seed=1470295829),
+        PcbRouterProfile(name="random_seed_1", order_strategy="random", order_seed=1),
+    )
+    if os.environ.get("INTERACTIVE_ROUTER_PROFILE_SET", "diversity_light") != "diversity_full":
+        return light_profiles
+    return (
+        *light_profiles,
+        PcbRouterProfile(name="high_pin_first", order_strategy="high_pin_first", order_seed=1470295829),
+        PcbRouterProfile(name="high_obstacle", order_strategy="natural", order_seed=1470295829, track_obstacle_weight=500.0),
+    )
+
+
+def _pcbrouter_profile_from_mapping(raw: dict[str, object]) -> PcbRouterProfile:
+    """Convert a manifest profile object into a PcbRouterProfile."""
+    params = raw.get("params", {})
+    if not isinstance(params, dict):
+        params = {}
+    return PcbRouterProfile(
+        name=str(raw.get("name") or raw.get("id") or "profile"),
+        order_strategy=str(raw.get("order_strategy") or params.get("order_strategy") or "natural"),
+        order_seed=_optional_int(raw.get("order_seed", params.get("order_seed"))),
+        grid_scale=int(params.get("grid_scale", raw.get("grid_scale", PCBROUTER_GRID_SCALE))),
+        num_iterations=_optional_int(params.get("num_iterations")),
+        enlarge_boundary=_optional_int(params.get("enlarge_boundary")),
+        layer_change_weight=_optional_float(params.get("layer_change_weight")),
+        track_obstacle_weight=_optional_float(params.get("track_obstacle_weight")),
+        track_obstacle_step_size=_optional_float(params.get("track_obstacle_step_size")),
+        via_obstacle_step_size=_optional_float(params.get("via_obstacle_step_size")),
+    )
+
+
+def _optional_int(value: object) -> int | None:
+    """Parse an optional integer from JSON/env-like values."""
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def _optional_float(value: object) -> float | None:
+    """Parse an optional float from JSON/env-like values."""
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _profile_max_workers() -> int:
+    """Limit profile process parallelism so router runs stay reproducible and memory-safe."""
+    try:
+        value = int(os.environ.get("INTERACTIVE_ROUTER_PROFILE_MAX_PARALLEL", "2"))
+    except ValueError:
+        value = 2
+    return max(1, min(value, 4))
+
+
+def _run_pcbrouter_profiles(
+    profiles: tuple[PcbRouterProfile, ...],
+    board_stem: str,
+    router_source_board_path: Path,
+    work_dir: Path,
+    exe_path: Path,
+    max_workers: int,
+    final_repair_enabled: bool,
+) -> list[dict[str, object]]:
+    """Run PcbRouter profiles in isolated work directories and return stage artifacts."""
+    profile_root = work_dir / "profiles"
+    if profile_root.exists():
+        shutil.rmtree(profile_root)
+    profile_root.mkdir(parents=True, exist_ok=True)
+
+    results: list[dict[str, object]] = []
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(profiles))) as executor:
+        future_to_profile = {
+            executor.submit(
+                _run_pcbrouter_profile_stage,
+                profile=profile,
+                board_stem=board_stem,
+                router_source_board_path=router_source_board_path,
+                profile_root=profile_root,
+                exe_path=exe_path,
+                final_repair_enabled=final_repair_enabled,
+            ): profile
+            for profile in profiles
+        }
+        for future in as_completed(future_to_profile):
+            profile = future_to_profile[future]
+            try:
+                results.append(future.result())
+            except Exception as exc:
+                print(f"pcbrouter_profile_failed {profile.name} reason={exc}", flush=True)
+    results.sort(key=lambda stage: profiles.index(stage["profile"]))
+    return results
+
+
+def _run_pcbrouter_profile_stage(
+    profile: PcbRouterProfile,
+    board_stem: str,
+    router_source_board_path: Path,
+    profile_root: Path,
+    exe_path: Path,
+    final_repair_enabled: bool,
+) -> dict[str, object]:
+    """Run one PcbRouter profile in an isolated directory with reproducible environment."""
+    stage_started_at = perf_counter()
+    prepare_started_at = perf_counter()
+    stage_dir = profile_root / _safe_profile_name(profile.name)
+    if stage_dir.exists():
+        shutil.rmtree(stage_dir)
+    output_dir = stage_dir / "output"
+    log_dir = stage_dir / "log"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    pcbrouter_input_path = _prepare_pcbrouter_input_board(router_source_board_path, stage_dir / f"{board_stem}.kicad_pcb")
+    stdout_log_path = stage_dir / "pcbrouter.stdout.log"
+    stderr_log_path = stage_dir / "pcbrouter.stderr.log"
+    command = _pcbrouter_command(exe_path, pcbrouter_input_path, profile)
+    env = os.environ.copy()
+    env["PCBROUTER_ORDER_STRATEGY"] = profile.order_strategy
+    env["PCBROUTER_FINAL_REPAIR"] = "1" if final_repair_enabled else "0"
+    if profile.order_seed is not None:
+        env["PCBROUTER_ORDER_SEED"] = str(profile.order_seed)
+    prepare_sec = perf_counter() - prepare_started_at
+    print(
+        f"pcbrouter_profile_start {profile.name} order={profile.order_strategy} "
+        f"seed={profile.order_seed} grid_scale={profile.grid_scale} "
+        f"final_repair={'on' if final_repair_enabled else 'off'}",
+        flush=True,
+    )
+    subprocess_started_at = perf_counter()
+    with stdout_log_path.open("w", encoding="utf-8", errors="replace") as stdout_log, stderr_log_path.open(
+        "w", encoding="utf-8", errors="replace"
+    ) as stderr_log:
+        process = subprocess.run(
+            command,
+            cwd=str(stage_dir),
+            stdout=stdout_log,
+            stderr=stderr_log,
+            text=True,
+            check=False,
+            env=env,
+        )
+    subprocess_sec = perf_counter() - subprocess_started_at
+    if process.returncode != 0:
+        raise RuntimeError(
+            "PcbRouter failed with exit code "
+            f"{process.returncode}. stdout={stdout_log_path.resolve()} stderr={stderr_log_path.resolve()}"
+        )
+    artifact_started_at = perf_counter()
+    produced_board = _find_pcbrouter_routed_board(output_dir, board_stem)
+    if produced_board is None:
+        raise RuntimeError(
+            f"PcbRouter completed but no routed board was found under {output_dir.resolve()}. "
+            f"stdout={stdout_log_path.resolve()} stderr={stderr_log_path.resolve()}"
+        )
+    routed_board_path = stage_dir / f"{board_stem}.{profile.name}.pcbrouter.routed.kicad_pcb"
+    shutil.copyfile(produced_board, routed_board_path)
+    produced_payload = output_dir / "pcbrouter_ripped_routes.json"
+    ripup_payload_path: Path | None = None
+    if produced_payload.exists():
+        ripup_payload_path = stage_dir / f"{profile.name}.pcbrouter_ripped_routes.json"
+        shutil.copyfile(produced_payload, ripup_payload_path)
+    routed_board = load_board(routed_board_path)
+    artifact_collect_sec = perf_counter() - artifact_started_at
+    internal_timing = _parse_pcbrouter_stdout_timing(stdout_log_path)
+    timing = {
+        "prepare_sec": prepare_sec,
+        "subprocess_sec": subprocess_sec,
+        "artifact_collect_sec": artifact_collect_sec,
+        "stage_total_sec": perf_counter() - stage_started_at,
+        **internal_timing,
+    }
+    return {
+        "profile": profile,
+        "stage_dir": stage_dir,
+        "routed_board": routed_board,
+        "routed_board_path": routed_board_path.resolve(),
+        "ripup_payload_path": ripup_payload_path.resolve() if ripup_payload_path is not None else None,
+        "ripup_previews": _load_ripup_previews(ripup_payload_path, backend_label=f"pcbrouter:{profile.name}"),
+        "ripup_event_count": _read_ripup_event_count(ripup_payload_path),
+        "failed_net_ids_estimated": tuple(_estimate_failed_nets(routed_board)),
+        "stdout_log_path": stdout_log_path.resolve(),
+        "stderr_log_path": stderr_log_path.resolve(),
+        "timing": timing,
+        "final_repair_enabled": final_repair_enabled,
+    }
+
+
+def _pcbrouter_command(exe_path: Path, board_path: Path, profile: PcbRouterProfile) -> list[str]:
+    """Build the positional PcbRouter command while preserving old defaults."""
+    command = [str(exe_path), str(board_path), str(profile.grid_scale)]
+    optional_values = [
+        (profile.num_iterations, 5),
+        (profile.enlarge_boundary, 0),
+        (profile.layer_change_weight, 10.0),
+        (profile.track_obstacle_weight, 50.0),
+        (profile.track_obstacle_step_size, 0.0),
+        (profile.via_obstacle_step_size, 0.0),
+    ]
+    while optional_values and optional_values[-1][0] is None:
+        optional_values.pop()
+    command.extend(str(value if value is not None else default) for value, default in optional_values)
+    return command
+
+
+def _safe_profile_name(name: str) -> str:
+    """Make a profile name safe for local folder and artifact names."""
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("._")
+    return safe or "profile"
+
+
+def _copy_stage_artifact(source: Path, destination: Path) -> None:
+    """Copy a selected profile artifact unless it already has the target path."""
+    if source.resolve() == destination.resolve():
+        return
+    shutil.copyfile(source, destination)
+
+
+def _stage_report_for_manifest(stage: dict[str, object]) -> dict[str, object]:
+    """Serialize one PcbRouter profile stage for replay and debugging."""
+    profile = stage["profile"]
+    assert isinstance(profile, PcbRouterProfile)
+    return {
+        "router": "pcbrouter",
+        "name": profile.name,
+        "order_strategy": profile.order_strategy,
+        "order_seed": profile.order_seed,
+        "params": {
+            "grid_scale": profile.grid_scale,
+            "num_iterations": profile.num_iterations,
+            "enlarge_boundary": profile.enlarge_boundary,
+            "layer_change_weight": profile.layer_change_weight,
+            "track_obstacle_weight": profile.track_obstacle_weight,
+            "track_obstacle_step_size": profile.track_obstacle_step_size,
+            "via_obstacle_step_size": profile.via_obstacle_step_size,
+        },
+        "routed_board_path": str(stage["routed_board_path"]),
+        "ripup_payload_path": str(stage["ripup_payload_path"]) if stage["ripup_payload_path"] is not None else None,
+        "stdout_log_path": str(stage["stdout_log_path"]),
+        "stderr_log_path": str(stage["stderr_log_path"]),
+        "via_count": len(stage["routed_board"].vias),
+        "failed_net_ids_estimated": list(stage["failed_net_ids_estimated"]),
+        "ripup_event_count": int(stage["ripup_event_count"]),
+        "timing": stage.get("timing", {}),
+        "final_repair_enabled": bool(stage.get("final_repair_enabled", True)),
+    }
+
+
+def _parse_pcbrouter_stdout_timing(stdout_log_path: Path) -> dict[str, float]:
+    """Extract coarse PcbRouter phase timing from stdout without touching router code.
+
+    The router already prints parser, GridBasedRouter, final total, and repair
+    timing lines. This parser keeps the bridge-level timing reproducible and
+    avoids changing the routing process itself.
+    """
+    timing = {
+        "internal_parser_sec": 0.0,
+        "internal_grid_router_sec": 0.0,
+        "internal_final_real_sec": 0.0,
+        "internal_repair_sec": 0.0,
+        "internal_route_output_drc_sec": 0.0,
+    }
+    try:
+        text = stdout_log_path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return timing
+
+    for label, seconds in re.findall(
+        r"-+\s*(.*?)\s+period time usage\s*-+\s*[\r\n]+\s*Real:([0-9.]+)s;",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        normalized_label = label.strip().lower()
+        value = float(seconds)
+        if normalized_label == "parser":
+            timing["internal_parser_sec"] = value
+        elif normalized_label == "gridbasedrouter":
+            timing["internal_grid_router_sec"] = value
+
+    final_match = re.search(r"Final Real:([0-9.]+)s;", text)
+    if final_match:
+        timing["internal_final_real_sec"] = float(final_match.group(1))
+
+    repair_match = re.search(r"pcbrouter_final_repair_timing_sec\s*=\s*([0-9.]+)", text)
+    if repair_match:
+        timing["internal_repair_sec"] = float(repair_match.group(1))
+
+    if timing["internal_grid_router_sec"] > 0.0:
+        timing["internal_route_output_drc_sec"] = max(
+            0.0,
+            timing["internal_grid_router_sec"] - timing["internal_repair_sec"],
+        )
+    elif timing["internal_final_real_sec"] > 0.0:
+        timing["internal_route_output_drc_sec"] = max(
+            0.0,
+            timing["internal_final_real_sec"] - timing["internal_parser_sec"] - timing["internal_repair_sec"],
+        )
+    return timing
 
 
 def _prepare_pcbrouter_input_board(board_path: Path, output_path: Path) -> Path:
@@ -188,7 +602,7 @@ def _prepare_pcbrouter_input_board(board_path: Path, output_path: Path) -> Path:
     return output_path
 
 
-def _canonical_router_source_board(board_path: Path) -> Path:
+def _canonical_router_source_board(board_path: Path, board_cache: BoardCache | None = None) -> Path:
     """Choose the board coordinate frame used by PcbRouter.
 
     If a routed reference board is only a translated copy of its sibling
@@ -200,7 +614,7 @@ def _canonical_router_source_board(board_path: Path) -> Path:
     if sibling is None:
         return board_path
     try:
-        dx, dy = _board_translation_from_common_pads(source_board=sibling, target_board=board_path)
+        dx, dy = _board_translation_from_common_pads(source_board=sibling, target_board=board_path, board_cache=board_cache)
     except Exception:
         return board_path
     print(f"pcbrouter_router_source_board = {sibling.resolve()}", flush=True)
@@ -209,7 +623,11 @@ def _canonical_router_source_board(board_path: Path) -> Path:
     return sibling
 
 
-def _load_selector_original_board(input_board_path: Path, router_source_board_path: Path) -> tuple[BoardData, BoardData | None]:
+def _load_selector_original_board(
+    input_board_path: Path,
+    router_source_board_path: Path,
+    board_cache: BoardCache | None = None,
+) -> tuple[BoardData, BoardData | None]:
     """Load selector data in router coordinates while preserving input routes.
 
     Selector geometry must share the external router's coordinate frame. For a
@@ -218,11 +636,15 @@ def _load_selector_original_board(input_board_path: Path, router_source_board_pa
     are shifted back separately and exposed as original candidate geometry.
     """
     if input_board_path == router_source_board_path:
-        return load_board(input_board_path), None
+        return _load_board_cached(input_board_path, board_cache), None
 
-    source_board = load_board(router_source_board_path)
-    input_board = load_board(input_board_path)
-    dx, dy = _board_translation_from_common_pads(source_board=router_source_board_path, target_board=input_board_path)
+    source_board = _load_board_cached(router_source_board_path, board_cache)
+    input_board = _load_board_cached(input_board_path, board_cache)
+    dx, dy = _board_translation_from_common_pads(
+        source_board=router_source_board_path,
+        target_board=input_board_path,
+        board_cache=board_cache,
+    )
     translated_tracks = [
         TrackSegment(
             start=(track.start[0] - dx, track.start[1] - dy),
@@ -265,15 +687,19 @@ def _load_selector_original_board(input_board_path: Path, router_source_board_pa
     return source_board, translated_candidate_board
 
 
-def _board_translation_from_common_pads(source_board: Path, target_board: Path) -> tuple[float, float]:
+def _board_translation_from_common_pads(
+    source_board: Path,
+    target_board: Path,
+    board_cache: BoardCache | None = None,
+) -> tuple[float, float]:
     """Calculate a constant source-to-target board translation from common pads.
 
     PcbRouter must route in the same coordinate frame as the displayed board.
     When a sibling board provides only the missing outline, common footprint/pad
     centers give a robust way to move that outline into the target board frame.
     """
-    source_pads = _pad_centers_by_key(load_board(source_board))
-    target_pads = _pad_centers_by_key(load_board(target_board))
+    source_pads = _pad_centers_by_key(_load_board_cached(source_board, board_cache))
+    target_pads = _pad_centers_by_key(_load_board_cached(target_board, board_cache))
     common_keys = sorted(set(source_pads) & set(target_pads))
     if len(common_keys) < 3:
         raise RuntimeError(
@@ -295,6 +721,18 @@ def _board_translation_from_common_pads(source_board: Path, target_board: Path) 
             f"source={source_board} target={target_board}"
         )
     return dx, dy
+
+
+def _load_board_cached(board_path: Path, board_cache: BoardCache | None = None) -> BoardData:
+    """Load a board once per bridge run and reuse it for metadata-only reads."""
+    if board_cache is None:
+        return load_board(board_path)
+    key = Path(board_path).resolve()
+    cached = board_cache.get(key)
+    if cached is None:
+        cached = load_board(key)
+        board_cache[key] = cached
+    return cached
 
 
 def _pad_centers_by_key(board: BoardData) -> dict[tuple[str, str], tuple[float, float]]:
@@ -491,7 +929,7 @@ def _find_pcbrouter_routed_board(output_dir: Path, board_stem: str) -> Path | No
     return None
 
 
-def _load_ripup_previews(payload_path: Path | None) -> list[PcbRouterRipupPreview]:
+def _load_ripup_previews(payload_path: Path | None, backend_label: str = "pcbrouter") -> list[PcbRouterRipupPreview]:
     """Load PcbRouter ripped route previews from its component occurrence payload."""
     if payload_path is None or not payload_path.exists():
         return []
@@ -527,6 +965,7 @@ def _load_ripup_previews(payload_path: Path | None) -> list[PcbRouterRipupPrevie
                     truncated=bool(occurrence.get("truncated", False)),
                     occurrence_index=int(occurrence.get("event_index", 0)),
                     source_net_id=source_net_id,
+                    backend=backend_label,
                 )
             )
     previews.sort(key=lambda item: (item.occurrence_index, item.net_id))

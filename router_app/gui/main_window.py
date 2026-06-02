@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+from datetime import datetime
 from math import hypot
 from pathlib import Path
 from types import SimpleNamespace
@@ -38,17 +39,26 @@ from router_app.gui.pcb_canvas import PcbCanvas, RoutePreviewCanvas
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, initial_file: str | None = None, freerouting_full: bool = False, pcb_router: bool = False):
+    def __init__(
+        self,
+        initial_file: str | None = None,
+        freerouting_full: bool = False,
+        pcb_router: bool = False,
+        router_profile_manifest: str | None = None,
+    ):
         super().__init__()
+        self._program_started_at = datetime.now().astimezone()
         self._board: BoardData | None = None
         self._original_board: BoardData | None = None
         self._candidate_outcome = None
         self._candidate_ripped_net_ids: set[int] = set()
         self._freerouting_full_enabled = freerouting_full
         self._pcb_router_enabled = pcb_router
+        self._router_profile_manifest = router_profile_manifest
         self._freerouting_run: FreeroutingRunResult | None = None
         self._pcb_router_run: PcbRouterRunResult | None = None
         self._freerouting_candidates_ready = False
+        self._external_candidate_timing: dict[str, datetime] = {}
 
         self.setWindowTitle("KiCad Auto Router Viewer")
         self.resize(1280, 820)
@@ -207,18 +217,27 @@ class MainWindow(QMainWindow):
         # board and payload available to the selector candidate builder.
         freerouting_result: FreeroutingRunResult | None = None
         pcbrouter_result: PcbRouterRunResult | None = None
+        self._external_candidate_timing = {
+            "program_started_at": self._program_started_at,
+            "collection_started_at": datetime.now().astimezone(),
+        }
         if self._freerouting_full_enabled:
             try:
-                freerouting_result = run_freerouting_full(file_name)
+                self._external_candidate_timing["freerouting_started_at"] = datetime.now().astimezone()
+                freerouting_result = run_freerouting_full(file_name, profile_manifest_path=self._router_profile_manifest)
+                self._external_candidate_timing["freerouting_finished_at"] = datetime.now().astimezone()
             except Exception as exc:
                 QMessageBox.critical(self, "freerouting-full failed", str(exc))
                 return
         if self._pcb_router_enabled:
             try:
-                pcbrouter_result = run_pcb_router_full(file_name)
+                self._external_candidate_timing["pcbrouter_started_at"] = datetime.now().astimezone()
+                pcbrouter_result = run_pcb_router_full(file_name, profile_manifest_path=self._router_profile_manifest)
+                self._external_candidate_timing["pcbrouter_finished_at"] = datetime.now().astimezone()
             except Exception as exc:
                 QMessageBox.critical(self, "pcb-router failed", str(exc))
                 return
+        self._external_candidate_timing["collection_finished_at"] = datetime.now().astimezone()
 
         self._freerouting_run = freerouting_result
         self._pcb_router_run = pcbrouter_result
@@ -289,8 +308,15 @@ class MainWindow(QMainWindow):
         return ".routed" in board_path.stem
 
     def _open_board_with_freerouting(self, file_name: str) -> None:
+        self._external_candidate_timing = {
+            "program_started_at": self._program_started_at,
+            "collection_started_at": datetime.now().astimezone(),
+            "freerouting_started_at": datetime.now().astimezone(),
+        }
         try:
-            result = run_freerouting_full(file_name)
+            result = run_freerouting_full(file_name, profile_manifest_path=self._router_profile_manifest)
+            self._external_candidate_timing["freerouting_finished_at"] = datetime.now().astimezone()
+            self._external_candidate_timing["collection_finished_at"] = datetime.now().astimezone()
         except Exception as exc:
             QMessageBox.critical(self, "freerouting-full failed", str(exc))
             return
@@ -452,6 +478,11 @@ class MainWindow(QMainWindow):
         ]
         print(f"pcbrouter_ripup_event_count = {result.ripup_event_count}", flush=True)
         print(f"pcbrouter_unique_ripped_nets = {result.unique_ripped_net_count}", flush=True)
+        if result.attempted_profiles:
+            print("pcbrouter_profiles_attempted = " + ", ".join(result.attempted_profiles), flush=True)
+            print(f"pcbrouter_profile_selected = {result.selected_profile}", flush=True)
+        if result.profile_manifest_path is not None:
+            print(f"pcbrouter_profile_manifest = {Path(result.profile_manifest_path).resolve()}", flush=True)
         print(f"pcbrouter_total_wire_length_mm = {total_wire_length_mm:.3f}", flush=True)
         print(f"pcbrouter_total_via_count = {len(result.routed_board.vias)}", flush=True)
         print(
@@ -560,6 +591,7 @@ class MainWindow(QMainWindow):
                 return
 
             selection = select_reroute_candidates(self._candidate_outcome, max_paths_per_net=1, prefer_gurobi=True)
+            self._print_external_candidate_collection_timing()
             if not selection.ok:
                 self.statusBar().showMessage(f"Path selection failed: {selection.message}")
                 return
@@ -630,6 +662,49 @@ class MainWindow(QMainWindow):
         else:
             self.route_preview.show_message("Generate candidates first")
 
+    def _print_external_candidate_collection_timing(self) -> None:
+        """Print wall-clock timing for external-router candidate collection.
+
+        Timestamps are captured around the external router calls, then reported
+        after the selector returns so the terminal ends with a single summary of
+        command start, candidate collection completion, and per-router profile
+        durations.
+        """
+        timing = self._external_candidate_timing
+        program_started = timing.get("program_started_at")
+        collection_finished = timing.get("collection_finished_at")
+        if program_started is None or collection_finished is None:
+            return
+
+        elapsed_sec = (collection_finished - program_started).total_seconds()
+        print(
+            "external_candidate_collection_program_started_at = "
+            + _format_wall_timestamp(program_started),
+            flush=True,
+        )
+        print(
+            "external_candidate_collection_finished_at = "
+            + _format_wall_timestamp(collection_finished),
+            flush=True,
+        )
+        print(
+            f"external_candidate_collection_elapsed_sec = {elapsed_sec:.3f}",
+            flush=True,
+        )
+        for router_key, label in (
+            ("freerouting", "freerouting_profiles"),
+            ("pcbrouter", "pcbrouter_profiles"),
+        ):
+            started = timing.get(f"{router_key}_started_at")
+            finished = timing.get(f"{router_key}_finished_at")
+            if started is None or finished is None:
+                continue
+            router_elapsed_sec = (finished - started).total_seconds()
+            print(
+                f"external_candidate_collection_{label}_elapsed_sec = {router_elapsed_sec:.3f}",
+                flush=True,
+            )
+
     def _external_ripup_previews(self) -> list[object]:
         # Keep backend previews as one stream for the GUI and selector setup.
         previews: list[object] = []
@@ -646,7 +721,7 @@ class MainWindow(QMainWindow):
         if self._freerouting_run is not None:
             boards.extend(self._freerouting_run.candidate_routed_boards)
         if self._pcb_router_run is not None:
-            boards.append(self._pcb_router_run.routed_board)
+            boards.extend(self._pcb_router_run.candidate_routed_boards or (self._pcb_router_run.routed_board,))
         return boards
 
     def _external_original_candidate_boards(self) -> list[BoardData]:
@@ -667,7 +742,7 @@ class MainWindow(QMainWindow):
     def _pcbrouter_payload_paths(self) -> list[Path]:
         if self._pcb_router_run is None or self._pcb_router_run.ripup_payload_path is None:
             return []
-        return [self._pcb_router_run.ripup_payload_path]
+        return list(self._pcb_router_run.candidate_ripup_payload_paths or (self._pcb_router_run.ripup_payload_path,))
 
     def _show_external_backend_ripped_routes(self) -> None:
         previews = self._external_ripup_previews()
@@ -1046,6 +1121,11 @@ def _median(values: object) -> float:
     if len(ordered) % 2:
         return ordered[middle]
     return (ordered[middle - 1] + ordered[middle]) / 2.0
+
+
+def _format_wall_timestamp(value: datetime) -> str:
+    """Format a wall-clock timestamp with seconds and timezone offset."""
+    return value.isoformat(timespec="seconds")
 
 
 def _translated_preview_segment(segment: object, dx: float, dy: float) -> SimpleNamespace:

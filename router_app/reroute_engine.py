@@ -183,6 +183,15 @@ def select_reroute_candidates(
             candidate_preview_items,
             len(item.candidate_boundary_vertices),
         )
+        candidate_display_lengths_mm = _candidate_display_lengths_for_selector(
+            router_core=router_core,
+            board=selector_board,
+            result=result,
+            candidate_paths_grid=candidate_paths_grid,
+            candidate_preview_items=candidate_preview_items,
+            candidate_terminal_groups=item.candidate_terminal_groups,
+            candidate_count=len(item.candidate_boundary_vertices),
+        )
         candidate_bend_counts = _candidate_bend_counts_for_selector(
             router_core=router_core,
             board=selector_board,
@@ -196,6 +205,7 @@ def select_reroute_candidates(
         item.candidate_bend_counts = candidate_bend_counts
         try:
             setattr(result, "candidate_lengths_mm", candidate_lengths_mm)
+            setattr(result, "candidate_display_lengths_mm", candidate_display_lengths_mm)
             setattr(result, "candidate_bend_counts", candidate_bend_counts)
         except Exception:
             pass
@@ -335,13 +345,23 @@ def select_reroute_candidates(
     # reference board without changing the candidate set or the Gurobi model.
     left_top_board = outcome.left_top_reference_board or _freerouting_final_board_from_results(outcome.result)
     if left_top_board is not None:
-        left_top_wire_length_mm = sum(
-            math.hypot(track.end[0] - track.start[0], track.end[1] - track.start[1])
-            for track in left_top_board.tracks
+        left_top_wire_length_mm = _board_wire_length_outside_selector_pads(
+            router_core,
+            left_top_board,
+            outcome.result,
         )
         left_top_via_count = len(left_top_board.vias)
+        left_top_bend_count = _board_bend_count_outside_selector_pads(
+            router_core,
+            left_top_board,
+            outcome.result,
+        )
         print(
             f"selector_left_top_total_via_count = {left_top_via_count}  # 左上顯示 board 總 via 數",
+            flush=True,
+        )
+        print(
+            f"selector_left_top_total_bend_count = {left_top_bend_count}  # 左上顯示 board 總 bend 數",
             flush=True,
         )
         print(
@@ -349,9 +369,13 @@ def select_reroute_candidates(
             flush=True,
         )
 
-    selected_via_count, selected_wire_length_mm = _selected_solution_stats(outcome.result, selections)
+    selected_via_count, selected_bend_count, selected_wire_length_mm = _selected_solution_stats(outcome.result, selections)
     print(
         f"selector_selected_total_via_count = {selected_via_count}  # Gurobi 選出結果總 via 數",
+        flush=True,
+    )
+    print(
+        f"selector_selected_total_bend_count = {selected_bend_count}  # Gurobi 選出結果總 bend 數",
         flush=True,
     )
     print(
@@ -862,6 +886,39 @@ def _candidate_lengths_for_selector(
     return lengths
 
 
+def _candidate_display_lengths_for_selector(
+    router_core: Any,
+    board: BoardData | None,
+    result: Any,
+    candidate_paths_grid: list[list[Any]],
+    candidate_preview_items: list[Any],
+    candidate_terminal_groups: list[list[list[Any]]],
+    candidate_count: int,
+) -> list[float]:
+    """Return display-only candidate lengths with terminal pad areas excluded.
+
+    These values are used for terminal reporting, not for the Gurobi objective.
+    Keeping them separate preserves the existing solver objective while making
+    the printed length metric match the pad-aware bend metric.
+    """
+    lengths: list[float] = []
+    external_offset = len(candidate_paths_grid)
+    for candidate_idx in range(candidate_count):
+        terminal_groups = (
+            candidate_terminal_groups[candidate_idx]
+            if candidate_idx < len(candidate_terminal_groups)
+            else []
+        )
+        pad_boxes = _terminal_group_grid_boxes(terminal_groups)
+        if candidate_idx < len(candidate_paths_grid) and candidate_paths_grid[candidate_idx]:
+            lengths.append(_grid_path_length_mm_outside_pads(result, candidate_paths_grid[candidate_idx], pad_boxes))
+            continue
+        preview_idx = candidate_idx - external_offset
+        preview = candidate_preview_items[preview_idx] if 0 <= preview_idx < len(candidate_preview_items) else None
+        lengths.append(_preview_wire_length_mm_outside_pads(board, result, preview, pad_boxes))
+    return lengths
+
+
 def _candidate_bend_counts_for_selector(
     router_core: Any,
     board: BoardData | None,
@@ -906,6 +963,71 @@ def _path_length_mm(path_mm: list[Any]) -> float:
     return total
 
 
+def _grid_point_inside_pad_box_float(
+    x: float,
+    y: float,
+    z: int,
+    pad_boxes: list[tuple[int, int, int, int, set[int]]],
+) -> bool:
+    """Return true when a floating grid-space sample lies inside a pad box."""
+    for min_x, max_x, min_y, max_y, layers in pad_boxes:
+        if z in layers and min_x <= x <= max_x and min_y <= y <= max_y:
+            return True
+    return False
+
+
+def _grid_segment_length_mm_outside_pads(
+    result: Any,
+    start: tuple[int, int, int],
+    end: tuple[int, int, int],
+    pad_boxes: list[tuple[int, int, int, int, set[int]]],
+) -> float:
+    """Approximate the grid segment length outside terminal pad boxes.
+
+    The segment is sampled in grid-space substeps and each substep is counted
+    when its midpoint is outside pad boxes. This mirrors the selector raster
+    view used by bend counting and keeps left-top and selected-candidate reports
+    comparable on the same geometry.
+    """
+    if start[2] != end[2]:
+        return 0.0
+    dx = int(end[0]) - int(start[0])
+    dy = int(end[1]) - int(start[1])
+    if dx == 0 and dy == 0:
+        return 0.0
+    steps = max(abs(dx), abs(dy), 1)
+    pitch = float(getattr(result, "grid_pitch", 0.0))
+    if pitch <= 0.0:
+        return 0.0
+    step_dx = dx / steps
+    step_dy = dy / steps
+    step_length_mm = math.hypot(step_dx * pitch, step_dy * pitch)
+    total = 0.0
+    for step in range(steps):
+        mid_x = float(start[0]) + (step + 0.5) * step_dx
+        mid_y = float(start[1]) + (step + 0.5) * step_dy
+        if not _grid_point_inside_pad_box_float(mid_x, mid_y, start[2], pad_boxes):
+            total += step_length_mm
+    return total
+
+
+def _grid_path_length_mm_outside_pads(
+    result: Any,
+    path_grid: list[Any],
+    pad_boxes: list[tuple[int, int, int, int, set[int]]],
+) -> float:
+    """Measure an ordered grid path while excluding terminal pad boxes."""
+    vertices: list[tuple[int, int, int]] = []
+    for point in path_grid:
+        vertex = _grid_point_to_vertex_tuple(point)
+        if not vertices or vertices[-1] != vertex:
+            vertices.append(vertex)
+    return sum(
+        _grid_segment_length_mm_outside_pads(result, start, end, pad_boxes)
+        for start, end in zip(vertices, vertices[1:])
+    )
+
+
 def _preview_wire_length_mm(preview: Any | None) -> float:
     """Measure external-router preview segments in millimeters."""
     total = 0.0
@@ -915,6 +1037,29 @@ def _preview_wire_length_mm(preview: Any | None) -> float:
         if len(start) < 2 or len(end) < 2:
             continue
         total += math.hypot(float(end[0]) - float(start[0]), float(end[1]) - float(start[1]))
+    return total
+
+
+def _preview_wire_length_mm_outside_pads(
+    board: BoardData | None,
+    result: Any,
+    preview: Any | None,
+    pad_boxes: list[tuple[int, int, int, int, set[int]]],
+) -> float:
+    """Measure preview segments in selector grid-space while excluding pads."""
+    if board is None or preview is None:
+        return 0.0
+    total = 0.0
+    for segment in list(getattr(preview, "segments", []) or []):
+        layer_name = str(getattr(segment, "layer", "F.Cu") or "F.Cu")
+        layer_index = _layer_index_from_name(board, layer_name) or 0
+        start = tuple(getattr(segment, "start", (0.0, 0.0)))
+        end = tuple(getattr(segment, "end", (0.0, 0.0)))
+        if len(start) < 2 or len(end) < 2:
+            continue
+        start_vertex = _mm_to_grid_vertex(result, float(start[0]), float(start[1]), layer_index)
+        end_vertex = _mm_to_grid_vertex(result, float(end[0]), float(end[1]), layer_index)
+        total += _grid_segment_length_mm_outside_pads(result, start_vertex, end_vertex, pad_boxes)
     return total
 
 
@@ -1030,6 +1175,226 @@ def _preview_bend_count_outside_pads(
     return bend_count
 
 
+def _point_inside_pad_body(
+    x_mm: float,
+    y_mm: float,
+    pad: Any,
+) -> bool:
+    """Return true when a board-space point is inside a pad's physical body."""
+    local = _pad_local_point(x_mm, y_mm, pad)
+    half_x = float(pad.size[0]) * 0.5
+    half_y = float(pad.size[1]) * 0.5
+    if half_x <= 0.0 or half_y <= 0.0:
+        return False
+    shape = str(getattr(pad, "shape", "")).lower()
+    if shape in {"circle", "oval", "ellipse"}:
+        return (local[0] / half_x) ** 2 + (local[1] / half_y) ** 2 <= 1.0 + 1e-9
+    return _point_inside_rect(local, half_x, half_y)
+
+
+def _pad_applies_to_layer(pad: Any, layer_name: str) -> bool:
+    """Return true when a pad can electrically touch a route on layer_name."""
+    layers = tuple(str(layer) for layer in getattr(pad, "layers", ()) or ())
+    if not layers:
+        return False
+    if layer_name in layers or "*.Cu" in layers or "F&B.Cu" in layers:
+        return True
+    return layer_name.endswith(".Cu") and any(layer == "*.Cu" or layer.endswith(".Cu") for layer in layers)
+
+
+def _board_bend_count_outside_pads(board: BoardData) -> int:
+    """Estimate a routed board's bend count while ignoring turns inside same-net pads.
+
+    The selector objective stores bend counts per candidate, but the visible
+    left-top board is just a KiCad board. This helper rebuilds a lightweight
+    track endpoint graph from that board so the final comparison can report a
+    bend count for both sides without changing solver behavior.
+    """
+    pads_by_net: dict[int, list[Any]] = {}
+    for footprint in board.footprints:
+        for pad in footprint.pads:
+            if pad.net_id is None:
+                continue
+            pads_by_net.setdefault(int(pad.net_id), []).append(pad)
+
+    adjacency_by_net: dict[int, dict[tuple[int, int, str], set[tuple[int, int, str]]]] = {}
+    for track in board.tracks:
+        net_id = int(track.net_id)
+        start_key = (*_topology_xy_key(float(track.start[0]), float(track.start[1])), str(track.layer))
+        end_key = (*_topology_xy_key(float(track.end[0]), float(track.end[1])), str(track.layer))
+        if start_key == end_key:
+            continue
+        adjacency = adjacency_by_net.setdefault(net_id, {})
+        adjacency.setdefault(start_key, set()).add(end_key)
+        adjacency.setdefault(end_key, set()).add(start_key)
+
+    total_bends = 0
+    for net_id, adjacency in adjacency_by_net.items():
+        same_net_pads = pads_by_net.get(net_id, [])
+        for vertex, neighbors in adjacency.items():
+            x_mm = vertex[0] / 10000.0
+            y_mm = vertex[1] / 10000.0
+            layer_name = vertex[2]
+            if any(
+                _pad_applies_to_layer(pad, layer_name) and _point_inside_pad_body(x_mm, y_mm, pad)
+                for pad in same_net_pads
+            ):
+                continue
+            axes = {
+                axis
+                for neighbor in neighbors
+                for axis in [
+                    _normalized_mm_axis(
+                        (x_mm, y_mm),
+                        (neighbor[0] / 10000.0, neighbor[1] / 10000.0),
+                    )
+                ]
+                if axis is not None
+            }
+            if len(axes) > 1:
+                total_bends += len(axes) - 1
+    return total_bends
+
+
+def _board_bend_count_outside_selector_pads(
+    router_core: Any,
+    board: BoardData,
+    results: list[Any] | None,
+) -> int:
+    """Estimate board bends using the same raster pad boxes as selector candidates.
+
+    The displayed board is not a selector candidate, so we rebuild each net's
+    centerline graph from its tracks and use C++ pad boundary groups to define
+    the pad areas where bends should be ignored.
+    """
+    if not results:
+        return _board_bend_count_outside_pads(board)
+    result_template = results[0]
+    net_ids = sorted({int(track.net_id) for track in board.tracks})
+    total_bends = 0
+    for net_id in net_ids:
+        segments, _vias = _collect_original_route_primitives(
+            board=board,
+            result=result_template,
+            net_id=net_id,
+            max_ripped_clearance=0.0,
+            layer_index_board=board,
+        )
+        if not segments:
+            continue
+        pad_groups = _cpp_pad_boundary_groups_for_net(router_core, board, result_template, net_id)
+        pad_boxes = _terminal_group_grid_boxes(pad_groups)
+        total_bends += _primitive_bend_count_outside_selector_pads(result_template, segments, pad_boxes)
+    return total_bends
+
+
+def _board_wire_length_outside_selector_pads(
+    router_core: Any,
+    board: BoardData,
+    results: list[Any] | None,
+) -> float:
+    """Measure a routed board while excluding same-net terminal pad boxes.
+
+    This is a reporting metric for the displayed left-top board. It uses the
+    same selector-raster pad boxes as candidate bend/length display metrics, so
+    the visible board and the selected candidate can be compared on one scale.
+    """
+    if not results:
+        return sum(
+            math.hypot(track.end[0] - track.start[0], track.end[1] - track.start[1])
+            for track in board.tracks
+        )
+    result_template = results[0]
+    total_length = 0.0
+    net_ids = sorted({int(track.net_id) for track in board.tracks})
+    for net_id in net_ids:
+        segments, _vias = _collect_original_route_primitives(
+            board=board,
+            result=result_template,
+            net_id=net_id,
+            max_ripped_clearance=0.0,
+            layer_index_board=board,
+        )
+        if not segments:
+            continue
+        pad_groups = _cpp_pad_boundary_groups_for_net(router_core, board, result_template, net_id)
+        pad_boxes = _terminal_group_grid_boxes(pad_groups)
+        total_length += _primitive_wire_length_outside_selector_pads(result_template, segments, pad_boxes)
+    return total_length
+
+
+def _primitive_bend_count_outside_selector_pads(
+    result: Any,
+    segments: list[dict[str, Any]],
+    pad_boxes: list[tuple[int, int, int, int, set[int]]],
+) -> int:
+    """Count bends from route primitives while ignoring selector-raster pad boxes."""
+    adjacency: dict[tuple[int, int, int], set[tuple[int, int, int]]] = {}
+    for segment in segments:
+        start = segment.get("start", (0.0, 0.0))
+        end = segment.get("end", (0.0, 0.0))
+        if len(start) < 2 or len(end) < 2:
+            continue
+        z = int(segment.get("z", 0))
+        start_vertex = _mm_to_grid_vertex(result, float(start[0]), float(start[1]), z)
+        end_vertex = _mm_to_grid_vertex(result, float(end[0]), float(end[1]), z)
+        if start_vertex == end_vertex:
+            continue
+        adjacency.setdefault(start_vertex, set()).add(end_vertex)
+        adjacency.setdefault(end_vertex, set()).add(start_vertex)
+
+    bend_count = 0
+    for vertex, neighbors in adjacency.items():
+        if _grid_vertex_inside_pad_box(vertex, pad_boxes):
+            continue
+        axes = {
+            axis
+            for neighbor in neighbors
+            for axis in [_normalized_grid_axis(vertex, neighbor)]
+            if axis is not None
+        }
+        if len(axes) > 1:
+            bend_count += len(axes) - 1
+    return bend_count
+
+
+def _primitive_wire_length_outside_selector_pads(
+    result: Any,
+    segments: list[dict[str, Any]],
+    pad_boxes: list[tuple[int, int, int, int, set[int]]],
+) -> float:
+    """Measure route primitives while excluding selector-raster pad boxes."""
+    total = 0.0
+    for segment in segments:
+        start = segment.get("start", (0.0, 0.0))
+        end = segment.get("end", (0.0, 0.0))
+        if len(start) < 2 or len(end) < 2:
+            continue
+        z = int(segment.get("z", 0))
+        start_vertex = _mm_to_grid_vertex(result, float(start[0]), float(start[1]), z)
+        end_vertex = _mm_to_grid_vertex(result, float(end[0]), float(end[1]), z)
+        total += _grid_segment_length_mm_outside_pads(result, start_vertex, end_vertex, pad_boxes)
+    return total
+
+
+def _normalized_mm_axis(
+    start: tuple[float, float],
+    end: tuple[float, float],
+) -> tuple[int, int] | None:
+    """Return a quantized orientation for millimeter-space bend comparisons."""
+    dx = int(round((float(end[0]) - float(start[0])) * 10000.0))
+    dy = int(round((float(end[1]) - float(start[1])) * 10000.0))
+    if dx == 0 and dy == 0:
+        return None
+    divisor = math.gcd(abs(dx), abs(dy)) or 1
+    nx = dx // divisor
+    ny = dy // divisor
+    if nx < 0 or (nx == 0 and ny < 0):
+        nx = -nx
+        ny = -ny
+    return nx, ny
+
+
 def _freerouting_final_board_from_results(results: list[Any] | None) -> BoardData | None:
     if not results:
         return None
@@ -1043,27 +1408,39 @@ def _freerouting_final_board_from_results(results: list[Any] | None) -> BoardDat
 def _selected_solution_stats(
     results: list[Any] | None,
     selections: list[PyNetSelection],
-) -> tuple[int, float]:
+) -> tuple[int, int, float]:
     if not results or not selections:
-        return 0, 0.0
+        return 0, 0, 0.0
 
     result_by_net = {
         int(getattr(result, "net_id", 0)): result
         for result in results
     }
     total_via_count = 0
+    total_bend_count = 0
     total_wire_length_mm = 0.0
     for selection in selections:
         route_result = result_by_net.get(int(selection.net_id))
         if route_result is None:
             continue
         preview_items = list(getattr(route_result, "candidate_preview_items", []))
+        display_lengths = list(getattr(route_result, "candidate_display_lengths_mm", []))
+        bend_counts = list(getattr(route_result, "candidate_bend_counts", []))
         for raw_index in selection.selected_candidate_indices:
             selected_index = int(raw_index)
             if not (0 <= selected_index < len(preview_items)):
                 continue
             preview = preview_items[selected_index]
             total_via_count += len(getattr(preview, "vias", []) or [])
+            if 0 <= selected_index < len(bend_counts):
+                # Reuse the exact candidate coefficient that Gurobi optimized.
+                total_bend_count += int(bend_counts[selected_index])
+            if 0 <= selected_index < len(display_lengths):
+                # Report the pad-aware display length, not the solver length
+                # coefficient, so pad-internal access stubs do not dominate
+                # visible route comparisons.
+                total_wire_length_mm += float(display_lengths[selected_index])
+                continue
             for segment in getattr(preview, "segments", []) or []:
                 start = getattr(segment, "start", None)
                 end = getattr(segment, "end", None)
@@ -1078,7 +1455,7 @@ def _selected_solution_stats(
                     float(end[0]) - float(start[0]),
                     float(end[1]) - float(start[1]),
                 )
-    return total_via_count, total_wire_length_mm
+    return total_via_count, total_bend_count, total_wire_length_mm
 
 
 def _grid_point_key(point: Any) -> tuple[int, int, int]:
@@ -1762,6 +2139,7 @@ def _append_external_candidates_for_selector(
                 selector_net_id=net_id,
                 source_net_id=net_id,
                 preview_source_net_id=int(occurrence.get("source_net_id", net_id) or net_id),
+                source_backend=source_backend,
                 start_anchor=start_anchor,
                 goal_anchor=goal_anchor,
                 segments=occ_segments,
@@ -1795,6 +2173,7 @@ def _append_external_candidates_for_selector(
         ) = occurrence_analysis
         occurrence_index = int(getattr(occurrence_entry, "occurrence_index", 0))
         source_label = str(getattr(occurrence_entry, "source_label", "freerouting"))
+        source_backend = str(getattr(occurrence_entry, "source_backend", "freerouting"))
         occ_segments = list(getattr(occurrence_entry, "segments", []))
         occ_vias = list(getattr(occurrence_entry, "vias", []))
         occ_graph = getattr(occurrence_entry, "explicit_graph", None)
@@ -2458,7 +2837,7 @@ def _primitive_geometry_key(
     vias: list[dict[str, Any]],
 ) -> tuple[Any, ...]:
     """Encode segment/via primitives without approximating their geometry."""
-    segment_key = tuple(
+    segment_key = tuple(sorted(
         (
             tuple(segment.get("start", (0.0, 0.0))),
             tuple(segment.get("end", (0.0, 0.0))),
@@ -2468,8 +2847,8 @@ def _primitive_geometry_key(
             float(segment.get("radius_mm", 0.0)),
         )
         for segment in segments
-    )
-    via_key = tuple(
+    ))
+    via_key = tuple(sorted(
         (
             tuple(via.get("center", (0.0, 0.0))),
             float(via.get("diameter_mm", 0.0)),
@@ -2480,7 +2859,7 @@ def _primitive_geometry_key(
             int(via.get("z_end", 0)),
         )
         for via in vias
-    )
+    ))
     return segment_key, via_key
 
 
@@ -2488,22 +2867,22 @@ def _explicit_graph_key(explicit_graph: dict[str, Any] | None) -> tuple[Any, ...
     """Encode explicit graph topology exactly for raster-analysis caching."""
     if not explicit_graph:
         return None
-    nodes = tuple(
+    nodes = tuple(sorted(
         (
             int(node.get("id", 0)),
             tuple(node.get("vertex", (0, 0, 0))),
         )
         for node in explicit_graph.get("nodes", [])
         if isinstance(node, dict)
-    )
-    edges = tuple(
+    ))
+    edges = tuple(sorted(
         (
             int(edge.get("from", 0)),
             int(edge.get("to", 0)),
         )
         for edge in explicit_graph.get("edges", [])
         if isinstance(edge, dict)
-    )
+    ))
     return nodes, edges
 
 
@@ -2579,25 +2958,65 @@ def _batch_cpp_external_candidate_analysis(
     """Analyze many external candidates in one C++ call, with safe fallback."""
     if not entries:
         return []
+    ordered_results: list[tuple[list[dict[str, Any]], list[Any], str | None, bool, float, float] | None] = [
+        None for _ in entries
+    ]
+    unique_entries: list[Any] = []
+    unique_keys: list[tuple[Any, ...]] = []
+    key_to_unique_index: dict[tuple[Any, ...], int] = {}
+    for entry_index, entry in enumerate(entries):
+        source_board = getattr(entry, "source_board", selector_board)
+        source_net_id = int(getattr(entry, "source_net_id", getattr(entry, "selector_net_id", 0)))
+        selector_net_id = int(getattr(entry, "selector_net_id", source_net_id))
+        key = _candidate_geometry_cache_key(
+            selector_board=selector_board,
+            source_board=source_board,
+            result=result,
+            selector_net_id=selector_net_id,
+            source_net_id=source_net_id,
+            start_anchor=getattr(entry, "start_anchor", None),
+            goal_anchor=getattr(entry, "goal_anchor", None),
+            segments=list(getattr(entry, "segments", [])),
+            vias=list(getattr(entry, "vias", [])),
+            explicit_graph=getattr(entry, "explicit_graph", None),
+        )
+        cached = geometry_cache.get(key)
+        if cached is not None:
+            raw_vertices, cover_vertices, pad_reason = cached
+            ordered_results[entry_index] = (list(raw_vertices), list(cover_vertices), pad_reason, True, 0.0, 0.0)
+            continue
+        duplicate_unique_index = key_to_unique_index.get(key)
+        if duplicate_unique_index is not None:
+            # The first identical primitive candidate will populate the cache;
+            # this duplicate is filled after the unique batch returns.
+            ordered_results[entry_index] = ("__DUPLICATE__", [duplicate_unique_index], None, True, 0.0, 0.0)  # type: ignore[list-item]
+            continue
+        key_to_unique_index[key] = len(unique_entries)
+        unique_entries.append(entry)
+        unique_keys.append(key)
+
+    if not unique_entries:
+        return [item for item in ordered_results if item is not None]  # type: ignore[return-value]
+
     try:
         anchors = [
             anchor
             for anchor in (
-                getattr(entries[0], "start_anchor", None),
-                getattr(entries[0], "goal_anchor", None),
+                getattr(unique_entries[0], "start_anchor", None),
+                getattr(unique_entries[0], "goal_anchor", None),
             )
             if anchor is not None
         ]
-        first_source_board = getattr(entries[0], "source_board", selector_board)
-        first_source_net_id = int(getattr(entries[0], "source_net_id", getattr(entries[0], "selector_net_id", 0)))
-        first_selector_net_id = int(getattr(entries[0], "selector_net_id", first_source_net_id))
+        first_source_board = getattr(unique_entries[0], "source_board", selector_board)
+        first_source_net_id = int(getattr(unique_entries[0], "source_net_id", getattr(unique_entries[0], "selector_net_id", 0)))
+        first_selector_net_id = int(getattr(unique_entries[0], "selector_net_id", first_source_net_id))
         same_base = all(
             getattr(entry, "source_board", selector_board) is first_source_board
             and int(getattr(entry, "source_net_id", getattr(entry, "selector_net_id", 0))) == first_source_net_id
             and int(getattr(entry, "selector_net_id", first_selector_net_id)) == first_selector_net_id
-            and getattr(entry, "start_anchor", None) == getattr(entries[0], "start_anchor", None)
-            and getattr(entry, "goal_anchor", None) == getattr(entries[0], "goal_anchor", None)
-            for entry in entries
+            and getattr(entry, "start_anchor", None) == getattr(unique_entries[0], "start_anchor", None)
+            and getattr(entry, "goal_anchor", None) == getattr(unique_entries[0], "goal_anchor", None)
+            for entry in unique_entries
         )
 
         if same_base and hasattr(router_core, "RasterCandidateBatchRequest"):
@@ -2629,17 +3048,28 @@ def _batch_cpp_external_candidate_analysis(
                     list(getattr(entry, "vias", [])),
                     getattr(entry, "explicit_graph", None),
                 )
-                for entry in entries
+                for entry in unique_entries
             ]
             batch_started_at = perf_counter()
             batch_results = router_core.analyze_selector_geometry_candidate_batch(batch_request)
         else:
             requests = []
-            for entry in entries:
+            for entry in unique_entries:
                 pair = router_core.RasterAnalysisPairRequest()
                 source_board = getattr(entry, "source_board", selector_board)
                 source_net_id = int(getattr(entry, "source_net_id", getattr(entry, "selector_net_id", 0)))
                 selector_net_id = int(getattr(entry, "selector_net_id", source_net_id))
+                # Use each candidate's own terminal anchors in the mixed-base
+                # fallback path. The fast path can share anchors only because
+                # same_base proves all candidates have identical endpoints.
+                entry_anchors = [
+                    anchor
+                    for anchor in (
+                        getattr(entry, "start_anchor", None),
+                        getattr(entry, "goal_anchor", None),
+                    )
+                    if anchor is not None
+                ]
                 pair.raster_request = _cpp_raster_request(
                     router_core,
                     source_board,
@@ -2648,7 +3078,7 @@ def _batch_cpp_external_candidate_analysis(
                     list(getattr(entry, "vias", [])),
                     _all_net_pads(source_board, source_net_id),
                     _clearance_for_net(source_board, source_net_id),
-                    anchors,
+                    entry_anchors,
                     getattr(entry, "explicit_graph", None),
                 )
                 pair.coverage_request = _cpp_raster_request(
@@ -2667,9 +3097,9 @@ def _batch_cpp_external_candidate_analysis(
             batch_results = router_core.analyze_selector_geometry_batch(requests)
 
         batch_elapsed = perf_counter() - batch_started_at
-        elapsed_per_entry = batch_elapsed / max(1, len(entries))
-        analyzed = []
-        for entry, analysis in zip(entries, batch_results):
+        elapsed_per_entry = batch_elapsed / max(1, len(unique_entries))
+        unique_results: list[tuple[list[dict[str, Any]], list[Any], str | None, bool, float, float]] = []
+        for unique_key, entry, analysis in zip(unique_keys, unique_entries, batch_results):
             boundary_set = {
                 (int(point.x), int(point.y), int(point.z))
                 for point in getattr(getattr(analysis, "raster", None), "boundary_vertices", [])
@@ -2685,23 +3115,22 @@ def _batch_cpp_external_candidate_analysis(
                 for point in getattr(getattr(analysis, "raster", None), "occupied_vertices", [])
             ]
             pad_reason = _pad_coverage_reason_from_analysis(getattr(analysis, "coverage", None))
-            analyzed.append(
-                (
-                    raw_vertices,
-                    cover_vertices,
-                    pad_reason,
-                    bool(getattr(analysis, "cache_hit", False)),
-                    0.0 if bool(getattr(analysis, "cache_hit", False)) else elapsed_per_entry,
-                    0.0,
-                )
+            result_tuple = (
+                raw_vertices,
+                cover_vertices,
+                pad_reason,
+                bool(getattr(analysis, "cache_hit", False)),
+                0.0 if bool(getattr(analysis, "cache_hit", False)) else elapsed_per_entry,
+                0.0,
             )
-        return analyzed
+            geometry_cache[unique_key] = (list(raw_vertices), list(cover_vertices), pad_reason)
+            unique_results.append(result_tuple)
+        return _expand_unique_geometry_results(ordered_results, unique_entries, unique_results)
     except Exception as exc:
         print(f"selector_batch_geometry_fallback reason={type(exc).__name__}:{exc}", flush=True)
-        analyzed = []
-        for entry in entries:
-            analyzed.append(
-                _cached_cpp_external_candidate_analysis(
+        unique_results = []
+        for unique_key, entry in zip(unique_keys, unique_entries):
+            result_tuple = _cached_cpp_external_candidate_analysis(
                     router_core=router_core,
                     source_board=getattr(entry, "source_board", selector_board),
                     selector_board=selector_board,
@@ -2715,8 +3144,33 @@ def _batch_cpp_external_candidate_analysis(
                     explicit_graph=getattr(entry, "explicit_graph", None),
                     geometry_cache=geometry_cache,
                 )
-            )
-        return analyzed
+            unique_results.append(result_tuple)
+            if not result_tuple[3]:
+                geometry_cache[unique_key] = (list(result_tuple[0]), list(result_tuple[1]), result_tuple[2])
+        return _expand_unique_geometry_results(ordered_results, unique_entries, unique_results)
+
+
+def _expand_unique_geometry_results(
+    ordered_results: list[Any],
+    unique_entries: list[Any],
+    unique_results: list[tuple[list[dict[str, Any]], list[Any], str | None, bool, float, float]],
+) -> list[tuple[list[dict[str, Any]], list[Any], str | None, bool, float, float]]:
+    """Expand exact-primitive cache results back to the original entry order."""
+    expanded: list[tuple[list[dict[str, Any]], list[Any], str | None, bool, float, float]] = []
+    unique_cursor = 0
+    for item in ordered_results:
+        if item is None:
+            result_tuple = unique_results[unique_cursor]
+            unique_cursor += 1
+            expanded.append(result_tuple)
+            continue
+        if isinstance(item, tuple) and item and item[0] == "__DUPLICATE__":
+            duplicate_index = int(item[1][0])
+            raw_vertices, cover_vertices, pad_reason, _cache_hit, _raster_elapsed, _pad_elapsed = unique_results[duplicate_index]
+            expanded.append((list(raw_vertices), list(cover_vertices), pad_reason, True, 0.0, 0.0))
+            continue
+        expanded.append(item)
+    return expanded
 
 
 def _cpp_rasterize_candidate_geometry(
