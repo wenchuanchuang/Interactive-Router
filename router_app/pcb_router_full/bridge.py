@@ -382,6 +382,12 @@ def _run_pcbrouter_profile_stage(
     env = os.environ.copy()
     env["PCBROUTER_ORDER_STRATEGY"] = profile.order_strategy
     env["PCBROUTER_FINAL_REPAIR"] = "1" if final_repair_enabled else "0"
+    # Forward the candidate-cleanup experiment explicitly. The PcbRouter side
+    # treats "no_check" as an inert diagnostic mode and only performs cleanup
+    # for concrete modes such as "y_only", "acute_only", or "1".
+    env.pop("PCBROUTER_CANDIDATE_PAD_ENTRY_FIX", None)
+    if _env_flag("INTERACTIVE_ROUTER_CANDIDATE_PAD_ENTRY_FIX"):
+        env["PCBROUTER_CANDIDATE_PAD_ENTRY_FIX"] = os.environ["INTERACTIVE_ROUTER_CANDIDATE_PAD_ENTRY_FIX"]
     if profile.order_seed is not None:
         env["PCBROUTER_ORDER_SEED"] = str(profile.order_seed)
     prepare_sec = perf_counter() - prepare_started_at
@@ -1022,6 +1028,12 @@ def _read_ripup_event_count(payload_path: Path | None) -> int:
         return int(payload.get("ripup_event_count", 0))
     except Exception:
         return 0
+
+
+def _env_flag(name: str) -> bool:
+    """Return true when an environment switch is set to an enabled value."""
+    value = os.environ.get(name, "")
+    return value not in {"", "0", "false", "FALSE", "False"}
 
 
 def _estimate_failed_nets(board: BoardData) -> list[int]:

@@ -52,6 +52,7 @@ class MainWindow(QMainWindow):
         self._original_board: BoardData | None = None
         self._candidate_outcome = None
         self._candidate_ripped_net_ids: set[int] = set()
+        self._external_selector_net_ids: set[int] = set()
         self._freerouting_full_enabled = freerouting_full
         self._pcb_router_enabled = pcb_router
         self._router_profile_manifest = router_profile_manifest
@@ -84,7 +85,18 @@ class MainWindow(QMainWindow):
         self.route_preview = RoutePreviewCanvas()
         self.route_preview.setMinimumHeight(220)
         self.route_preview.show_message("Reroute preview")
-        left_column.addWidget(self.route_preview)
+        preview_panel = QFrame()
+        preview_layout = QVBoxLayout(preview_panel)
+        preview_layout.setContentsMargins(0, 0, 0, 0)
+        preview_layout.setSpacing(4)
+        self.preview_reference_button = QPushButton("Show Original Reference")
+        self.preview_reference_button.setCheckable(True)
+        self.preview_reference_button.setChecked(True)
+        self.preview_reference_button.setToolTip("Show or hide faint original routes in this lower preview")
+        self.preview_reference_button.toggled.connect(self.route_preview.set_show_reference_routes)
+        preview_layout.addWidget(self.preview_reference_button)
+        preview_layout.addWidget(self.route_preview)
+        left_column.addWidget(preview_panel)
         left_column.setStretchFactor(0, 3)
         left_column.setStretchFactor(1, 2)
 
@@ -601,7 +613,12 @@ class MainWindow(QMainWindow):
                 )
                 return
 
-            ripped_net_ids = {item.net_id for item in self._external_ripup_previews()}
+            # Use the selector net set here, not only the ripup preview net set:
+            # final-board-only candidates need the same faint original-route
+            # reference in the selected preview.
+            ripped_net_ids = set(self._external_selector_net_ids) or {
+                item.net_id for item in self._external_ripup_previews()
+            }
             selected_preview = self._build_selected_preview_results(self._candidate_outcome.result, selection)
             if selected_preview:
                 self.route_preview.show_routes(selected_preview, self._board, ripped_net_ids)
@@ -656,6 +673,7 @@ class MainWindow(QMainWindow):
     def _reset_candidate_generation_state(self) -> None:
         self._candidate_outcome = None
         self._candidate_ripped_net_ids = set()
+        self._external_selector_net_ids = set()
         self._freerouting_candidates_ready = False
         if self._freerouting_full_enabled or self._pcb_router_enabled:
             self.route_preview.show_message("Generate candidates to show external ripped routes")
@@ -744,11 +762,124 @@ class MainWindow(QMainWindow):
             return []
         return list(self._pcb_router_run.candidate_ripup_payload_paths or (self._pcb_router_run.ripup_payload_path,))
 
+    def _external_final_route_net_ids(self, selector_board: BoardData) -> set[int]:
+        """Return selector-board net ids that have copper in external final boards.
+
+        A net can be fully routed by an external router without ever appearing
+        in a ripup payload. Such nets still need selector candidates from final
+        boards; the normal candidate append path will still apply angle/Y,
+        pad coverage, and collision validation before accepting them.
+        """
+        selector_net_by_name = {
+            str(name): int(net_id)
+            for net_id, name in selector_board.nets.items()
+            if int(net_id) > 0 and str(name)
+        }
+        final_route_net_ids: set[int] = set()
+        for candidate_board in self._external_final_boards():
+            board_route_net_ids = {
+                int(getattr(track, "net_id", 0) or 0)
+                for track in candidate_board.tracks
+            } | {
+                int(getattr(via, "net_id", 0) or 0)
+                for via in candidate_board.vias
+            }
+            for route_net_id in board_route_net_ids:
+                if route_net_id <= 0:
+                    continue
+                route_net_name = str(candidate_board.nets.get(route_net_id, ""))
+                selector_net_id = selector_net_by_name.get(route_net_name)
+                if selector_net_id is not None:
+                    final_route_net_ids.add(selector_net_id)
+        return final_route_net_ids
+
+    def _external_final_route_previews(self, selector_board: BoardData, net_ids: set[int]) -> list[object]:
+        """Build display-only previews for final-board candidates on selected nets.
+
+        This does not bypass selector validation. It only lets the lower-left
+        canvas show final-route candidates for nets that have no ripup
+        occurrence, so users can compare them against the faint reference route.
+        """
+        if not net_ids:
+            return []
+        selector_net_names = {
+            int(net_id): str(selector_board.nets.get(net_id, ""))
+            for net_id in net_ids
+        }
+        previews: list[object] = []
+        seen: set[tuple[int, tuple[tuple[object, ...], ...], tuple[tuple[object, ...], ...]]] = set()
+        for candidate_board in self._external_final_boards():
+            source = f"final:{Path(candidate_board.path).stem}"
+            source_net_by_name = {
+                str(name): int(net_id)
+                for net_id, name in candidate_board.nets.items()
+                if int(net_id) > 0 and str(name)
+            }
+            for selector_net_id, net_name in selector_net_names.items():
+                source_net_id = source_net_by_name.get(net_name)
+                if source_net_id is None:
+                    continue
+                segments = [
+                    track
+                    for track in candidate_board.tracks
+                    if int(getattr(track, "net_id", 0) or 0) == source_net_id
+                ]
+                vias = [
+                    via
+                    for via in candidate_board.vias
+                    if int(getattr(via, "net_id", 0) or 0) == source_net_id
+                ]
+                if not segments and not vias:
+                    continue
+                segment_key = tuple(
+                    sorted(
+                        (
+                            str(getattr(segment, "layer", "")),
+                            round(float(segment.start[0]), 6),
+                            round(float(segment.start[1]), 6),
+                            round(float(segment.end[0]), 6),
+                            round(float(segment.end[1]), 6),
+                            round(float(getattr(segment, "width", 0.0)), 6),
+                        )
+                        for segment in segments
+                    )
+                )
+                via_key = tuple(
+                    sorted(
+                        (
+                            round(float(via.center[0]), 6),
+                            round(float(via.center[1]), 6),
+                            round(float(getattr(via, "diameter", 0.0)), 6),
+                            tuple(getattr(via, "layers", ())),
+                        )
+                        for via in vias
+                    )
+                )
+                preview_key = (selector_net_id, segment_key, via_key)
+                if preview_key in seen:
+                    continue
+                seen.add(preview_key)
+                previews.append(
+                    SimpleNamespace(
+                        net_id=selector_net_id,
+                        net_name=net_name,
+                        segments=segments,
+                        vias=vias,
+                        truncated=False,
+                        occurrence_index=0,
+                        source_net_id=source_net_id,
+                        source=source,
+                        preview_kind="candidate",
+                    )
+                )
+        return previews
+
     def _show_external_backend_ripped_routes(self) -> None:
         previews = self._external_ripup_previews()
-        if self._board is None or not previews:
+        if self._board is None:
             self.route_preview.show_message("External router result is not available")
             return
+        selector_board = self._original_board or self._board
         display_offset = self._selector_to_display_offset_mm()
         display_previews = self._translate_route_previews_for_display(previews, display_offset)
         if display_offset != (0.0, 0.0):
@@ -759,14 +890,37 @@ class MainWindow(QMainWindow):
             )
 
         ripped_net_ids = {item.net_id for item in previews}
+        visible_preview_net_ids = {
+            item.net_id
+            for item in previews
+            if getattr(item, "segments", None) or getattr(item, "vias", None)
+        }
+        final_route_net_ids = self._external_final_route_net_ids(selector_board)
+        selector_net_ids = set(ripped_net_ids) | set(final_route_net_ids)
+        if not selector_net_ids:
+            self.route_preview.show_message("External router result is not available")
+            return
+        # Some router payload entries exist only as empty occurrences after an
+        # angle/Y rejection. Show their final-board route preview so the lower
+        # pane still has visible geometry to compare against the reference path.
+        added_final_only_net_ids = sorted(final_route_net_ids - visible_preview_net_ids)
+        final_only_previews = self._external_final_route_previews(
+            selector_board,
+            set(added_final_only_net_ids),
+        )
+        display_previews.extend(self._translate_route_previews_for_display(final_only_previews, display_offset))
         overlay_net_ids = []
         for item in previews:
             if item.occurrence_index > 0:
                 overlay_net_ids.append(f"{item.net_id}@E{item.occurrence_index}")
             else:
                 overlay_net_ids.append(str(item.net_id))
+        for item in final_only_previews:
+            overlay_net_ids.append(f"{item.net_id}@final")
         segment_count = sum(len(item.segments) for item in previews)
         via_count = sum(len(item.vias) for item in previews)
+        final_only_segment_count = sum(len(item.segments) for item in final_only_previews)
+        final_only_via_count = sum(len(item.vias) for item in final_only_previews)
         truncated_count = sum(1 for item in previews if item.truncated)
         truncated_labels = []
         for item in previews:
@@ -776,11 +930,31 @@ class MainWindow(QMainWindow):
                 truncated_labels.append(f"{item.net_id}@E{item.occurrence_index}")
             else:
                 truncated_labels.append(str(item.net_id))
-        self.trace_panel.show_ripped_nets(self._board, ripped_net_ids)
-        self.route_preview.show_routes(display_previews, self._board, ripped_net_ids)
+        self.trace_panel.show_ripped_nets(self._board, selector_net_ids)
+        self.route_preview.show_routes(display_previews, self._board, selector_net_ids)
         print(
             "external_ripped_occurrences = "
             + ", ".join(overlay_net_ids),
+            flush=True,
+        )
+        print(
+            "external_selector_final_route_net_ids = "
+            + (", ".join(str(net_id) for net_id in sorted(final_route_net_ids)) if final_route_net_ids else "(none)"),
+            flush=True,
+        )
+        print(
+            "external_selector_visible_preview_net_ids = "
+            + (", ".join(str(net_id) for net_id in sorted(visible_preview_net_ids)) if visible_preview_net_ids else "(none)"),
+            flush=True,
+        )
+        print(
+            "external_selector_final_only_net_ids = "
+            + (", ".join(str(net_id) for net_id in added_final_only_net_ids) if added_final_only_net_ids else "(none)"),
+            flush=True,
+        )
+        print(
+            "external_selector_final_only_preview_count = "
+            f"{len(final_only_previews)} segments={final_only_segment_count} vias={final_only_via_count}",
             flush=True,
         )
         print(
@@ -792,10 +966,9 @@ class MainWindow(QMainWindow):
             + (", ".join(truncated_labels) if truncated_labels else "(none)"),
             flush=True,
         )
-        selector_board = self._original_board or self._board
         outcome = build_freerouting_external_selector_outcome(
             selector_board,
-            ripped_net_ids,
+            selector_net_ids,
             self.trace_panel.grid_steps_per_mm,
             final_board=None,
             final_boards=self._external_final_boards(),
@@ -817,7 +990,8 @@ class MainWindow(QMainWindow):
             )
         else:
             self._candidate_outcome = None
-        self._candidate_ripped_net_ids = set(ripped_net_ids) if outcome.result else set()
+        self._candidate_ripped_net_ids = set(selector_net_ids) if outcome.result else set()
+        self._external_selector_net_ids = set(selector_net_ids) if outcome.result else set()
         self._freerouting_candidates_ready = bool(outcome.result)
         if outcome.elapsed_seconds is not None:
             print(
@@ -834,7 +1008,9 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"Showing external ripped routes for {len(ripped_net_ids)} unique nets "
             f"across {len(previews)} occurrences, "
-            f"{segment_count} segments, {via_count} vias.{suffix}"
+            f"{segment_count + final_only_segment_count} segments, "
+            f"{via_count + final_only_via_count} vias; "
+            f"{len(selector_net_ids)} selector nets.{suffix}"
         )
         self._update_ripup_buttons()
 

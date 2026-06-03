@@ -1881,6 +1881,7 @@ def _append_external_candidates_for_selector(
     pad_reason_total = 0.0
     candidate_append_total = 0.0
     cache_total = 0.0
+    pad_entry_repair_total = 0.0
     occurrence_total = 0.0
     occurrence_count = 0
 
@@ -1924,6 +1925,28 @@ def _append_external_candidates_for_selector(
             layer_index_board=board,
         )
         collect_total += perf_counter() - collect_started_at
+        repair_started_at = perf_counter()
+        final_repair = _maybe_repair_final_candidate_angle_y(
+            board=board,
+            result=result,
+            net_id=net_id,
+            segments=final_segments,
+            vias=final_vias,
+        )
+        pad_entry_repair_total += perf_counter() - repair_started_at
+        summary["final_angle_y_checked"] = int(summary.get("final_angle_y_checked", 0)) + int(final_repair.checked)
+        summary["final_angle_y_repaired"] = int(summary.get("final_angle_y_repaired", 0)) + int(final_repair.repaired)
+        summary["final_angle_y_rejected"] = int(summary.get("final_angle_y_rejected", 0)) + int(final_repair.rejected)
+        if final_repair.rejected:
+            summary.setdefault("rejections", []).append(f"final:{final_source}:{final_repair.reason}")
+            print(
+                "selector_external_rejected_final_angle_y "
+                f"net={net_id} source=final profile={final_source} reason={final_repair.reason}",
+                flush=True,
+            )
+            continue
+        final_segments = final_repair.segments
+        final_vias = final_repair.vias
         cache_started_at = perf_counter()
         (
             final_raw,
@@ -2133,6 +2156,35 @@ def _append_external_candidates_for_selector(
             occurrence=occurrence,
         )
         graph_total += perf_counter() - graph_started_at
+        repair_started_at = perf_counter()
+        repair_result = _maybe_repair_freerouting_candidate_pad_entry(
+            board=board,
+            result=result,
+            net_id=net_id,
+            source_backend=source_backend,
+            segments=occ_segments,
+            vias=occ_vias,
+            explicit_graph=occ_graph,
+        )
+        pad_entry_repair_total += perf_counter() - repair_started_at
+        summary["freerouting_pad_entry_checked"] = int(summary.get("freerouting_pad_entry_checked", 0)) + int(repair_result.checked)
+        summary["freerouting_pad_entry_repaired"] = int(summary.get("freerouting_pad_entry_repaired", 0)) + int(getattr(repair_result, "pad_repaired", repair_result.repaired))
+        summary["freerouting_y_cleanup_repaired"] = int(summary.get("freerouting_y_cleanup_repaired", 0)) + int(getattr(repair_result, "y_cleaned", False))
+        summary["freerouting_pad_entry_rejected"] = int(summary.get("freerouting_pad_entry_rejected", 0)) + int(repair_result.rejected)
+        if repair_result.rejected:
+            summary.setdefault("rejections", []).append(
+                f"{source_label}@E{occurrence_index}:{repair_result.reason}"
+            )
+            print(
+                "selector_external_rejected_pad_entry "
+                f"net={net_id} source={source_label} occurrence_index={occurrence_index} reason={repair_result.reason}",
+                flush=True,
+            )
+            occurrence_total += perf_counter() - occurrence_started_at
+            continue
+        occ_segments = repair_result.segments
+        occ_vias = repair_result.vias
+        occ_graph = repair_result.explicit_graph
         occurrence_entries.append(
             SimpleNamespace(
                 source_board=board,
@@ -2251,10 +2303,18 @@ def _append_external_candidates_for_selector(
         f"graph_sec={graph_total:.3f} "
         f"raster_sec={raster_total:.3f} "
         f"pad_reason_sec={pad_reason_total:.3f} "
+        f"pad_entry_repair_sec={pad_entry_repair_total:.3f} "
         f"candidate_append_sec={candidate_append_total:.3f} "
         f"geometry_cache_sec={cache_total:.3f} "
         f"geometry_cache_hits={int(summary.get('geometry_cache_hits', 0))} "
         f"geometry_cache_misses={int(summary.get('geometry_cache_misses', 0))} "
+        f"pad_entry_checked={int(summary.get('freerouting_pad_entry_checked', 0))} "
+        f"pad_entry_repaired={int(summary.get('freerouting_pad_entry_repaired', 0))} "
+        f"y_cleanup_repaired={int(summary.get('freerouting_y_cleanup_repaired', 0))} "
+        f"pad_entry_rejected={int(summary.get('freerouting_pad_entry_rejected', 0))} "
+        f"final_angle_y_checked={int(summary.get('final_angle_y_checked', 0))} "
+        f"final_angle_y_repaired={int(summary.get('final_angle_y_repaired', 0))} "
+        f"final_angle_y_rejected={int(summary.get('final_angle_y_rejected', 0))} "
         f"occurrence_count={occurrence_count} "
         f"occurrence_total_sec={occurrence_total:.3f}",
         flush=True,
@@ -2309,6 +2369,988 @@ def _append_external_payload_candidate(
         else SimpleNamespace(net_id=int(getattr(result, "net_id", 0)))
     )
     return True
+
+
+def _interactive_router_env_flag(name: str) -> bool:
+    """Return true when an environment switch is set to an enabled value."""
+    value = os.environ.get(name, "")
+    return value not in {"", "0", "false", "FALSE", "False"}
+
+
+def _final_candidate_angle_y_fix_enabled() -> bool:
+    """Return true when final routed-board candidates should be sanitized."""
+    return (
+        _interactive_router_env_flag("INTERACTIVE_ROUTER_FINAL_CANDIDATE_PAD_ENTRY_FIX")
+        or _interactive_router_env_flag("INTERACTIVE_ROUTER_CANDIDATE_PAD_ENTRY_FIX")
+        or _interactive_router_env_flag("INTERACTIVE_ROUTER_FREEROUTING_CANDIDATE_PAD_ENTRY_FIX")
+    )
+
+
+def _maybe_repair_final_candidate_angle_y(
+    board: BoardData,
+    result: Any,
+    net_id: int,
+    segments: list[dict[str, Any]],
+    vias: list[dict[str, Any]],
+) -> Any:
+    """Repair final routed-board candidate geometry before selector insertion.
+
+    This applies only to `final:` candidates. Routed input boards are added via
+    the separate `original:` candidate path and intentionally bypass this check
+    so the user-provided reference route remains available unchanged.
+    """
+    if not _final_candidate_angle_y_fix_enabled():
+        return SimpleNamespace(checked=False, repaired=False, rejected=False, reason="disabled", segments=segments, vias=vias)
+
+    copied_segments = [dict(segment) for segment in segments]
+    copied_vias = [dict(via) for via in vias]
+    invalid_entries = _find_invalid_pad_entry_locations(board, net_id, copied_segments)
+    changed = False
+
+    for entry in invalid_entries:
+        segment = copied_segments[entry.segment_index]
+        repaired = _choose_pad_entry_repair_candidate(
+            board=board,
+            net_id=net_id,
+            segment=segment,
+            endpoint_key=entry.endpoint_key,
+            other_key=entry.other_key,
+            pad=entry.pad,
+            other=entry.other,
+        )
+        if repaired is None:
+            fallback = _repair_final_candidate_with_local_entry_chains(
+                board=board,
+                result=result,
+                net_id=net_id,
+                segments=segments,
+                vias=vias,
+                invalid_entries=invalid_entries,
+            )
+            if fallback is not None:
+                return fallback
+            return SimpleNamespace(checked=True, repaired=changed, rejected=True, reason="final_pad_entry_unrepairable", segments=segments, vias=vias)
+        segment[entry.endpoint_key] = repaired
+        changed = True
+
+    y_segments, y_cleaned = _cleanup_freerouting_candidate_y_stub(board, net_id, copied_segments, copied_vias)
+    if y_cleaned:
+        copied_segments = y_segments
+        changed = True
+
+    if not changed:
+        return SimpleNamespace(checked=True, repaired=False, rejected=False, reason="ok", segments=segments, vias=vias)
+
+    rejection_reason = _final_candidate_repair_rejection_reason(
+        board=board,
+        result=result,
+        net_id=net_id,
+        segments=copied_segments,
+        vias=copied_vias,
+    )
+    if rejection_reason is not None:
+        fallback = _repair_final_candidate_with_local_entry_chains(
+            board=board,
+            result=result,
+            net_id=net_id,
+            segments=segments,
+            vias=vias,
+            invalid_entries=invalid_entries,
+        )
+        if fallback is not None:
+            return fallback
+        return SimpleNamespace(checked=True, repaired=True, rejected=True, reason=rejection_reason, segments=segments, vias=vias)
+    return SimpleNamespace(checked=True, repaired=True, rejected=False, reason="repaired", segments=copied_segments, vias=copied_vias)
+
+
+def _find_invalid_pad_entry_locations(
+    board: BoardData,
+    net_id: int,
+    segments: list[dict[str, Any]],
+) -> list[Any]:
+    """Locate candidate segment endpoints that leave same-net pads illegally."""
+    net_pads = _all_net_pads(board, net_id)
+    invalid_entries: list[Any] = []
+    for segment_index, segment in enumerate(segments):
+        layer_name = str(segment.get("layer", ""))
+        for endpoint_key, other_key in (("start", "end"), ("end", "start")):
+            endpoint = tuple(segment.get(endpoint_key, (0.0, 0.0)))
+            other = tuple(segment.get(other_key, (0.0, 0.0)))
+            if len(endpoint) != 2 or len(other) != 2:
+                continue
+            endpoint_xy = tuple(map(float, endpoint))
+            other_xy = tuple(map(float, other))
+            pad = _candidate_endpoint_pad(board, net_pads, layer_name, endpoint_xy)
+            if pad is None or _point_inside_pad_body(float(other_xy[0]), float(other_xy[1]), pad):
+                continue
+            trace_width = float(segment.get("width_mm", segment.get("width", 0.2)) or 0.2)
+            if _pad_entry_angle_is_valid(endpoint_xy, other_xy, pad, trace_width):
+                continue
+            invalid_entries.append(
+                SimpleNamespace(
+                    segment_index=segment_index,
+                    endpoint_key=endpoint_key,
+                    other_key=other_key,
+                    pad=pad,
+                    endpoint=endpoint_xy,
+                    other=other_xy,
+                    trace_width=trace_width,
+                )
+            )
+    return invalid_entries
+
+
+def _final_candidate_repair_rejection_reason(
+    board: BoardData,
+    result: Any,
+    net_id: int,
+    segments: list[dict[str, Any]],
+    vias: list[dict[str, Any]],
+) -> str | None:
+    """Run the final-candidate repair gates and return the selector rejection reason."""
+    if _candidate_violates_foreign_pad_clearance(board, net_id, segments, vias):
+        return "final_angle_y_foreign_pad_violation"
+    if _external_candidate_pad_coverage_reason(
+        board=board,
+        result=result,
+        net_id=net_id,
+        segments=segments,
+        vias=vias,
+        explicit_graph=None,
+    ) is not None:
+        return "final_angle_y_pad_coverage"
+    return None
+
+
+def _repair_final_candidate_with_local_entry_chains(
+    board: BoardData,
+    result: Any,
+    net_id: int,
+    segments: list[dict[str, Any]],
+    vias: list[dict[str, Any]],
+    invalid_entries: list[Any],
+) -> Any | None:
+    """Fallback to a PcbRouter-style local segment-chain pad-entry repair.
+
+    The single-point repair only moves the pad-side endpoint. This fallback
+    replaces the short pad-entry segment with a small chain that explicitly
+    reconnects through a legal entry point and then to the pad center, so the
+    selector still sees terminal coverage after the angle fix.
+    """
+    if not invalid_entries:
+        return None
+    unique_entries: list[Any] = []
+    seen_segment_indexes: set[int] = set()
+    for entry in sorted(invalid_entries, key=lambda value: int(value.segment_index), reverse=True):
+        # A single segment with two bad pad endpoints needs a larger two-sided
+        # rewrite. Keep this fallback conservative by repairing each segment at
+        # most once and letting the selector reject rare ambiguous cases.
+        if int(entry.segment_index) in seen_segment_indexes:
+            continue
+        seen_segment_indexes.add(int(entry.segment_index))
+        unique_entries.append(entry)
+
+    def search(entry_index: int, current_segments: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
+        if entry_index >= len(unique_entries):
+            if _find_invalid_pad_entry_locations(board, net_id, current_segments):
+                return None
+            if _final_candidate_repair_rejection_reason(board, result, net_id, current_segments, vias) is not None:
+                return None
+            return current_segments
+
+        entry = unique_entries[entry_index]
+        if entry.segment_index >= len(current_segments):
+            return None
+        segment = current_segments[entry.segment_index]
+        for replacement in _pad_entry_chain_repair_variants(segment, entry.endpoint_key, entry.other_key, entry.pad):
+            if _candidate_violates_foreign_pad_clearance(board, net_id, replacement, []):
+                continue
+            trial_segments = current_segments[:entry.segment_index] + replacement + current_segments[entry.segment_index + 1 :]
+            repaired = search(entry_index + 1, trial_segments)
+            if repaired is not None:
+                return repaired
+        return None
+
+    repaired_segments = search(0, [dict(segment) for segment in segments])
+    if repaired_segments is None:
+        return None
+    y_segments, y_cleaned = _cleanup_freerouting_candidate_y_stub(board, net_id, repaired_segments, vias)
+    if y_cleaned:
+        if _find_invalid_pad_entry_locations(board, net_id, y_segments):
+            return None
+        if _final_candidate_repair_rejection_reason(board, result, net_id, y_segments, vias) is not None:
+            return None
+        repaired_segments = y_segments
+    return SimpleNamespace(checked=True, repaired=True, rejected=False, reason="repaired_chain", segments=repaired_segments, vias=vias)
+
+
+def _pad_entry_chain_repair_variants(
+    segment: dict[str, Any],
+    endpoint_key: str,
+    other_key: str,
+    pad: Any,
+) -> list[list[dict[str, Any]]]:
+    """Build deterministic local chain replacements for one bad pad entry."""
+    other = tuple(map(float, segment.get(other_key, (0.0, 0.0))))
+    if len(other) != 2:
+        return []
+    center = (float(pad.center[0]), float(pad.center[1]))
+    local_other = _pad_local_point(other[0], other[1], pad)
+    local_center = (0.0, 0.0)
+    variants: list[list[dict[str, Any]]] = []
+
+    for entry_point in _pad_entry_repair_candidates(other, pad):
+        trace_width = float(segment.get("width_mm", segment.get("width", 0.2)) or 0.2)
+        if not _pad_entry_angle_is_valid(entry_point, other, pad, trace_width):
+            continue
+        local_entry = _pad_local_point(entry_point[0], entry_point[1], pad)
+        local_paths = [
+            [local_other, local_entry, local_center],
+            [local_other, (local_other[0], local_entry[1]), local_entry, local_center],
+            [local_other, (local_entry[0], local_other[1]), local_entry, local_center],
+        ]
+        for local_path in local_paths:
+            world_path = [_pad_world_point_from_local(x, y, pad) for x, y in _dedupe_adjacent_points(local_path)]
+            if endpoint_key == "start":
+                world_path = list(reversed(world_path))
+            replacement = _segments_from_point_chain(segment, world_path)
+            if replacement:
+                variants.append(replacement)
+
+    deduped: list[list[dict[str, Any]]] = []
+    seen: set[tuple[tuple[float, float], ...]] = set()
+    for replacement in variants:
+        all_points = [tuple(map(float, replacement[0]["start"]))]
+        all_points.extend(tuple(map(float, item["end"])) for item in replacement)
+        key = tuple((round(point[0], 9), round(point[1], 9)) for point in all_points)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(replacement)
+    return deduped
+
+
+def _dedupe_adjacent_points(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """Remove adjacent duplicate local points before building replacement segments."""
+    deduped: list[tuple[float, float]] = []
+    for point in points:
+        if deduped and math.hypot(point[0] - deduped[-1][0], point[1] - deduped[-1][1]) <= 1e-9:
+            continue
+        deduped.append(point)
+    return deduped
+
+
+def _segments_from_point_chain(segment_template: dict[str, Any], points: list[tuple[float, float]]) -> list[dict[str, Any]]:
+    """Copy segment metadata across a replacement point chain."""
+    replacement: list[dict[str, Any]] = []
+    for start, end in zip(points, points[1:]):
+        if math.hypot(float(end[0]) - float(start[0]), float(end[1]) - float(start[1])) <= 1e-9:
+            continue
+        segment = dict(segment_template)
+        segment["start"] = (float(start[0]), float(start[1]))
+        segment["end"] = (float(end[0]), float(end[1]))
+        replacement.append(segment)
+    return replacement
+
+
+def _choose_pad_entry_repair_candidate(
+    board: BoardData,
+    net_id: int,
+    segment: dict[str, Any],
+    endpoint_key: str,
+    other_key: str,
+    pad: Any,
+    other: tuple[float, float],
+) -> tuple[float, float] | None:
+    """Try several local pad-entry repairs and keep the first valid endpoint."""
+    original_endpoint = tuple(segment.get(endpoint_key, (0.0, 0.0)))
+    for repaired in _pad_entry_repair_candidates(other, pad):
+        trial = dict(segment)
+        trial[endpoint_key] = repaired
+        trace_width = float(segment.get("width_mm", segment.get("width", 0.2)) or 0.2)
+        if not _pad_entry_angle_is_valid(repaired, other, pad, trace_width):
+            continue
+        if _candidate_violates_foreign_pad_clearance(board, net_id, [trial], []):
+            continue
+        return repaired
+    # Keep the failure conservative: if every local endpoint introduces a pad
+    # issue, the final-board candidate is rejected rather than altered further.
+    _ = original_endpoint
+    return None
+
+
+def _pad_entry_repair_candidates(outside_point: tuple[float, float], pad: Any) -> list[tuple[float, float]]:
+    """Return deterministic local endpoint candidates for pad-entry repair."""
+    candidates: list[tuple[float, float]] = []
+    primary = _repair_pad_entry_endpoint(outside_point, pad)
+    if primary is not None:
+        candidates.append(primary)
+    local_outside = _pad_local_point(outside_point[0], outside_point[1], pad)
+    half_x = float(pad.size[0]) * 0.5
+    half_y = float(pad.size[1]) * 0.5
+    if half_x <= 0.0 or half_y <= 0.0:
+        return candidates
+    shape = str(getattr(pad, "shape", "")).lower()
+    if shape in {"circle", "oval", "ellipse"}:
+        return candidates
+    ox, oy = local_outside
+    clamped_x = max(-half_x, min(half_x, ox))
+    clamped_y = max(-half_y, min(half_y, oy))
+    if abs(ox) >= abs(oy):
+        side_x = math.copysign(half_x, ox if abs(ox) > 1e-9 else 1.0)
+        candidates.append(_pad_world_point_from_local(side_x, clamped_y, pad))
+        candidates.append(_pad_world_point_from_local(side_x, 0.0, pad))
+    else:
+        side_y = math.copysign(half_y, oy if abs(oy) > 1e-9 else 1.0)
+        candidates.append(_pad_world_point_from_local(clamped_x, side_y, pad))
+        candidates.append(_pad_world_point_from_local(0.0, side_y, pad))
+    deduped: list[tuple[float, float]] = []
+    seen: set[tuple[float, float]] = set()
+    for candidate in candidates:
+        key = (round(float(candidate[0]), 9), round(float(candidate[1]), 9))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append((float(candidate[0]), float(candidate[1])))
+    return deduped
+
+
+def _maybe_repair_freerouting_candidate_pad_entry(
+    board: BoardData,
+    result: Any,
+    net_id: int,
+    source_backend: str,
+    segments: list[dict[str, Any]],
+    vias: list[dict[str, Any]],
+    explicit_graph: dict[str, Any] | None,
+) -> Any:
+    """Repair freerouting pad-entry geometry on copied primitive candidates.
+
+    The external router payload is treated as immutable source data. This
+    helper returns copied primitives when a local pad-entry endpoint is moved,
+    and it drops the explicit graph so downstream analysis rebuilds topology
+    from the repaired primitives instead of mixing old graph nodes with new
+    segment coordinates.
+    """
+    # The default freerouting pad-entry repair now runs inside the freerouting
+    # writer, where the router's live board state is still available. Keep this
+    # Python path as an explicit external fallback only, so a candidate is not
+    # repaired twice when the public writer-side switch is enabled.
+    if source_backend != "freerouting" or not _interactive_router_env_flag("INTERACTIVE_ROUTER_FREEROUTING_EXTERNAL_CANDIDATE_PAD_ENTRY_FIX"):
+        return SimpleNamespace(checked=False, repaired=False, pad_repaired=False, y_cleaned=False, rejected=False, reason="disabled", segments=segments, vias=vias, explicit_graph=explicit_graph)
+
+    copied_segments = [dict(segment) for segment in segments]
+    copied_vias = [dict(via) for via in vias]
+    net_pads = _all_net_pads(board, net_id)
+    invalid_entries = 0
+    repaired_entries = 0
+    repaired_segment_indexes: set[int] = set()
+
+    for segment_index, segment in enumerate(copied_segments):
+        layer_name = str(segment.get("layer", ""))
+        for endpoint_key, other_key in (("start", "end"), ("end", "start")):
+            endpoint = tuple(segment.get(endpoint_key, (0.0, 0.0)))
+            other = tuple(segment.get(other_key, (0.0, 0.0)))
+            if len(endpoint) != 2 or len(other) != 2:
+                continue
+            pad = _candidate_endpoint_pad(board, net_pads, layer_name, tuple(map(float, endpoint)))
+            if pad is None:
+                continue
+            if _point_inside_pad_body(float(other[0]), float(other[1]), pad):
+                continue
+            trace_width = float(segment.get("width_mm", segment.get("width", 0.2)) or 0.2)
+            if _pad_entry_angle_is_valid(tuple(map(float, endpoint)), tuple(map(float, other)), pad, trace_width):
+                continue
+            invalid_entries += 1
+            repaired = _repair_pad_entry_endpoint(tuple(map(float, other)), pad)
+            if repaired is None:
+                return SimpleNamespace(checked=True, repaired=False, pad_repaired=False, y_cleaned=False, rejected=True, reason="pad_entry_unrepairable", segments=segments, vias=vias, explicit_graph=explicit_graph)
+            segment[endpoint_key] = repaired
+            repaired_entries += 1
+            repaired_segment_indexes.add(segment_index)
+
+    if repaired_entries != invalid_entries:
+        return SimpleNamespace(checked=True, repaired=False, pad_repaired=False, y_cleaned=False, rejected=True, reason="pad_entry_partial_repair", segments=segments, vias=vias, explicit_graph=explicit_graph)
+    repaired_segments = [
+        segment
+        for segment_index, segment in enumerate(copied_segments)
+        if segment_index in repaired_segment_indexes
+    ]
+    if _candidate_violates_foreign_pad_clearance(board, net_id, repaired_segments, []):
+        return SimpleNamespace(checked=True, repaired=True, pad_repaired=True, y_cleaned=False, rejected=True, reason="pad_entry_repair_foreign_pad_violation", segments=segments, vias=vias, explicit_graph=explicit_graph)
+
+    y_segments, y_cleaned = _cleanup_freerouting_candidate_y_stub(board, net_id, copied_segments, copied_vias)
+    if y_cleaned:
+        copied_segments = y_segments
+
+    if invalid_entries == 0 and not y_cleaned:
+        return SimpleNamespace(checked=True, repaired=False, pad_repaired=False, y_cleaned=False, rejected=False, reason="ok", segments=segments, vias=vias, explicit_graph=explicit_graph)
+
+    if _candidate_violates_existing_route_clearance(board, net_id, copied_segments, copied_vias):
+        return SimpleNamespace(checked=True, repaired=True, pad_repaired=invalid_entries > 0, y_cleaned=y_cleaned, rejected=True, reason="pad_entry_repair_route_collision", segments=segments, vias=vias, explicit_graph=explicit_graph)
+
+    pad_reason = _external_candidate_pad_coverage_reason(
+        board=board,
+        result=result,
+        net_id=net_id,
+        segments=copied_segments,
+        vias=copied_vias,
+        explicit_graph=None,
+    )
+    if pad_reason is not None:
+        return SimpleNamespace(checked=True, repaired=True, pad_repaired=invalid_entries > 0, y_cleaned=y_cleaned, rejected=True, reason=f"pad_entry_repair_{pad_reason}", segments=segments, vias=vias, explicit_graph=explicit_graph)
+
+    return SimpleNamespace(checked=True, repaired=True, pad_repaired=invalid_entries > 0, y_cleaned=y_cleaned, rejected=False, reason="repaired", segments=copied_segments, vias=copied_vias, explicit_graph=None)
+
+
+def _cleanup_freerouting_candidate_y_stub(
+    board: BoardData,
+    net_id: int,
+    segments: list[dict[str, Any]],
+    vias: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], bool]:
+    """Remove one obvious non-pad Y/T stub from a freerouting primitive graph.
+
+    PcbRouter's Y cleanup depends on three GridPath objects. Freerouting only
+    gives us primitive segments, so this conservative equivalent only removes a
+    dangling non-pad branch when the segment graph has exactly one degree-3
+    junction and at least two remaining branches terminate on same-net pads.
+    """
+    if vias or len(segments) < 3:
+        return segments, False
+
+    node_to_edges: dict[tuple[str, float, float], list[int]] = {}
+    edge_nodes: list[tuple[tuple[str, float, float], tuple[str, float, float]]] = []
+    for index, segment in enumerate(segments):
+        layer_name = str(segment.get("layer", ""))
+        start = tuple(segment.get("start", (0.0, 0.0)))
+        end = tuple(segment.get("end", (0.0, 0.0)))
+        if len(start) != 2 or len(end) != 2:
+            return segments, False
+        start_node = (layer_name, round(float(start[0]), 6), round(float(start[1]), 6))
+        end_node = (layer_name, round(float(end[0]), 6), round(float(end[1]), 6))
+        edge_nodes.append((start_node, end_node))
+        node_to_edges.setdefault(start_node, []).append(index)
+        node_to_edges.setdefault(end_node, []).append(index)
+
+    junctions = [node for node, edges in node_to_edges.items() if len(edges) == 3]
+    if len(junctions) != 1:
+        return segments, False
+    junction = junctions[0]
+    leaves = [node for node, edges in node_to_edges.items() if len(edges) == 1]
+    if len(leaves) < 3:
+        return segments, False
+
+    net_pads = _all_net_pads(board, net_id)
+    removable_edge_indexes: set[int] = set()
+    pad_leaf_count = 0
+    for leaf in leaves:
+        leaf_path_edges = _path_edges_between_leaf_and_junction(leaf, junction, node_to_edges, edge_nodes)
+        if not leaf_path_edges:
+            continue
+        layer_name, x_mm, y_mm = leaf
+        if _candidate_endpoint_pad(board, net_pads, layer_name, (x_mm, y_mm)) is not None:
+            pad_leaf_count += 1
+            continue
+        removable_edge_indexes.update(leaf_path_edges)
+
+    if pad_leaf_count < 2 or not removable_edge_indexes:
+        return segments, False
+    cleaned_segments = [
+        dict(segment)
+        for index, segment in enumerate(segments)
+        if index not in removable_edge_indexes
+    ]
+    return cleaned_segments, len(cleaned_segments) != len(segments)
+
+
+def _path_edges_between_leaf_and_junction(
+    leaf: tuple[str, float, float],
+    junction: tuple[str, float, float],
+    node_to_edges: dict[tuple[str, float, float], list[int]],
+    edge_nodes: list[tuple[tuple[str, float, float], tuple[str, float, float]]],
+) -> list[int]:
+    """Trace a simple branch from a degree-1 leaf to the single Y/T junction."""
+    path_edges: list[int] = []
+    previous_node: tuple[str, float, float] | None = None
+    current_node = leaf
+    visited_edges: set[int] = set()
+    while current_node != junction:
+        candidate_edges = [
+            edge_index
+            for edge_index in node_to_edges.get(current_node, [])
+            if edge_index not in visited_edges
+        ]
+        if previous_node is not None:
+            candidate_edges = [
+                edge_index
+                for edge_index in candidate_edges
+                if _other_edge_node(edge_nodes[edge_index], current_node) != previous_node
+            ]
+        if len(candidate_edges) != 1:
+            return []
+        edge_index = candidate_edges[0]
+        visited_edges.add(edge_index)
+        path_edges.append(edge_index)
+        next_node = _other_edge_node(edge_nodes[edge_index], current_node)
+        if next_node is None:
+            return []
+        previous_node, current_node = current_node, next_node
+        if current_node != junction and len(node_to_edges.get(current_node, [])) != 2:
+            return []
+    return path_edges
+
+
+def _other_edge_node(
+    edge: tuple[tuple[str, float, float], tuple[str, float, float]],
+    node: tuple[str, float, float],
+) -> tuple[str, float, float] | None:
+    """Return the opposite node on an undirected segment edge."""
+    if edge[0] == node:
+        return edge[1]
+    if edge[1] == node:
+        return edge[0]
+    return None
+
+
+def _candidate_endpoint_pad(board: BoardData, net_pads: list[Any], layer_name: str, point: tuple[float, float]) -> Any | None:
+    """Return the same-net pad containing a candidate endpoint on a route layer."""
+    best_pad = None
+    best_dist2 = float("inf")
+    for pad in net_pads:
+        if not _pad_has_selector_layer(board, pad, layer_name):
+            continue
+        if not _point_inside_pad_body(float(point[0]), float(point[1]), pad):
+            continue
+        dx = float(point[0]) - float(pad.center[0])
+        dy = float(point[1]) - float(pad.center[1])
+        dist2 = dx * dx + dy * dy
+        if dist2 < best_dist2:
+            best_dist2 = dist2
+            best_pad = pad
+    return best_pad
+
+
+def _pad_entry_angle_is_valid(
+    endpoint: tuple[float, float],
+    outside_point: tuple[float, float],
+    pad: Any,
+    trace_width_mm: float = 0.0,
+) -> bool:
+    """Check whether a segment leaves a pad through an allowed local normal.
+
+    Rectangular-pad corner entry uses the swept copper centerline: if the
+    centerline plus half the trace width touches a pad corner, the segment is
+    treated as a corner entry. Clearance is intentionally not included here.
+    """
+    local_endpoint = _pad_local_point(endpoint[0], endpoint[1], pad)
+    local_outside = _pad_local_point(outside_point[0], outside_point[1], pad)
+    dx = local_outside[0] - local_endpoint[0]
+    dy = local_outside[1] - local_endpoint[1]
+    if abs(dx) <= 1e-9 and abs(dy) <= 1e-9:
+        return False
+    half_x = float(pad.size[0]) * 0.5
+    half_y = float(pad.size[1]) * 0.5
+    if half_x <= 0.0 or half_y <= 0.0:
+        return False
+    shape = str(getattr(pad, "shape", "")).lower()
+    if shape in {"circle", "oval", "ellipse"}:
+        boundary = _ellipse_ray_intersection(local_endpoint, (dx, dy), half_x, half_y)
+        if boundary is None:
+            return False
+        normal = (boundary[0] / (half_x * half_x), boundary[1] / (half_y * half_y))
+        return _cosine_between((dx, dy), normal) >= math.cos(math.pi / 4.0) - 1e-9
+    boundary = _rect_ray_intersection(local_endpoint, (dx, dy), half_x, half_y)
+    if boundary is None:
+        return False
+    tol = 1e-6
+    near_x = abs(abs(boundary[0]) - half_x) <= tol
+    near_y = abs(abs(boundary[1]) - half_y) <= tol
+    if near_x and near_y:
+        return math.copysign(1.0, dx) == math.copysign(1.0, boundary[0]) and math.copysign(1.0, dy) == math.copysign(1.0, boundary[1])
+    if _rect_trace_sweeps_corner(local_endpoint, local_outside, (dx, dy), half_x, half_y, trace_width_mm):
+        return True
+    if near_x:
+        return abs(dy) <= tol
+    if near_y:
+        return abs(dx) <= tol
+    return False
+
+
+def _rect_trace_sweeps_corner(
+    local_endpoint: tuple[float, float],
+    local_outside: tuple[float, float],
+    direction: tuple[float, float],
+    half_x: float,
+    half_y: float,
+    trace_width_mm: float,
+) -> bool:
+    """Return true when the trace copper width touches a rectangular pad corner."""
+    radius = max(0.0, float(trace_width_mm) * 0.5)
+    if radius <= 1e-9:
+        return False
+    dx, dy = direction
+    corners = (
+        (half_x, half_y),
+        (half_x, -half_y),
+        (-half_x, half_y),
+        (-half_x, -half_y),
+    )
+    for corner in corners:
+        # Keep the existing normal-cone semantics for corners: the segment must
+        # travel outward into the corner's quadrant, not merely pass nearby.
+        if math.copysign(1.0, dx) != math.copysign(1.0, corner[0]):
+            continue
+        if math.copysign(1.0, dy) != math.copysign(1.0, corner[1]):
+            continue
+        if _point_to_segment_distance(corner, local_endpoint, local_outside) <= radius + 1e-9:
+            return True
+    return False
+
+
+def _repair_pad_entry_endpoint(outside_point: tuple[float, float], pad: Any) -> tuple[float, float] | None:
+    """Move only the pad-side endpoint so the segment exits through a normal."""
+    local_outside = _pad_local_point(outside_point[0], outside_point[1], pad)
+    half_x = float(pad.size[0]) * 0.5
+    half_y = float(pad.size[1]) * 0.5
+    if half_x <= 0.0 or half_y <= 0.0:
+        return None
+    shape = str(getattr(pad, "shape", "")).lower()
+    if shape in {"circle", "oval", "ellipse"}:
+        vx, vy = local_outside
+        scale = math.hypot(vx / half_x, vy / half_y)
+        if scale <= 1e-9:
+            return None
+        return _pad_world_point_from_local(vx / scale, vy / scale, pad)
+    ox, oy = local_outside
+    if abs(ox) > half_x and abs(oy) <= half_y:
+        repaired_local = (math.copysign(half_x, ox), oy)
+    elif abs(oy) > half_y and abs(ox) <= half_x:
+        repaired_local = (ox, math.copysign(half_y, oy))
+    else:
+        repaired_local = (
+            math.copysign(half_x, ox if abs(ox) > 1e-9 else 1.0),
+            math.copysign(half_y, oy if abs(oy) > 1e-9 else 1.0),
+        )
+    return _pad_world_point_from_local(repaired_local[0], repaired_local[1], pad)
+
+
+def _pad_world_point_from_local(local_x: float, local_y: float, pad: Any) -> tuple[float, float]:
+    """Convert a pad-local point back into board-space millimeters."""
+    angle = float(getattr(pad, "rotation_degrees", 0.0)) * math.pi / 180.0
+    cx = float(pad.center[0])
+    cy = float(pad.center[1])
+    return (cx + local_x * cos(angle) - local_y * sin(angle), cy + local_x * sin(angle) + local_y * cos(angle))
+
+
+def _rect_ray_intersection(point: tuple[float, float], direction: tuple[float, float], half_x: float, half_y: float) -> tuple[float, float] | None:
+    """Find where a ray from inside a rectangle exits the rectangle."""
+    px, py = point
+    dx, dy = direction
+    candidates: list[float] = []
+    if abs(dx) > 1e-12:
+        candidates.extend(((half_x - px) / dx, (-half_x - px) / dx))
+    if abs(dy) > 1e-12:
+        candidates.extend(((half_y - py) / dy, (-half_y - py) / dy))
+    for t in sorted(value for value in candidates if value >= -1e-12):
+        x = px + dx * t
+        y = py + dy * t
+        if abs(x) <= half_x + 1e-6 and abs(y) <= half_y + 1e-6:
+            return x, y
+    return None
+
+
+def _ellipse_ray_intersection(point: tuple[float, float], direction: tuple[float, float], half_x: float, half_y: float) -> tuple[float, float] | None:
+    """Find where a ray from inside an ellipse exits the ellipse."""
+    px, py = point
+    dx, dy = direction
+    a = (dx * dx) / (half_x * half_x) + (dy * dy) / (half_y * half_y)
+    b = 2.0 * ((px * dx) / (half_x * half_x) + (py * dy) / (half_y * half_y))
+    c = (px * px) / (half_x * half_x) + (py * py) / (half_y * half_y) - 1.0
+    if abs(a) <= 1e-12:
+        return None
+    disc = b * b - 4.0 * a * c
+    if disc < -1e-12:
+        return None
+    roots = [(-b + math.sqrt(max(0.0, disc))) / (2.0 * a), (-b - math.sqrt(max(0.0, disc))) / (2.0 * a)]
+    positive = [root for root in roots if root >= -1e-12]
+    if not positive:
+        return None
+    t = min(positive)
+    return px + dx * t, py + dy * t
+
+
+def _cosine_between(a: tuple[float, float], b: tuple[float, float]) -> float:
+    """Return cosine of the smaller angle between two vectors."""
+    a_len = math.hypot(a[0], a[1])
+    b_len = math.hypot(b[0], b[1])
+    if a_len <= 1e-12 or b_len <= 1e-12:
+        return -1.0
+    return (a[0] * b[0] + a[1] * b[1]) / (a_len * b_len)
+
+
+_FOREIGN_PAD_SPATIAL_INDEX_CACHE: dict[tuple[int, int, str], list[tuple[float, float, float, float, Any]]] = {}
+
+
+def _candidate_violates_foreign_pad_clearance(board: BoardData, net_id: int, segments: list[dict[str, Any]], vias: list[dict[str, Any]]) -> bool:
+    """Approximate whether repaired candidate primitives newly touch foreign pads."""
+    clearance = _clearance_for_net(board, net_id)
+    for segment in segments:
+        layer_name = str(segment.get("layer", ""))
+        start = tuple(segment.get("start", (0.0, 0.0)))
+        end = tuple(segment.get("end", (0.0, 0.0)))
+        if len(start) != 2 or len(end) != 2:
+            continue
+        radius = float(segment.get("width_mm", 0.2)) * 0.5 + clearance
+        if _sampled_primitive_hits_foreign_pad(board, net_id, layer_name, tuple(map(float, start)), tuple(map(float, end)), radius):
+            return True
+    for via in vias:
+        center = tuple(via.get("center", (0.0, 0.0)))
+        if len(center) != 2:
+            continue
+        radius = float(via.get("diameter_mm", 0.6)) * 0.5 + clearance
+        for layer_name in (str(via.get("start_layer", "")), str(via.get("end_layer", ""))):
+            if _sampled_primitive_hits_foreign_pad(board, net_id, layer_name, tuple(map(float, center)), tuple(map(float, center)), radius):
+                return True
+    return False
+
+
+def _candidate_violates_existing_route_clearance(board: BoardData, net_id: int, segments: list[dict[str, Any]], vias: list[dict[str, Any]]) -> bool:
+    """Check repaired candidate copper against currently visible foreign routes.
+
+    Freerouting payloads do not include its transient in-process board state, so
+    this validation uses the board items available to Interactive-Router at
+    extraction time. It is still useful for routed input boards and for any
+    preserved copper that the repaired endpoint could newly touch.
+    """
+    candidate_clearance = _clearance_for_net(board, net_id)
+    for segment in segments:
+        layer_name = str(segment.get("layer", ""))
+        start = tuple(segment.get("start", (0.0, 0.0)))
+        end = tuple(segment.get("end", (0.0, 0.0)))
+        if len(start) != 2 or len(end) != 2:
+            continue
+        candidate_radius = float(segment.get("width_mm", 0.2)) * 0.5
+        if _candidate_segment_violates_existing_routes(
+            board,
+            net_id,
+            layer_name,
+            tuple(map(float, start)),
+            tuple(map(float, end)),
+            candidate_radius,
+            candidate_clearance,
+        ):
+            return True
+    for via in vias:
+        center = tuple(via.get("center", (0.0, 0.0)))
+        if len(center) != 2:
+            continue
+        candidate_radius = float(via.get("diameter_mm", 0.6)) * 0.5
+        active_layers = _via_active_layer_indices(
+            board,
+            str(via.get("start_layer", "F.Cu")),
+            str(via.get("end_layer", "B.Cu")),
+        )
+        if _candidate_via_violates_existing_routes(
+            board,
+            net_id,
+            tuple(map(float, center)),
+            candidate_radius,
+            candidate_clearance,
+            active_layers,
+        ):
+            return True
+    return False
+
+
+def _candidate_segment_violates_existing_routes(
+    board: BoardData,
+    net_id: int,
+    layer_name: str,
+    start: tuple[float, float],
+    end: tuple[float, float],
+    radius: float,
+    clearance: float,
+) -> bool:
+    """Check one candidate segment against foreign tracks and vias."""
+    layer_index = _layer_index_from_name(board, layer_name)
+    if layer_index is None:
+        return False
+    query_bbox = _expanded_segment_bbox(start, end, radius + clearance + _max_existing_route_radius(board))
+    for track in board.tracks:
+        if int(track.net_id) == int(net_id):
+            continue
+        track_layer = _layer_index_from_name(board, str(track.layer))
+        if track_layer != layer_index:
+            continue
+        track_radius = float(track.width) * 0.5
+        if not _bbox_overlaps(query_bbox, _expanded_segment_bbox(track.start, track.end, track_radius)):
+            continue
+        required = radius + track_radius + max(clearance, _clearance_for_net(board, int(track.net_id)))
+        if _segment_to_segment_distance(start, end, track.start, track.end) + 1e-9 < required:
+            return True
+    for via in board.vias:
+        if int(via.net_id) == int(net_id):
+            continue
+        active_layers = _via_active_layer_indices(board, str(via.start_layer), str(via.end_layer))
+        if layer_index not in active_layers:
+            continue
+        via_radius = float(via.diameter) * 0.5
+        via_bbox = _expanded_segment_bbox(via.center, via.center, via_radius)
+        if not _bbox_overlaps(query_bbox, via_bbox):
+            continue
+        required = radius + via_radius + max(clearance, _clearance_for_net(board, int(via.net_id)))
+        if _point_to_segment_distance(via.center, start, end) + 1e-9 < required:
+            return True
+    return False
+
+
+def _candidate_via_violates_existing_routes(
+    board: BoardData,
+    net_id: int,
+    center: tuple[float, float],
+    radius: float,
+    clearance: float,
+    active_layers: set[int],
+) -> bool:
+    """Check one candidate via against foreign tracks and vias."""
+    query_bbox = _expanded_segment_bbox(center, center, radius + clearance + _max_existing_route_radius(board))
+    for track in board.tracks:
+        if int(track.net_id) == int(net_id):
+            continue
+        track_layer = _layer_index_from_name(board, str(track.layer))
+        if track_layer is None or track_layer not in active_layers:
+            continue
+        track_radius = float(track.width) * 0.5
+        if not _bbox_overlaps(query_bbox, _expanded_segment_bbox(track.start, track.end, track_radius)):
+            continue
+        required = radius + track_radius + max(clearance, _clearance_for_net(board, int(track.net_id)))
+        if _point_to_segment_distance(center, track.start, track.end) + 1e-9 < required:
+            return True
+    for via in board.vias:
+        if int(via.net_id) == int(net_id):
+            continue
+        other_layers = _via_active_layer_indices(board, str(via.start_layer), str(via.end_layer))
+        if not active_layers.intersection(other_layers):
+            continue
+        via_radius = float(via.diameter) * 0.5
+        if not _bbox_overlaps(query_bbox, _expanded_segment_bbox(via.center, via.center, via_radius)):
+            continue
+        required = radius + via_radius + max(clearance, _clearance_for_net(board, int(via.net_id)))
+        if math.hypot(center[0] - via.center[0], center[1] - via.center[1]) + 1e-9 < required:
+            return True
+    return False
+
+
+def _via_active_layer_indices(board: BoardData, start_layer: str, end_layer: str) -> set[int]:
+    """Return all copper stack indices touched by a via span."""
+    start_index = _layer_index_from_name(board, start_layer)
+    end_index = _layer_index_from_name(board, end_layer)
+    if start_index is None and end_index is None:
+        return set(range(len(board.copper_layers)))
+    if start_index is None:
+        start_index = end_index
+    if end_index is None:
+        end_index = start_index
+    assert start_index is not None and end_index is not None
+    low = min(start_index, end_index)
+    high = max(start_index, end_index)
+    return set(range(low, high + 1))
+
+
+def _max_existing_route_radius(board: BoardData) -> float:
+    """Return a cheap conservative route radius for bbox prefilters."""
+    radii = [float(track.width) * 0.5 for track in board.tracks if float(track.width) > 0.0]
+    radii.extend(float(via.diameter) * 0.5 for via in board.vias if float(via.diameter) > 0.0)
+    return max(radii, default=0.0)
+
+
+def _segment_to_segment_distance(
+    a_start: tuple[float, float],
+    a_end: tuple[float, float],
+    b_start: tuple[float, float],
+    b_end: tuple[float, float],
+) -> float:
+    """Return the exact 2D distance between two line segments."""
+    if _segments_intersect_or_touch(a_start, a_end, b_start, b_end):
+        return 0.0
+    return min(
+        _point_to_segment_distance(a_start, b_start, b_end),
+        _point_to_segment_distance(a_end, b_start, b_end),
+        _point_to_segment_distance(b_start, a_start, a_end),
+        _point_to_segment_distance(b_end, a_start, a_end),
+    )
+
+
+def _sampled_primitive_hits_foreign_pad(board: BoardData, net_id: int, layer_name: str, start: tuple[float, float], end: tuple[float, float], expansion: float) -> bool:
+    """Sample a repaired primitive against nearby foreign pad keepouts."""
+    query_bbox = _expanded_segment_bbox(start, end, expansion)
+    candidate_pads = [
+        pad
+        for pad_bbox in _foreign_pad_spatial_index(board, net_id, layer_name)
+        if _bbox_overlaps(query_bbox, pad_bbox[:4])
+        for pad in (pad_bbox[4],)
+    ]
+    if not candidate_pads:
+        return False
+    length = math.hypot(end[0] - start[0], end[1] - start[1])
+    steps = max(1, int(math.ceil(length / 0.05)))
+    for index in range(steps + 1):
+        t = index / steps
+        x = start[0] + (end[0] - start[0]) * t
+        y = start[1] + (end[1] - start[1]) * t
+        for pad in candidate_pads:
+            if _point_inside_expanded_pad(x, y, pad, expansion):
+                return True
+    return False
+
+
+def _foreign_pad_spatial_index(board: BoardData, net_id: int, layer_name: str) -> list[tuple[float, float, float, float, Any]]:
+    """Return cached foreign pad bounding boxes for one board/net/layer view."""
+    cache_key = (id(board), int(net_id), str(layer_name))
+    cached = _FOREIGN_PAD_SPATIAL_INDEX_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    entries: list[tuple[float, float, float, float, Any]] = []
+    for footprint in board.footprints:
+        for pad in footprint.pads:
+            if (pad.net_id or 0) == net_id:
+                continue
+            if not _pad_has_selector_layer(board, pad, layer_name):
+                continue
+            entries.append((*_pad_axis_aligned_bbox(pad), pad))
+    _FOREIGN_PAD_SPATIAL_INDEX_CACHE[cache_key] = entries
+    return entries
+
+
+def _pad_axis_aligned_bbox(pad: Any) -> tuple[float, float, float, float]:
+    """Compute a conservative board-space bbox for a rotated pad body."""
+    half_x = float(pad.size[0]) * 0.5
+    half_y = float(pad.size[1]) * 0.5
+    corners = [
+        _pad_world_point_from_local(-half_x, -half_y, pad),
+        _pad_world_point_from_local(half_x, -half_y, pad),
+        _pad_world_point_from_local(half_x, half_y, pad),
+        _pad_world_point_from_local(-half_x, half_y, pad),
+    ]
+    xs = [point[0] for point in corners]
+    ys = [point[1] for point in corners]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _expanded_segment_bbox(start: tuple[float, float], end: tuple[float, float], expansion: float) -> tuple[float, float, float, float]:
+    """Return the primitive bbox expanded by clearance and copper radius."""
+    return (
+        min(start[0], end[0]) - expansion,
+        min(start[1], end[1]) - expansion,
+        max(start[0], end[0]) + expansion,
+        max(start[1], end[1]) + expansion,
+    )
+
+
+def _bbox_overlaps(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> bool:
+    """Check whether two axis-aligned bounding boxes overlap."""
+    return not (a[2] < b[0] or b[2] < a[0] or a[3] < b[1] or b[3] < a[1])
 
 
 def _candidate_preview_item(

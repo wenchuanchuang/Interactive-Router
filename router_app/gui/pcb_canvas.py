@@ -353,6 +353,10 @@ class RoutePreviewCanvas(QGraphicsView):
         super().__init__(parent)
         self._scene = QGraphicsScene(self)
         self._zoom_level = 1.0
+        self._show_reference_routes = True
+        self._last_route_results = None
+        self._last_board: BoardData | None = None
+        self._last_ripped_net_ids: set[int] | None = None
         self.setScene(self._scene)
         self.setRenderHints(QPainter.Antialiasing | QPainter.TextAntialiasing)
         self.setBackgroundBrush(QBrush(QColor("#101318")))
@@ -360,7 +364,16 @@ class RoutePreviewCanvas(QGraphicsView):
         self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.AnchorViewCenter)
 
+    def set_show_reference_routes(self, enabled: bool) -> None:
+        """Toggle the faint original route overlay in the lower preview pane."""
+        self._show_reference_routes = bool(enabled)
+        if self._last_route_results is not None:
+            self.show_routes(self._last_route_results, self._last_board, self._last_ripped_net_ids)
+
     def show_message(self, message: str) -> None:
+        self._last_route_results = None
+        self._last_board = None
+        self._last_ripped_net_ids = None
         self._scene.clear()
         text = QGraphicsTextItem(message)
         text.setDefaultTextColor(QColor("#8d96a5"))
@@ -383,6 +396,9 @@ class RoutePreviewCanvas(QGraphicsView):
         board: BoardData | None = None,
         ripped_net_ids: set[int] | None = None,
     ) -> None:
+        self._last_route_results = route_results
+        self._last_board = board
+        self._last_ripped_net_ids = set(ripped_net_ids or set())
         self._scene.clear()
         if _looks_like_freerouting_ripup(route_results):
             self._show_freerouting_ripup_routes(route_results, board, ripped_net_ids)
@@ -408,7 +424,10 @@ class RoutePreviewCanvas(QGraphicsView):
                 x2, y2 = _preview_point(end, scale, min_x, min_y)
                 self._scene.addLine(x1, y1, x2, y2, halo_pen).setZValue(40)
                 layer = _route_layer_for_segment(route_result, board, path_grid, index)
-                route_color = _layer_highlight_color(layer)
+                # Use the same layer palette as the main board view so the
+                # replacement path can be compared directly against the
+                # translucent original route underneath.
+                route_color = _layer_color(layer)
                 route_color.setAlpha(candidate_alpha)
                 route_pen = QPen(
                     route_color,
@@ -472,7 +491,9 @@ class RoutePreviewCanvas(QGraphicsView):
                 x1, y1 = _preview_point(_SegmentPoint(segment.start), scale, min_x, min_y)
                 x2, y2 = _preview_point(_SegmentPoint(segment.end), scale, min_x, min_y)
                 self._scene.addLine(x1, y1, x2, y2, halo_pen).setZValue(40)
-                route_color = _layer_highlight_color(layer_hint)
+                # Keep ripped/candidate route previews on the normal layer
+                # palette; the background board already supplies translucency.
+                route_color = _layer_color(layer_hint)
                 route_pen = QPen(
                     route_color,
                     max(getattr(segment, "width", 0.2) * scale, 4.0),
@@ -486,7 +507,7 @@ class RoutePreviewCanvas(QGraphicsView):
                 x, y = _preview_point(_SegmentPoint(via.center), scale, min_x, min_y)
                 diameter = max(getattr(via, "diameter", 0.6) * scale, 8.0)
                 marker = QGraphicsEllipseItem(x - diameter / 2, y - diameter / 2, diameter, diameter)
-                marker.setBrush(QBrush(_layer_highlight_color(layer_hint)))
+                marker.setBrush(QBrush(_layer_color(layer_hint)))
                 pen = QPen(QColor("#ffffff"), 1.4)
                 pen.setCosmetic(True)
                 marker.setPen(pen)
@@ -512,7 +533,7 @@ class RoutePreviewCanvas(QGraphicsView):
 
     def _draw_route_layer_change_marker(self, x: float, y: float, layer: str) -> None:
         marker = QGraphicsEllipseItem(x - 6, y - 6, 12, 12)
-        marker.setBrush(QBrush(_layer_highlight_color(layer)))
+        marker.setBrush(QBrush(_layer_color(layer)))
         pen = QPen(QColor("#ffffff"), 1.6)
         pen.setCosmetic(True)
         marker.setPen(pen)
@@ -569,6 +590,8 @@ class RoutePreviewCanvas(QGraphicsView):
             # This makes differences between the original route and the
             # selected replacement route visible without changing solver data.
             is_ripped_reference = track.net_id in ripped_net_ids
+            if is_ripped_reference and not self._show_reference_routes:
+                continue
             x1 = (track.start[0] - min_x) * scale
             y1 = (track.start[1] - min_y) * scale
             x2 = (track.end[0] - min_x) * scale
@@ -589,6 +612,8 @@ class RoutePreviewCanvas(QGraphicsView):
             # Draw original vias on ripped nets faintly so via changes remain
             # comparable against the highlighted selected candidate.
             is_ripped_reference = via.net_id in ripped_net_ids
+            if is_ripped_reference and not self._show_reference_routes:
+                continue
             radius = max(via.diameter * scale * 0.5, 2.2)
             x = (via.center[0] - min_x) * scale
             y = (via.center[1] - min_y) * scale

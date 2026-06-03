@@ -109,6 +109,8 @@ def run_freerouting_full(board_path: str | Path, profile_manifest_path: str | Pa
         stderr_log_path,
     ):
         if artifact.exists():
+            if artifact.is_dir():
+                raise RuntimeError(f"Expected freerouting artifact to be a file, but found a directory: {artifact}")
             artifact.unlink()
 
     home_dir = app_root / ".freerouting-home"
@@ -765,6 +767,11 @@ def _run_freerouting(
     env = os.environ.copy()
     env["FREEROUTING__USER_DATA_PATH"] = str(home_dir)
     env["FREEROUTING_ITEM_ORDER_STRATEGY"] = order_strategy
+    # Forward the public Interactive-Router switch into the freerouting JVM so
+    # candidate pad-entry repair happens while the writer can still see the
+    # router's live board state.
+    if _env_flag("INTERACTIVE_ROUTER_FREEROUTING_CANDIDATE_PAD_ENTRY_FIX"):
+        env["FREEROUTING_CANDIDATE_PAD_ENTRY_FIX"] = "1"
     if order_seed is not None:
         env["FREEROUTING_ITEM_ORDER_SEED"] = str(order_seed)
     completed = subprocess.run(
@@ -940,6 +947,12 @@ def _profile_max_workers() -> int:
     except ValueError:
         value = 2
     return max(1, min(value, 4))
+
+
+def _env_flag(name: str) -> bool:
+    """Return true when an environment switch is set to an enabled value."""
+    value = os.environ.get(name, "")
+    return value not in {"", "0", "false", "FALSE", "False"}
 
 
 def _safe_profile_name(name: str) -> str:
