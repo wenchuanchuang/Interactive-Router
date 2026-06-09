@@ -83,10 +83,12 @@ def select_reroute_candidates(
     forbidden_selections: list[list[tuple[int, int]]] | None = None,
     forbidden_pairs: list[tuple[tuple[int, int], tuple[int, int]]] | None = None,
     drc_feedback_pairwise: bool = False,
+    drc_feedback_unary: bool = False,
     drc_feedback_max_iterations: int = 0,
     drc_feedback_kicad_cli: str | Path | None = None,
     _drc_feedback_attempt: int = 0,
     _drc_feedback_seen_pairs: set[tuple[tuple[int, int], tuple[int, int]]] | None = None,
+    _drc_feedback_seen_unary: set[tuple[int, int]] | None = None,
 ) -> SelectionResult:
     selector_started_at = perf_counter()
     if not outcome.result or not isinstance(outcome.result, list):
@@ -534,7 +536,7 @@ def select_reroute_candidates(
         print(f"selector_gurobi_board_saved = {gurobi_board_artifact.path.resolve()}", flush=True)
     elif gurobi_board_save_error:
         print(f"selector_gurobi_board_save_failed reason={gurobi_board_save_error}", flush=True)
-    feedback_result = _maybe_resolve_with_pairwise_drc_feedback(
+    feedback_result = _maybe_resolve_with_drc_feedback(
         outcome=outcome,
         selection_ok=bool(cpp_result.ok) and str(cpp_result.solver).lower().startswith("gurobi"),
         board_artifact=gurobi_board_artifact,
@@ -544,10 +546,12 @@ def select_reroute_candidates(
         prefer_gurobi=prefer_gurobi,
         allow_fallback=allow_fallback,
         drc_feedback_pairwise=drc_feedback_pairwise,
+        drc_feedback_unary=drc_feedback_unary,
         drc_feedback_max_iterations=drc_feedback_max_iterations,
         drc_feedback_kicad_cli=drc_feedback_kicad_cli,
         drc_feedback_attempt=_drc_feedback_attempt,
         drc_feedback_seen_pairs=_drc_feedback_seen_pairs,
+        drc_feedback_seen_unary=_drc_feedback_seen_unary,
     )
     if feedback_result is not None:
         return feedback_result
@@ -565,7 +569,7 @@ def select_reroute_candidates(
     )
 
 
-def _maybe_resolve_with_pairwise_drc_feedback(
+def _maybe_resolve_with_drc_feedback(
     outcome: RerouteOutcome,
     selection_ok: bool,
     board_artifact: GurobiSelectedBoardArtifact | None,
@@ -575,13 +579,15 @@ def _maybe_resolve_with_pairwise_drc_feedback(
     prefer_gurobi: bool,
     allow_fallback: bool,
     drc_feedback_pairwise: bool,
+    drc_feedback_unary: bool,
     drc_feedback_max_iterations: int,
     drc_feedback_kicad_cli: str | Path | None,
     drc_feedback_attempt: int,
     drc_feedback_seen_pairs: set[tuple[tuple[int, int], tuple[int, int]]] | None,
+    drc_feedback_seen_unary: set[tuple[int, int]] | None,
 ) -> SelectionResult | None:
-    """Run KiCad DRC on a selected board and re-solve with new pairwise cuts."""
-    if not drc_feedback_pairwise or not selection_ok or board_artifact is None:
+    """Run KiCad DRC on a selected board and re-solve with candidate cuts."""
+    if not (drc_feedback_pairwise or drc_feedback_unary) or not selection_ok or board_artifact is None:
         return None
     if drc_feedback_max_iterations > 0 and drc_feedback_attempt >= drc_feedback_max_iterations:
         print(
@@ -597,32 +603,58 @@ def _maybe_resolve_with_pairwise_drc_feedback(
 
     report_path = _drc_feedback_report_path(board_artifact.path, drc_feedback_attempt)
     drc_summary = _run_kicad_drc_for_feedback(board_artifact.path, report_path, kicad_cli)
-    extracted_pairs = _pairwise_cuts_from_drc_report(report_path, board_artifact.uuid_to_candidate)
+    extracted_pairs, extracted_unary = _candidate_cuts_from_drc_report(report_path, board_artifact.uuid_to_candidate)
+    if not drc_feedback_pairwise:
+        extracted_pairs = []
+    if not drc_feedback_unary:
+        extracted_unary = []
     seen_pairs = set(drc_feedback_seen_pairs or set())
     seen_pairs.update(_canonical_candidate_pair(pair) for pair in (forbidden_pairs or []))
+    seen_unary = set(drc_feedback_seen_unary or set())
+    for selection in forbidden_selections or []:
+        if len(selection) == 1:
+            seen_unary.add(_canonical_candidate(selection[0]))
     new_pairs = [
         pair
         for pair in extracted_pairs
         if _canonical_candidate_pair(pair) not in seen_pairs
     ]
+    new_unary = [
+        candidate
+        for candidate in extracted_unary
+        if _canonical_candidate(candidate) not in seen_unary
+    ]
     print(
         "drc_feedback_iteration "
         f"attempt={drc_feedback_attempt} "
         f"clearance={drc_summary['clearance']} "
+        f"actionable={drc_summary['actionable']} "
         f"total={drc_summary['total']} "
+        f"existing_unary={sum(1 for selection in (forbidden_selections or []) if len(selection) == 1)} "
         f"existing_pairs={len(forbidden_pairs or [])} "
+        f"extracted_unary={len(extracted_unary)} "
         f"extracted_pairs={len(extracted_pairs)} "
+        f"new_unary={len(new_unary)} "
         f"new_pairs={len(new_pairs)} "
         f"report={report_path.resolve()}",
         flush=True,
     )
-    if drc_summary["clearance"] <= 0:
-        print(f"drc_feedback_stop attempt={drc_feedback_attempt} reason=no_clearance", flush=True)
+    if drc_summary["actionable"] <= 0:
+        print(f"drc_feedback_stop attempt={drc_feedback_attempt} reason=no_actionable_drc", flush=True)
         return None
-    if not new_pairs:
-        print(f"drc_feedback_stop attempt={drc_feedback_attempt} reason=no_new_pair_cuts", flush=True)
+    if not new_pairs and not new_unary:
+        print(f"drc_feedback_stop attempt={drc_feedback_attempt} reason=no_new_candidate_cuts", flush=True)
         return None
 
+    next_selections = list(forbidden_selections or [])
+    for candidate in new_unary:
+        canonical = _canonical_candidate(candidate)
+        if canonical in seen_unary:
+            continue
+        seen_unary.add(canonical)
+        # Unary feedback excludes a single candidate that KiCad found colliding
+        # with fixed board geometry such as pads, board edge, or no-net copper.
+        next_selections.append([canonical])
     next_pairs = list(forbidden_pairs or [])
     for pair in new_pairs:
         canonical = _canonical_candidate_pair(pair)
@@ -634,6 +666,7 @@ def _maybe_resolve_with_pairwise_drc_feedback(
     print(
         "drc_feedback_resolve "
         f"next_attempt={drc_feedback_attempt + 1} "
+        f"forbidden_unary={sum(1 for selection in next_selections if len(selection) == 1)} "
         f"forbidden_pairs={len(next_pairs)}",
         flush=True,
     )
@@ -642,13 +675,15 @@ def _maybe_resolve_with_pairwise_drc_feedback(
         max_paths_per_net=max_paths_per_net,
         prefer_gurobi=prefer_gurobi,
         allow_fallback=allow_fallback,
-        forbidden_selections=forbidden_selections,
+        forbidden_selections=next_selections,
         forbidden_pairs=next_pairs,
         drc_feedback_pairwise=drc_feedback_pairwise,
+        drc_feedback_unary=drc_feedback_unary,
         drc_feedback_max_iterations=drc_feedback_max_iterations,
         drc_feedback_kicad_cli=kicad_cli,
         _drc_feedback_attempt=drc_feedback_attempt + 1,
         _drc_feedback_seen_pairs=seen_pairs,
+        _drc_feedback_seen_unary=seen_unary,
     )
 
 
@@ -703,13 +738,31 @@ def _run_kicad_drc_for_feedback(board_path: Path, report_path: Path, kicad_cli: 
     text = report_path.read_text(encoding="utf-8", errors="replace") if report_path.exists() else ""
     types = re.findall(r'"type"\s*:\s*"([^"]+)"', text)
     clearance = sum(1 for violation_type in types if "clearance" in violation_type.lower())
+    actionable = sum(1 for violation_type in types if _is_drc_feedback_cut_type(violation_type))
     if completed.returncode not in (0,):
         print(
             "drc_feedback_kicad_cli_exit "
             f"code={completed.returncode} stdout={completed.stdout.strip()!r} stderr={completed.stderr.strip()!r}",
             flush=True,
         )
-    return {"total": len(types), "clearance": clearance}
+    return {"total": len(types), "clearance": clearance, "actionable": actionable}
+
+
+def _is_drc_feedback_cut_type(violation_type: str) -> bool:
+    """Return whether a KiCad DRC type should produce selector feedback cuts."""
+    normalized = str(violation_type).lower()
+    return normalized in {
+        "clearance",
+        "copper_edge_clearance",
+        "shorting_items",
+        "tracks_crossing",
+    }
+
+
+def _canonical_candidate(candidate: tuple[int, int]) -> tuple[int, int]:
+    """Normalize a selected candidate id for set membership and JSON-derived data."""
+    net_id, candidate_index = candidate
+    return (int(net_id), int(candidate_index))
 
 
 def _canonical_candidate_pair(
@@ -718,6 +771,52 @@ def _canonical_candidate_pair(
     """Return a deterministic order for a two-candidate no-good pair."""
     first, second = pair
     return tuple(sorted((first, second)))  # type: ignore[return-value]
+
+
+def _candidate_cuts_from_drc_report(
+    report_path: Path,
+    uuid_to_candidate: dict[str, tuple[int, int]],
+) -> tuple[list[tuple[tuple[int, int], tuple[int, int]]], list[tuple[int, int]]]:
+    """Extract pairwise and unary candidate cuts from actionable KiCad DRC items."""
+    if not report_path.exists():
+        return [], []
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8", errors="replace"))
+    except json.JSONDecodeError:
+        return _pairwise_cuts_from_drc_report(report_path, uuid_to_candidate), []
+
+    pairs: list[tuple[tuple[int, int], tuple[int, int]]] = []
+    unary: list[tuple[int, int]] = []
+    seen_pairs: set[tuple[tuple[int, int], tuple[int, int]]] = set()
+    seen_unary: set[tuple[int, int]] = set()
+
+    for violation in report.get("violations", []):
+        if not _is_drc_feedback_cut_type(str(violation.get("type", ""))):
+            continue
+        candidates: list[tuple[int, int]] = []
+        for item in violation.get("items", []):
+            uuid = str(item.get("uuid", "")).lower()
+            candidate = uuid_to_candidate.get(uuid)
+            if candidate is None or candidate[1] < 0:
+                continue
+            canonical_candidate = _canonical_candidate(candidate)
+            if canonical_candidate not in candidates:
+                candidates.append(canonical_candidate)
+        if len(candidates) == 1:
+            # A single mapped candidate means the other DRC item is fixed board
+            # geometry, so the candidate itself is the smallest useful cut.
+            candidate = candidates[0]
+            if candidate not in seen_unary:
+                seen_unary.add(candidate)
+                unary.append(candidate)
+            continue
+        for index, first in enumerate(candidates):
+            for second in candidates[index + 1:]:
+                pair = _canonical_candidate_pair((first, second))
+                if pair not in seen_pairs:
+                    seen_pairs.add(pair)
+                    pairs.append(pair)
+    return pairs, unary
 
 
 def _pairwise_cuts_from_drc_report(
@@ -2062,15 +2161,26 @@ def _selected_segment_dict(segment: Any, net_id: int, net_name: str, candidate_i
 def _selected_via_dict(via: Any, net_id: int, net_name: str, candidate_index: int) -> dict[str, Any]:
     """Normalize one selected preview via for pcbnew output."""
     diameter = float(getattr(via, "diameter", getattr(via, "diameter_mm", 0.6)) or 0.6)
+    drill = _candidate_via_drill_mm(via)
     return {
         "net_id": int(net_id),
         "net_name": str(net_name),
         "candidate_index": int(candidate_index),
         "center": _xy_tuple(getattr(via, "center", (0.0, 0.0))),
         "diameter_mm": diameter,
+        "drill_mm": float(drill) if drill is not None else None,
+        "via_type": str(getattr(via, "via_type", "through") or "through"),
         "start_layer": str(getattr(via, "start_layer", "F.Cu") or "F.Cu"),
         "end_layer": str(getattr(via, "end_layer", "B.Cu") or "B.Cu"),
     }
+
+
+def _candidate_via_drill_mm(via: Any) -> float | None:
+    """Return candidate via drill metadata without converting missing values to zero."""
+    drill = getattr(via, "drill", None)
+    if drill is None:
+        drill = getattr(via, "drill_mm", None)
+    return float(drill) if drill is not None else None
 
 
 def _xy_tuple(point: Any) -> tuple[float, float]:
@@ -2111,10 +2221,12 @@ def _add_selected_via_to_board(pcbnew: Any, board: Any, via: dict[str, Any]) -> 
     """Add one selected via to a pcbnew board."""
     center = tuple(via.get("center", (0.0, 0.0)))
     diameter = float(via.get("diameter_mm", via.get("diameter", 0.6)))
+    drill = _selected_via_drill_mm(board, via, diameter)
     item = pcbnew.PCB_VIA(board)
     item.SetPosition(pcbnew.VECTOR2I(pcbnew.FromMM(float(center[0])), pcbnew.FromMM(float(center[1]))))
+    _set_selected_via_type(pcbnew, item, _selected_via_type(board, via, diameter))
     item.SetWidth(pcbnew.FromMM(diameter))
-    item.SetDrill(pcbnew.FromMM(max(0.1, diameter * 0.5)))
+    item.SetDrill(pcbnew.FromMM(drill))
     item.SetLayerPair(
         board.GetLayerID(str(via.get("start_layer", "F.Cu"))),
         board.GetLayerID(str(via.get("end_layer", "B.Cu"))),
@@ -2122,6 +2234,96 @@ def _add_selected_via_to_board(pcbnew: Any, board: Any, via: dict[str, Any]) -> 
     item.SetNet(board.FindNet(int(via["net_id"])))
     board.Add(item)
     return _board_item_uuid(item)
+
+
+def _selected_via_type(board: Any, via: dict[str, Any], diameter_mm: float) -> str:
+    """Infer the KiCad via type when legacy candidate metadata lacks it."""
+    raw_type = str(via.get("via_type", "") or "").lower()
+    if raw_type in {"micro", "microvia", "micro_via"}:
+        return "micro"
+    if raw_type in {"blind", "buried", "blind_buried", "blind/buried"}:
+        return "blind_buried"
+    rules = _board_design_rule_mm(board)
+    micro_diameter = rules.get("micro_via_diameter") or rules.get("netclass_micro_via_diameter")
+    via_min_size = rules.get("via_min_size")
+    if micro_diameter and abs(float(diameter_mm) - float(micro_diameter)) <= 1e-6:
+        return "micro"
+    if via_min_size and float(diameter_mm) < float(via_min_size) and micro_diameter:
+        return "micro"
+    return "through"
+
+
+def _selected_via_drill_mm(board: Any, via: dict[str, Any], diameter_mm: float) -> float:
+    """Choose a drill from candidate metadata, then board rules, then fallback."""
+    raw_drill = via.get("drill_mm", via.get("drill"))
+    if raw_drill is not None:
+        return max(0.0, float(raw_drill))
+    rules = _board_design_rule_mm(board)
+    via_type = _selected_via_type(board, via, diameter_mm)
+    if via_type == "micro":
+        for key in ("micro_via_drill", "netclass_micro_via_drill", "micro_via_min_drill"):
+            if key in rules and float(rules[key]) > 0.0:
+                return float(rules[key])
+    for key in ("via_drill", "netclass_via_drill", "via_min_drill"):
+        if key in rules and float(rules[key]) > 0.0:
+            return float(rules[key])
+    return max(0.1, float(diameter_mm) * 0.5)
+
+
+def _set_selected_via_type(pcbnew: Any, item: Any, via_type: str) -> None:
+    """Set KiCad's via type constant when the API supports it."""
+    try:
+        normalized = str(via_type).lower()
+        if normalized == "micro":
+            item.SetViaType(getattr(pcbnew, "VIATYPE_MICROVIA"))
+        elif normalized in {"blind", "buried", "blind_buried", "blind/buried"}:
+            item.SetViaType(getattr(pcbnew, "VIATYPE_BLIND"))
+        else:
+            item.SetViaType(getattr(pcbnew, "VIATYPE_THROUGH"))
+    except Exception:
+        return
+
+
+def _board_design_rule_mm(board: Any) -> dict[str, float]:
+    """Read board-level via rules from pcbnew plus source-file text."""
+    rules: dict[str, float] = {}
+    try:
+        settings = board.GetDesignSettings()
+        pcbnew = _import_pcbnew_for_board_write()
+        mapping = {
+            "via_diameter": "GetCurrentViaSize",
+            "via_drill": "GetCurrentViaDrill",
+            "via_min_size": "m_ViasMinSize",
+            "via_min_drill": "m_MinThroughDrill",
+            "micro_via_min_size": "m_MicroViasMinSize",
+            "micro_via_min_drill": "m_MicroViasMinDrill",
+        }
+        for key, attr in mapping.items():
+            value = getattr(settings, attr, None)
+            if callable(value):
+                value = value()
+            if isinstance(value, (int, float)):
+                rules[key] = float(pcbnew.ToMM(value))
+    except Exception:
+        pass
+    try:
+        filename = Path(str(board.GetFileName()))
+        text = filename.read_text(encoding="utf-8", errors="ignore")
+        for sexpr_key, rule_key in (
+            ("via_size", "via_diameter"),
+            ("uvia_size", "micro_via_diameter"),
+            ("uvia_drill", "micro_via_drill"),
+            ("uvia_dia", "netclass_micro_via_diameter"),
+            ("uvia_drill", "netclass_micro_via_drill"),
+            ("via_dia", "netclass_via_diameter"),
+            ("via_drill", "netclass_via_drill"),
+        ):
+            match = re.search(rf"\(\s*{re.escape(sexpr_key)}\s+([-+]?\d+(?:\.\d+)?)", text)
+            if match:
+                rules.setdefault(rule_key, float(match.group(1)))
+    except Exception:
+        pass
+    return rules
 
 
 def _board_item_uuid(item: Any) -> str | None:
@@ -2244,9 +2446,12 @@ def _serialize_preview_segment(segment: Any) -> dict[str, Any]:
 
 def _serialize_preview_via(via: Any) -> dict[str, Any]:
     """Serialize one selected preview via for DRC and size-rule debugging."""
+    drill = _candidate_via_drill_mm(via)
     return {
         "center": _serialize_xy_like(getattr(via, "center", (0.0, 0.0))),
         "diameter_mm": float(getattr(via, "diameter", 0.0)),
+        "drill_mm": drill,
+        "via_type": str(getattr(via, "via_type", "through") or "through"),
         "start_layer": str(getattr(via, "start_layer", "")),
         "end_layer": str(getattr(via, "end_layer", "")),
     }
@@ -4534,6 +4739,8 @@ def _candidate_preview_item(
             SimpleNamespace(
                 center=tuple(via.get("center", (0.0, 0.0))),
                 diameter=float(via.get("diameter_mm", via.get("diameter", 0.6))),
+                drill=float(via["drill_mm"]) if via.get("drill_mm") is not None else None,
+                via_type=str(via.get("via_type", "through") or "through"),
                 start_layer=str(via.get("start_layer", "F.Cu")),
                 end_layer=str(via.get("end_layer", "B.Cu")),
             )
@@ -4662,6 +4869,8 @@ def _collect_original_route_primitives(
             {
                 "center": center,
                 "diameter_mm": diameter,
+                "drill_mm": float(via.drill) if getattr(via, "drill", None) is not None else None,
+                "via_type": str(getattr(via, "via_type", "through") or "through"),
                 "start_layer": _layer_name_for_z(mapping_board, z_start) or getattr(via, "start_layer", "F.Cu"),
                 "end_layer": _layer_name_for_z(mapping_board, z_end) or getattr(via, "end_layer", "B.Cu"),
                 "radius_mm": radius,
@@ -4762,6 +4971,8 @@ def _collect_freerouting_occurrence_primitives(
             {
                 "center": (float(center[0]), float(center[1])),
                 "diameter_mm": diameter,
+                "drill_mm": float(via["drill_mm"]) if via.get("drill_mm") is not None else None,
+                "via_type": str(via.get("via_type", "through") or "through"),
                 "start_layer": str(via.get("start_layer", "F.Cu")),
                 "end_layer": str(via.get("end_layer", "B.Cu")),
                 "radius_mm": diameter * 0.5 + boundary_clearance,
@@ -6275,6 +6486,10 @@ def _parse_freerouting_occurrence_for_selector(
                     -float(center.get("y_mm", 0.0)),
                 ),
                 "diameter_mm": float(via.get("diameter_mm", 0.6)),
+                # Preserve via manufacturing metadata so the selected-board
+                # writer does not turn micro/blind vias into illegal through vias.
+                "drill_mm": float(via["drill_mm"]) if via.get("drill_mm") is not None else None,
+                "via_type": str(via.get("via_type", "through") or "through"),
                 "start_layer": str(via.get("start_layer", "F.Cu")),
                 "end_layer": str(via.get("end_layer", "B.Cu")),
             }
@@ -6351,6 +6566,123 @@ def _matching_net_id_by_name(board: BoardData | None, net_name: str) -> int:
     if len(matches) == 1:
         return matches[0]
     return 0
+
+
+def _external_selector_bounds(
+    board: BoardData,
+    ripped_net_ids: set[int],
+    pitch: float,
+    nz: int,
+    final_board: BoardData | None = None,
+    final_boards: list[BoardData] | None = None,
+    original_candidate_boards: list[BoardData] | None = None,
+    freerouting_payload_paths: list[Path] | None = None,
+    pcbrouter_payload_paths: list[Path] | None = None,
+    external_payload_paths: list[Path] | None = None,
+) -> tuple[float, float, float, float]:
+    """Return selector grid bounds that cover the board and all external candidates.
+
+    The selector rasterizes candidates after the grid has already been sized.
+    Candidate geometry outside that grid is clipped by the C++ rasterizer, so
+    include every candidate primitive before `origin_x/nx/ny` are computed.
+    """
+    min_x, min_y, max_x, max_y = _board_bounds(board)
+    result_template = SimpleNamespace(
+        grid_pitch=float(pitch),
+        origin_x=0.0,
+        origin_y=0.0,
+        nx=1,
+        ny=1,
+        nz=max(1, int(nz)),
+    )
+    padding = max(0.0, float(pitch)) * 2.0
+
+    def include_primitives(segments: list[dict[str, Any]], vias: list[dict[str, Any]]) -> None:
+        nonlocal min_x, min_y, max_x, max_y
+        min_x, min_y, max_x, max_y = _extend_bounds_with_candidate_primitives(
+            (min_x, min_y, max_x, max_y),
+            segments,
+            vias,
+            padding,
+        )
+
+    candidate_boards: list[BoardData] = []
+    for candidate_board in list(final_boards or []):
+        if candidate_board is not None:
+            candidate_boards.append(candidate_board)
+    if final_board is not None and all(Path(getattr(item, "path", "")) != Path(final_board.path) for item in candidate_boards):
+        candidate_boards.append(final_board)
+
+    for candidate_board in list(original_candidate_boards or []):
+        if candidate_board is not None:
+            candidate_boards.append(candidate_board)
+
+    for net_id in sorted(int(value) for value in ripped_net_ids):
+        net_name = board.nets.get(net_id, "")
+        max_ripped_clearance = _max_ripped_clearance(board, [net_id])
+        for candidate_board in candidate_boards:
+            candidate_net_id = _matching_net_id_by_name(candidate_board, net_name)
+            if candidate_net_id <= 0:
+                continue
+            segments, vias = _collect_original_route_primitives(
+                board=candidate_board,
+                result=result_template,
+                net_id=candidate_net_id,
+                max_ripped_clearance=max_ripped_clearance,
+                layer_index_board=board,
+            )
+            include_primitives(segments, vias)
+
+    payload_paths = [
+        *list(freerouting_payload_paths or []),
+        *list(pcbrouter_payload_paths or []),
+        *list(external_payload_paths or []),
+    ]
+    occurrences_by_net = _load_freerouting_occurrences_by_net(board, payload_paths)
+    for net_id in sorted(int(value) for value in ripped_net_ids):
+        max_ripped_clearance = _max_ripped_clearance(board, [net_id])
+        for occurrence in occurrences_by_net.get(net_id, []):
+            segments, vias = _collect_freerouting_occurrence_primitives(
+                board=board,
+                result=result_template,
+                max_ripped_clearance=max_ripped_clearance,
+                occurrence=occurrence,
+            )
+            include_primitives(segments, vias)
+
+    return min_x, min_y, max_x, max_y
+
+
+def _extend_bounds_with_candidate_primitives(
+    bounds: tuple[float, float, float, float],
+    segments: list[dict[str, Any]],
+    vias: list[dict[str, Any]],
+    padding: float,
+) -> tuple[float, float, float, float]:
+    """Expand a 2D bbox with clearance-expanded candidate tracks and vias."""
+    min_x, min_y, max_x, max_y = bounds
+    for segment in segments:
+        start = segment.get("start", (0.0, 0.0))
+        end = segment.get("end", (0.0, 0.0))
+        radius = max(0.0, float(segment.get("radius_mm", 0.0))) + padding
+        sx = float(start[0])
+        sy = float(start[1])
+        ex = float(end[0])
+        ey = float(end[1])
+        min_x = min(min_x, sx - radius, ex - radius)
+        min_y = min(min_y, sy - radius, ey - radius)
+        max_x = max(max_x, sx + radius, ex + radius)
+        max_y = max(max_y, sy + radius, ey + radius)
+    for via in vias:
+        center = via.get("center", (0.0, 0.0))
+        radius = max(0.0, float(via.get("radius_mm", 0.0))) + padding
+        cx = float(center[0])
+        cy = float(center[1])
+        min_x = min(min_x, cx - radius)
+        min_y = min(min_y, cy - radius)
+        max_x = max(max_x, cx + radius)
+        max_y = max(max_y, cy + radius)
+    return min_x, min_y, max_x, max_y
 
 
 def _pad_boundary_vertices_for_selector(
@@ -6438,7 +6770,18 @@ def build_freerouting_external_selector_outcome(
     layers = board.copper_layers or ["F.Cu"]
     nz = len(layers)
     pitch = 1.0 / (grid_steps_per_mm if grid_steps_per_mm > 0.0 else 10.0)
-    min_x, min_y, max_x, max_y = _board_bounds(board)
+    min_x, min_y, max_x, max_y = _external_selector_bounds(
+        board=board,
+        ripped_net_ids=ripped_net_ids,
+        pitch=pitch,
+        nz=nz,
+        final_board=final_board,
+        final_boards=final_boards,
+        original_candidate_boards=original_candidate_boards,
+        freerouting_payload_paths=freerouting_payload_paths,
+        pcbrouter_payload_paths=pcbrouter_payload_paths,
+        external_payload_paths=external_payload_paths,
+    )
     margin = pitch * 2.0
     origin_x = min_x - margin
     origin_y = min_y - margin

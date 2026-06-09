@@ -1,5 +1,8 @@
 ﻿from __future__ import annotations
 
+import json
+import subprocess
+import tempfile
 from datetime import datetime
 from math import hypot
 from pathlib import Path
@@ -30,6 +33,8 @@ from router_app.kicad_parser import BoardData, TrackSegment, load_board
 from router_app.pcb_router_full import PcbRouterRunResult, run_pcb_router_full
 from router_app.reroute_engine import (
     RerouteOutcome,
+    _board_bend_count_outside_pads,
+    _resolve_kicad_cli,
     build_freerouting_external_selector_outcome,
     minimum_grid_steps_per_mm,
     run_dijkstra_reroute_test,
@@ -46,6 +51,7 @@ class MainWindow(QMainWindow):
         pcb_router: bool = False,
         router_profile_manifest: str | None = None,
         drc_feedback_pairwise: bool = False,
+        drc_feedback_unary: bool = False,
         drc_feedback_max_iterations: int = 0,
         drc_feedback_kicad_cli: str | None = None,
     ):
@@ -60,6 +66,7 @@ class MainWindow(QMainWindow):
         self._pcb_router_enabled = pcb_router
         self._router_profile_manifest = router_profile_manifest
         self._drc_feedback_pairwise = drc_feedback_pairwise
+        self._drc_feedback_unary = drc_feedback_unary
         self._drc_feedback_max_iterations = drc_feedback_max_iterations
         self._drc_feedback_kicad_cli = drc_feedback_kicad_cli
         self._freerouting_run: FreeroutingRunResult | None = None
@@ -307,19 +314,118 @@ class MainWindow(QMainWindow):
         Routed reference inputs are user-provided comparison baselines. Keep
         them visible in the top-left canvas while external routers and selector
         candidates continue to use the canonical unrouted coordinate frame.
-        For unrouted inputs with multiple external routers, show the backend
-        final board with fewer vias so the visible baseline matches the simpler
-        completed route.
+        For unrouted inputs with multiple external routers, show the final
+        board with the best DRC connectivity/clearance rank before comparing
+        via count, bend count, and wire length.
         """
         input_path = Path(file_name)
         if self._is_routed_reference_input(input_path):
             return load_board(input_path)
-        if freerouting_result is not None and pcbrouter_result is not None:
-            freerouting_vias = len(freerouting_result.routed_board.vias)
-            pcbrouter_vias = len(pcbrouter_result.routed_board.vias)
-            if pcbrouter_vias < freerouting_vias:
-                return pcbrouter_result.routed_board
-        return display_result.routed_board
+        candidates: list[tuple[str, BoardData]] = []
+        if freerouting_result is not None:
+            candidates.append(("freerouting", freerouting_result.routed_board))
+        if pcbrouter_result is not None:
+            candidates.append(("pcbrouter", pcbrouter_result.routed_board))
+        if not candidates:
+            return display_result.routed_board
+        ranked = [
+            (self._external_display_board_rank(label, board), label, board)
+            for label, board in candidates
+        ]
+        ranked.sort(key=lambda item: item[0])
+        best_rank, best_label, best_board = ranked[0]
+        print(
+            "external_left_top_display_selection "
+            f"backend={best_label} "
+            f"drc_bad={best_rank[0]} vias={best_rank[1]} "
+            f"bends={best_rank[2]} wire_mm={best_rank[3]:.3f}",
+            flush=True,
+        )
+        return best_board
+
+    def _external_display_board_rank(self, backend_label: str, board: BoardData) -> tuple[int, int, int, float]:
+        """Return the ordering key for choosing the left-top external-router board."""
+        drc_bad_count = self._external_display_board_drc_bad_count(backend_label, board)
+        via_count = len(board.vias)
+        bend_count = _board_bend_count_outside_pads(board)
+        wire_length_mm = self._board_wire_length_mm(board)
+        print(
+            "external_left_top_display_candidate "
+            f"backend={backend_label} drc_bad={drc_bad_count} "
+            f"vias={via_count} bends={bend_count} wire_mm={wire_length_mm:.3f} "
+            f"board={Path(board.path).resolve()}",
+            flush=True,
+        )
+        return (drc_bad_count, via_count, bend_count, wire_length_mm)
+
+    def _external_display_board_drc_bad_count(self, backend_label: str, board: BoardData) -> int:
+        """Count priority KiCad routing/connectivity errors for display ranking."""
+        kicad_cli = _resolve_kicad_cli(self._drc_feedback_kicad_cli)
+        if kicad_cli is None:
+            print(
+                f"external_left_top_display_drc_unavailable backend={backend_label} reason=kicad_cli_not_found",
+                flush=True,
+            )
+            return 10**9
+        report_path = Path(tempfile.gettempdir()) / f"interactive_router_left_top_{backend_label}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.drc.json"
+        completed = subprocess.run(
+            [
+                str(kicad_cli),
+                "pcb",
+                "drc",
+                "--format",
+                "json",
+                "--severity-all",
+                "--all-track-errors",
+                "--output",
+                str(report_path),
+                str(board.path),
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if not report_path.exists():
+            print(
+                "external_left_top_display_drc_unavailable "
+                f"backend={backend_label} reason=missing_report exit={completed.returncode}",
+                flush=True,
+            )
+            return 10**9
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8", errors="replace"))
+        except Exception as exc:
+            print(
+                f"external_left_top_display_drc_unavailable backend={backend_label} reason=parse_failed error={exc}",
+                flush=True,
+            )
+            return 10**9
+        violations = list(report.get("violations", []))
+        clearance = sum(1 for item in violations if item.get("type") == "clearance")
+        shorting = sum(1 for item in violations if item.get("type") == "shorting_items")
+        tracks_crossing = sum(1 for item in violations if item.get("type") == "tracks_crossing")
+        hole_clearance = sum(1 for item in violations if item.get("type") == "hole_clearance")
+        unconnected = len(report.get("unconnected_items", []))
+        bad_count = int(clearance + shorting + tracks_crossing + hole_clearance + unconnected)
+        print(
+            "external_left_top_display_drc "
+            f"backend={backend_label} clearance={clearance} "
+            f"shorting_items={shorting} tracks_crossing={tracks_crossing} "
+            f"hole_clearance={hole_clearance} unconnected_items={unconnected} "
+            f"bad={bad_count} report={report_path}",
+            flush=True,
+        )
+        return bad_count
+
+    def _board_wire_length_mm(self, board: BoardData) -> float:
+        """Measure total routed track length for deterministic display-board ties."""
+        total = 0.0
+        for track in board.tracks:
+            total += hypot(
+                float(track.end[0]) - float(track.start[0]),
+                float(track.end[1]) - float(track.start[1]),
+            )
+        return total
 
     def _is_routed_reference_input(self, board_path: Path) -> bool:
         """Return true when the opened file name represents a routed reference board."""
@@ -684,6 +790,7 @@ class MainWindow(QMainWindow):
             max_paths_per_net=1,
             prefer_gurobi=True,
             drc_feedback_pairwise=self._drc_feedback_pairwise,
+            drc_feedback_unary=self._drc_feedback_unary,
             drc_feedback_max_iterations=self._drc_feedback_max_iterations,
             drc_feedback_kicad_cli=self._drc_feedback_kicad_cli,
         )

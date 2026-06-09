@@ -36,6 +36,9 @@ class FreeroutingVia:
     diameter: float
     start_layer: str
     end_layer: str
+    # Preserve KiCad manufacturing metadata when freerouting candidates are replayed.
+    drill: float | None = None
+    via_type: str = "through"
 
 
 @dataclass(frozen=True)
@@ -402,6 +405,8 @@ def _load_selector_original_board(
             net_name=via.net_name,
             start_layer=via.start_layer,
             end_layer=via.end_layer,
+            drill=via.drill,
+            via_type=via.via_type,
         )
         for via in input_board.vias
     ]
@@ -1117,6 +1122,8 @@ def _via_to_dict(via: Via) -> dict[str, object]:
     return {
         "center": tuple(map(float, via.center)),
         "diameter": float(via.diameter),
+        "drill_mm": float(via.drill) if via.drill is not None else None,
+        "via_type": str(via.via_type or "through"),
         "start_layer": via.start_layer,
         "end_layer": via.end_layer,
     }
@@ -1612,6 +1619,8 @@ def _parse_vias(raw_vias) -> list[FreeroutingVia]:
             diameter=float(via.get("diameter_mm", 0.6)),
             start_layer=str(via.get("start_layer", "F.Cu")),
             end_layer=str(via.get("end_layer", "B.Cu")),
+            drill=float(via["drill_mm"]) if via.get("drill_mm") is not None else None,
+            via_type=str(via.get("via_type", "through") or "through"),
         )
         for via in raw_vias
         if isinstance(via, dict)

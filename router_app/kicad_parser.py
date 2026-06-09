@@ -49,6 +49,9 @@ class Via:
     net_name: str
     start_layer: str = "F.Cu"
     end_layer: str = "B.Cu"
+    # Preserve KiCad manufacturing metadata for micro/blind via replay.
+    drill: float | None = None
+    via_type: str = "through"
 
 
 @dataclass(frozen=True)
@@ -134,7 +137,7 @@ def _load_board_with_pcbnew(path: str | Path) -> BoardData:
         footprints=footprints,
         vias=vias,
         backend="pcbnew-normalized" if load_path != board_path else "pcbnew",
-        design_rules=_pcbnew_design_rules(board, pcbnew),
+        design_rules=_merge_design_rules(_pcbnew_design_rules(board, pcbnew), _sexpr_design_rules_from_file(board_path)),
         net_clearances=_pcbnew_net_clearances(board, pcbnew),
         declared_copper_layers=declared_layers,
         layer_aliases=layer_aliases,
@@ -186,6 +189,7 @@ def _load_board_with_sexpr(path: str | Path) -> BoardData:
         footprints=footprints,
         vias=vias,
         backend="sexpr",
+        design_rules=_sexpr_design_rules_from_file(board_path),
         declared_copper_layers=declared_layers,
         layer_aliases=layer_aliases,
     )
@@ -497,6 +501,8 @@ def _pcbnew_vias(board: Any, pcbnew: Any, nets: dict[int, str]) -> list[Via]:
             continue
         net_id = int(_call_or_default(item, "GetNetCode", 0))
         diameter = _pcbnew_via_diameter(board, item)
+        drill = _pcbnew_via_drill(item)
+        via_type = _pcbnew_via_type(item, pcbnew)
         start_layer, end_layer = _pcbnew_via_layer_span(board, item)
         vias.append(
             Via(
@@ -506,6 +512,8 @@ def _pcbnew_vias(board: Any, pcbnew: Any, nets: dict[int, str]) -> list[Via]:
                 net_name=_call_or_default(item, "GetNetname", nets.get(net_id, f"Net {net_id}")),
                 start_layer=start_layer,
                 end_layer=end_layer,
+                drill=_pcbnew_to_mm(drill, pcbnew) if isinstance(drill, (int, float)) else None,
+                via_type=via_type,
             )
         )
     return vias
@@ -549,6 +557,32 @@ def _pcbnew_via_diameter(board: Any, via: Any) -> int | float:
     if hasattr(via, "GetDiameter"):
         return via.GetDiameter()
     return 0
+
+
+def _pcbnew_via_drill(via: Any) -> int | float | None:
+    """Read a via drill diameter from pcbnew when available."""
+    for method_name in ("GetDrillValue", "GetDrill", "GetPrimaryDrillSize"):
+        value = _call_or_default(via, method_name, None)
+        if isinstance(value, (int, float)):
+            return value
+    return None
+
+
+def _pcbnew_via_type(via: Any, pcbnew: Any) -> str:
+    """Normalize KiCad's via type constants into stable metadata strings."""
+    if bool(_call_or_default(via, "IsMicroVia", False)):
+        return "micro"
+    if bool(_call_or_default(via, "IsBlindVia", False)) or bool(_call_or_default(via, "IsBuriedVia", False)):
+        return "blind_buried"
+    value = _call_or_default(via, "GetViaType", None)
+    try:
+        if value == getattr(pcbnew, "VIATYPE_MICROVIA", object()):
+            return "micro"
+        if value == getattr(pcbnew, "VIATYPE_BLIND", object()):
+            return "blind_buried"
+    except Exception:
+        pass
+    return "through"
 
 
 def _pcbnew_footprints(board: Any, pcbnew: Any, nets: dict[int, str]) -> list[Footprint]:
@@ -603,6 +637,49 @@ def _pcbnew_design_rules(board: Any, pcbnew: Any) -> dict[str, float]:
         value = _call_or_default(settings, method_name, None)
         if isinstance(value, (int, float)):
             rules[key] = _pcbnew_to_mm(value, pcbnew)
+    return rules
+
+
+def _merge_design_rules(primary: dict[str, float], secondary: dict[str, float]) -> dict[str, float]:
+    """Merge design-rule dictionaries without overwriting pcbnew API values."""
+    merged = dict(secondary)
+    merged.update(primary)
+    return merged
+
+
+def _sexpr_design_rules_from_file(path: Path) -> dict[str, float]:
+    """Read via-size rules that pcbnew does not expose through simple getters."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return {}
+    rules: dict[str, float] = {}
+    scalar_keys = {
+        "via_size": "via_diameter",
+        "via_min_size": "via_min_size",
+        "via_min_drill": "via_min_drill",
+        "uvia_size": "micro_via_diameter",
+        "uvia_drill": "micro_via_drill",
+        "uvia_min_size": "micro_via_min_size",
+        "uvia_min_drill": "micro_via_min_drill",
+    }
+    for sexpr_key, rule_key in scalar_keys.items():
+        match = re.search(rf"\(\s*{re.escape(sexpr_key)}\s+([-+]?\d+(?:\.\d+)?)", text)
+        if match:
+            rules[rule_key] = float(match.group(1))
+    for sexpr_key, rule_key in {
+        "via_dia": "netclass_via_diameter",
+        "via_drill": "netclass_via_drill",
+        "uvia_dia": "netclass_micro_via_diameter",
+        "uvia_drill": "netclass_micro_via_drill",
+    }.items():
+        match = re.search(rf"\(\s*{re.escape(sexpr_key)}\s+([-+]?\d+(?:\.\d+)?)", text)
+        if match:
+            rules[rule_key] = float(match.group(1))
+    if "netclass_micro_via_diameter" in rules:
+        rules.setdefault("micro_via_diameter", rules["netclass_micro_via_diameter"])
+    if "netclass_micro_via_drill" in rules:
+        rules.setdefault("micro_via_drill", rules["netclass_micro_via_drill"])
     return rules
 
 
@@ -747,10 +824,12 @@ def _parse_segment(node: list[Any], nets: dict[int, str]) -> TrackSegment | None
 def _parse_via(node: list[Any], nets: dict[int, str]) -> Via | None:
     center = _pair(_child(node, "at"))
     diameter = _number(_child_value(node, "size"), default=0.6)
+    drill = _number(_child_value(node, "drill"), default=None)
     net_id = _to_int(_child_value(node, "net"))
     layers_node = _child(node, "layers")
     start_layer = _canonical_layer(layers_node[1]) if layers_node is not None and len(layers_node) >= 3 else "F.Cu"
     end_layer = _canonical_layer(layers_node[2]) if layers_node is not None and len(layers_node) >= 3 else "B.Cu"
+    via_type = "micro" if len(node) > 1 and str(node[1]).lower() == "micro" else "through"
 
     if center is None or net_id is None:
         return None
@@ -762,6 +841,8 @@ def _parse_via(node: list[Any], nets: dict[int, str]) -> Via | None:
         net_name=nets.get(net_id, f"Net {net_id}"),
         start_layer=start_layer,
         end_layer=end_layer,
+        drill=drill,
+        via_type=via_type,
     )
 
 
@@ -938,7 +1019,7 @@ def _pair(node: list[Any] | None) -> tuple[float, float] | None:
     return (_number(node[1]), _number(node[2]))
 
 
-def _number(value: Any, default: float = 0.0) -> float:
+def _number(value: Any, default: float | None = 0.0) -> float | None:
     try:
         return float(value)
     except (TypeError, ValueError):
