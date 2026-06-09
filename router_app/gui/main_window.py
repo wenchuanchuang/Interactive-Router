@@ -45,6 +45,9 @@ class MainWindow(QMainWindow):
         freerouting_full: bool = False,
         pcb_router: bool = False,
         router_profile_manifest: str | None = None,
+        drc_feedback_pairwise: bool = False,
+        drc_feedback_max_iterations: int = 0,
+        drc_feedback_kicad_cli: str | None = None,
     ):
         super().__init__()
         self._program_started_at = datetime.now().astimezone()
@@ -56,6 +59,9 @@ class MainWindow(QMainWindow):
         self._freerouting_full_enabled = freerouting_full
         self._pcb_router_enabled = pcb_router
         self._router_profile_manifest = router_profile_manifest
+        self._drc_feedback_pairwise = drc_feedback_pairwise
+        self._drc_feedback_max_iterations = drc_feedback_max_iterations
+        self._drc_feedback_kicad_cli = drc_feedback_kicad_cli
         self._freerouting_run: FreeroutingRunResult | None = None
         self._pcb_router_run: PcbRouterRunResult | None = None
         self._freerouting_candidates_ready = False
@@ -602,7 +608,7 @@ class MainWindow(QMainWindow):
                 self.statusBar().showMessage("Generate candidates first, then reroute.")
                 return
 
-            selection = select_reroute_candidates(self._candidate_outcome, max_paths_per_net=1, prefer_gurobi=True)
+            selection = self._select_candidates_with_configured_feedback()
             self._print_external_candidate_collection_timing()
             if not selection.ok:
                 self.statusBar().showMessage(f"Path selection failed: {selection.message}")
@@ -629,6 +635,7 @@ class MainWindow(QMainWindow):
                 self.statusBar().showMessage(
                     "Reroute has no selectable solution. Keep current preview unchanged."
                 )
+            self._print_selection_artifacts(selection)
             return
         if self._board is None:
             return
@@ -641,7 +648,7 @@ class MainWindow(QMainWindow):
             self._update_ripup_buttons()
             return
 
-        selection = select_reroute_candidates(self._candidate_outcome, max_paths_per_net=1, prefer_gurobi=True)
+        selection = self._select_candidates_with_configured_feedback()
         if not selection.ok:
             self.statusBar().showMessage(f"Path selection failed: {selection.message}")
             return
@@ -661,6 +668,25 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 "Reroute has no selectable solution. Keep current preview unchanged."
             )
+        self._print_selection_artifacts(selection)
+
+    def _print_selection_artifacts(self, selection) -> None:
+        """Print saved selector artifacts near the end of a GUI reroute action."""
+        artifacts = getattr(selection, "artifacts", None) or {}
+        gurobi_board_path = artifacts.get("gurobi_selected_board")
+        if gurobi_board_path:
+            print(f"gui_gurobi_board_saved = {gurobi_board_path}", flush=True)
+
+    def _select_candidates_with_configured_feedback(self):
+        """Run path selection with the optional KiCad DRC feedback CLI settings."""
+        return select_reroute_candidates(
+            self._candidate_outcome,
+            max_paths_per_net=1,
+            prefer_gurobi=True,
+            drc_feedback_pairwise=self._drc_feedback_pairwise,
+            drc_feedback_max_iterations=self._drc_feedback_max_iterations,
+            drc_feedback_kicad_cli=self._drc_feedback_kicad_cli,
+        )
 
     def _show_status_counts(self, prefix: str) -> None:
         if self._board is None:

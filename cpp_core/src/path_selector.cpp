@@ -1,5 +1,7 @@
 ﻿#include "router.h"
 
+#include "roaring_bitmap.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -60,8 +62,8 @@ struct CandidateRecord {
     int via_count = 0;
     int bend_count = 0;
     double length_mm = 0.0;
-    std::vector<PackedVertexId> occupied_vertices;
-    std::vector<PackedVertexId> cover_vertices;
+    Roaring64Bitmap occupied_vertices;
+    Roaring64Bitmap cover_vertices;
     std::vector<PackedVertexId> terminal_coords;
     std::vector<std::vector<PackedVertexId>> terminal_groups;
 };
@@ -132,6 +134,10 @@ std::size_t candidateCount(const NetCandidateSet& net) {
         net.candidate_cover_vertices.size(),
         net.candidate_terminal_coords.size(),
         net.candidate_terminal_groups.size(),
+        net.candidate_boundary_vertex_ids.size(),
+        net.candidate_cover_vertex_ids.size(),
+        net.candidate_terminal_coord_ids.size(),
+        net.candidate_terminal_group_ids.size(),
     });
 }
 
@@ -166,18 +172,28 @@ std::size_t sharedPadCount(const std::vector<int>& a, const std::vector<int>& b)
     return count;
 }
 
-std::vector<PackedVertexId> uniqueVerticesFromGridPoints(const std::vector<GridPoint>& points) {
-    std::vector<PackedVertexId> vertices;
-    vertices.reserve(points.size());
-    std::unordered_set<PackedVertexId> seen;
-    seen.reserve(points.size() * 2 + 1);
+Roaring64Bitmap bitmapFromGridPoints(const std::vector<GridPoint>& points) {
+    Roaring64Bitmap vertices;
     for (const auto& point : points) {
-        PackedVertexId key = packVertex(toVertex(point));
-        if (seen.insert(key).second) {
-            vertices.push_back(key);
-        }
+        vertices.add(packVertex(toVertex(point)));
     }
     return vertices;
+}
+
+std::vector<PackedVertexId> uniqueVerticesFromGridPoints(const std::vector<GridPoint>& points) {
+    return bitmapFromGridPoints(points).values();
+}
+
+Roaring64Bitmap bitmapFromPackedVertices(const std::vector<PackedVertexId>& points) {
+    Roaring64Bitmap vertices;
+    for (PackedVertexId point : points) {
+        vertices.add(point);
+    }
+    return vertices;
+}
+
+std::vector<PackedVertexId> uniqueVerticesFromPackedVertices(const std::vector<PackedVertexId>& points) {
+    return bitmapFromPackedVertices(points).values();
 }
 
 void appendPackedVertices(std::string& key, std::vector<PackedVertexId> vertices) {
@@ -191,6 +207,15 @@ void appendPackedVertices(std::string& key, std::vector<PackedVertexId> vertices
     key += "]";
 }
 
+void appendBitmapVertices(std::string& key, const Roaring64Bitmap& vertices) {
+    key += "[";
+    vertices.forEach([&key](PackedVertexId vertex) {
+        key += std::to_string(vertex);
+        key += ",";
+    });
+    key += "]";
+}
+
 std::string candidateRecordGeometryKey(const CandidateRecord& candidate) {
     // Deduplicate candidates only when their selector-visible geometry and
     // terminal coverage are identical. This catches duplicate stable/aggressive
@@ -201,9 +226,9 @@ std::string candidateRecordGeometryKey(const CandidateRecord& candidate) {
          candidate.terminal_coords.size()) * 24
     );
     key += "occ=";
-    appendPackedVertices(key, candidate.occupied_vertices);
+    appendBitmapVertices(key, candidate.occupied_vertices);
     key += "cov=";
-    appendPackedVertices(key, candidate.cover_vertices);
+    appendBitmapVertices(key, candidate.cover_vertices);
     key += "term=";
     appendPackedVertices(key, candidate.terminal_coords);
     key += "groups=";
@@ -329,21 +354,30 @@ std::vector<NetRecord> buildNetRecords(const SelectionRequest& request, bool* tr
                 ? pathLengthMm(net.candidate_paths_mm[candidate_idx])
                 : 0.0;
 
-            if (candidate_idx < net.candidate_boundary_vertices.size() &&
+            if (candidate_idx < net.candidate_boundary_vertex_ids.size() &&
+                !net.candidate_boundary_vertex_ids[candidate_idx].empty()) {
+                candidate.occupied_vertices = bitmapFromPackedVertices(net.candidate_boundary_vertex_ids[candidate_idx]);
+            } else if (candidate_idx < net.candidate_boundary_vertices.size() &&
                 !net.candidate_boundary_vertices[candidate_idx].empty()) {
-                candidate.occupied_vertices = uniqueVerticesFromGridPoints(net.candidate_boundary_vertices[candidate_idx]);
+                candidate.occupied_vertices = bitmapFromGridPoints(net.candidate_boundary_vertices[candidate_idx]);
             } else if (!path_grid.empty()) {
-                candidate.occupied_vertices = uniqueVerticesFromGridPoints(path_grid);
+                candidate.occupied_vertices = bitmapFromGridPoints(path_grid);
             }
 
-            if (candidate_idx < net.candidate_cover_vertices.size() &&
+            if (candidate_idx < net.candidate_cover_vertex_ids.size() &&
+                !net.candidate_cover_vertex_ids[candidate_idx].empty()) {
+                candidate.cover_vertices = bitmapFromPackedVertices(net.candidate_cover_vertex_ids[candidate_idx]);
+            } else if (candidate_idx < net.candidate_cover_vertices.size() &&
                 !net.candidate_cover_vertices[candidate_idx].empty()) {
-                candidate.cover_vertices = uniqueVerticesFromGridPoints(net.candidate_cover_vertices[candidate_idx]);
+                candidate.cover_vertices = bitmapFromGridPoints(net.candidate_cover_vertices[candidate_idx]);
             } else {
                 candidate.cover_vertices = candidate.occupied_vertices;
             }
 
-            if (candidate_idx < net.candidate_terminal_coords.size() &&
+            if (candidate_idx < net.candidate_terminal_coord_ids.size() &&
+                !net.candidate_terminal_coord_ids[candidate_idx].empty()) {
+                candidate.terminal_coords = uniqueVerticesFromPackedVertices(net.candidate_terminal_coord_ids[candidate_idx]);
+            } else if (candidate_idx < net.candidate_terminal_coords.size() &&
                 !net.candidate_terminal_coords[candidate_idx].empty()) {
                 candidate.terminal_coords = uniqueVerticesFromGridPoints(net.candidate_terminal_coords[candidate_idx]);
             } else if (!path_grid.empty()) {
@@ -353,7 +387,15 @@ std::vector<NetRecord> buildNetRecords(const SelectionRequest& request, bool* tr
                 };
             }
 
-            if (candidate_idx < net.candidate_terminal_groups.size() &&
+            if (candidate_idx < net.candidate_terminal_group_ids.size() &&
+                !net.candidate_terminal_group_ids[candidate_idx].empty()) {
+                for (const auto& group_points : net.candidate_terminal_group_ids[candidate_idx]) {
+                    auto group_vertices = uniqueVerticesFromPackedVertices(group_points);
+                    if (!group_vertices.empty()) {
+                        candidate.terminal_groups.push_back(std::move(group_vertices));
+                    }
+                }
+            } else if (candidate_idx < net.candidate_terminal_groups.size() &&
                 !net.candidate_terminal_groups[candidate_idx].empty()) {
                 for (const auto& group_points : net.candidate_terminal_groups[candidate_idx]) {
                     auto group_vertices = uniqueVerticesFromGridPoints(group_points);
@@ -649,8 +691,8 @@ SelectionResult solveWithGurobi(const SelectionRequest& request, const std::vect
                 hit_groups.reserve(terminal_group_sets_by_net[g].size());
                 for (std::size_t gi = 0; gi < terminal_group_sets_by_net[g].size(); ++gi) {
                     bool hit_group = false;
-                    for (const auto& occupied : candidate.cover_vertices) {
-                        if (terminal_group_sets_by_net[g][gi].find(occupied) != terminal_group_sets_by_net[g][gi].end()) {
+                    for (const auto& terminal_vertex : terminal_group_sets_by_net[g][gi]) {
+                        if (candidate.cover_vertices.contains(terminal_vertex)) {
                             hit_group = true;
                             break;
                         }
@@ -681,10 +723,10 @@ SelectionResult solveWithGurobi(const SelectionRequest& request, const std::vect
 
         for (std::size_t p = 0; p < records[g].candidates.size(); ++p) {
             const auto& candidate = records[g].candidates[p];
-            for (const auto& vertex : candidate.occupied_vertices) {
+            candidate.occupied_vertices.forEach([&](PackedVertexId vertex) {
                 v_exprs[vertex] += path_choice[g][p];
                 v_groups[vertex].insert(static_cast<int>(g));
-            }
+            });
         }
     }
 
@@ -924,6 +966,78 @@ SelectionResult solveWithGurobi(const SelectionRequest& request, const std::vect
                 "Capacity_x" + std::to_string(unpacked.x) + "_y" + std::to_string(unpacked.y) + "_z" + std::to_string(unpacked.z)
             );
         }
+    }
+
+    auto findChoiceForForbiddenItem = [&](const ForbiddenSelectionItem& item) -> GRBVar* {
+        auto record_it = std::find_if(records.begin(), records.end(), [&](const NetRecord& record) {
+            return record.net_id == item.net_id;
+        });
+        if (record_it == records.end()) {
+            return nullptr;
+        }
+        const std::size_t g = static_cast<std::size_t>(std::distance(records.begin(), record_it));
+        auto candidate_it = std::find_if(record_it->candidates.begin(), record_it->candidates.end(), [&](const CandidateRecord& candidate) {
+            return candidate.candidate_index == item.candidate_index;
+        });
+        if (candidate_it == record_it->candidates.end()) {
+            return nullptr;
+        }
+        const std::size_t p = static_cast<std::size_t>(std::distance(record_it->candidates.begin(), candidate_it));
+        return &path_choice[g][p];
+    };
+
+    int forbidden_selection_count = 0;
+    for (std::size_t forbidden_index = 0; forbidden_index < request.forbidden_selections.size(); ++forbidden_index) {
+        GRBLinExpr forbidden_expr = 0.0;
+        int matched_items = 0;
+        for (const auto& item : request.forbidden_selections[forbidden_index].items) {
+            GRBVar* choice = findChoiceForForbiddenItem(item);
+            if (choice != nullptr) {
+                forbidden_expr += *choice;
+                ++matched_items;
+            }
+        }
+        if (matched_items > 0) {
+            // Exclude a previously DRC-failing full selected solution without
+            // changing the objective. At least one selected candidate must
+            // differ from the forbidden combination on the next solve.
+            model.addConstr(
+                forbidden_expr <= static_cast<double>(matched_items - 1),
+                "ForbiddenSelection_" + std::to_string(forbidden_index)
+            );
+            ++forbidden_selection_count;
+        }
+    }
+    if (forbidden_selection_count > 0) {
+        std::cout << "selector_gurobi_forbidden_selection_row_count = "
+                  << forbidden_selection_count << std::endl;
+    }
+
+    int forbidden_pair_count = 0;
+    for (std::size_t forbidden_index = 0; forbidden_index < request.forbidden_pairs.size(); ++forbidden_index) {
+        GRBLinExpr forbidden_expr = 0.0;
+        int matched_items = 0;
+        for (const auto& item : request.forbidden_pairs[forbidden_index].items) {
+            GRBVar* choice = findChoiceForForbiddenItem(item);
+            if (choice != nullptr) {
+                forbidden_expr += *choice;
+                ++matched_items;
+            }
+        }
+        if (matched_items >= 2) {
+            // Exclude only the two-candidate combination observed in KiCad DRC.
+            // Single-item violations are intentionally ignored here because this
+            // experiment does not add unary cuts.
+            model.addConstr(
+                forbidden_expr <= static_cast<double>(matched_items - 1),
+                "ForbiddenPair_" + std::to_string(forbidden_index)
+            );
+            ++forbidden_pair_count;
+        }
+    }
+    if (forbidden_pair_count > 0) {
+        std::cout << "selector_gurobi_forbidden_pair_row_count = "
+                  << forbidden_pair_count << std::endl;
     }
 
     GRBLinExpr via_obj = 0.0;

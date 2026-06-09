@@ -18,6 +18,7 @@ class SelectionResult:
     selections: list[NetSelection]
     solver: str
     message: str
+    artifacts: dict[str, str] | None = None
 
 
 def _path_length_mm(path_mm: list[Any]) -> float:

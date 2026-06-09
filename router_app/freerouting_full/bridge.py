@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -14,6 +15,7 @@ from typing import Iterable
 import pcbnew
 
 from router_app.kicad_parser import BoardData, TrackSegment, Via, load_board
+from router_app.reroute_engine import _find_invalid_pad_entry_locations
 
 
 FREEROUTING_PROFILE_SCHEMA = "interactive_router_freerouting_profiles_v1"
@@ -87,7 +89,7 @@ def run_freerouting_full(board_path: str | Path, profile_manifest_path: str | Pa
     if not jar_path.exists():
         raise RuntimeError(f"freerouting executable jar was not found: {jar_path}")
 
-    work_dir = app_root / "out" / "freerouting_full" / board_path.stem
+    work_dir = _artifact_root(app_root) / "freerouting_full" / board_path.stem
     work_dir.mkdir(parents=True, exist_ok=True)
 
     dsn_path = work_dir / "freerouting.dsn"
@@ -137,12 +139,22 @@ def run_freerouting_full(board_path: str | Path, profile_manifest_path: str | Pa
     if not stage_results:
         raise RuntimeError("freerouting did not produce any profile result.")
     attempted_profiles = [str(stage["profile_name"]) for stage in stage_results]
+    original_board, original_candidate_board = _load_selector_original_board(
+        input_board_path=board_path,
+        router_source_board_path=router_source_board_path,
+        board_cache=board_cache,
+    )
+    stage_quality_reports = [
+        _profile_quality_report(stage, original_board, board_cache)
+        for stage in stage_results
+    ]
+    stage_quality_by_profile = {
+        str(report["profile"]): report
+        for report in stage_quality_reports
+    }
     selected_stage = min(
         stage_results,
-        key=lambda stage: (
-            _unconnected_count(stage),
-            len(_load_board_cached(Path(stage["routed_board_path"]), board_cache).vias),
-        ),
+        key=lambda stage: _profile_selection_key(stage, stage_quality_by_profile, board_cache),
     )
 
     _copy_stage_artifact(selected_stage["ses_path"], ses_path)
@@ -152,14 +164,9 @@ def run_freerouting_full(board_path: str | Path, profile_manifest_path: str | Pa
     _copy_stage_artifact(selected_stage["stderr_log_path"], stderr_log_path)
     run_report = dict(selected_stage["run_report"])
 
-    original_board, original_candidate_board = _load_selector_original_board(
-        input_board_path=board_path,
-        router_source_board_path=router_source_board_path,
-        board_cache=board_cache,
-    )
-    routed_board = _load_board_cached(routed_board_path, board_cache)
+    routed_board = _sanitize_freerouting_final_board(_load_board_cached(routed_board_path, board_cache))
     candidate_routed_boards = tuple(
-        _load_board_cached(Path(stage["routed_board_path"]), board_cache)
+        _sanitize_freerouting_final_board(_load_board_cached(Path(stage["routed_board_path"]), board_cache))
         for stage in stage_results
     )
     candidate_routed_board_paths = tuple(Path(stage["routed_board_path"]) for stage in stage_results)
@@ -244,6 +251,7 @@ def run_freerouting_full(board_path: str | Path, profile_manifest_path: str | Pa
         "unconnected_report": run_report["unconnected_report"],
         "attempted_profiles": attempted_profiles,
         "selected_profile": selected_stage["profile_name"],
+        "profile_quality_reports": stage_quality_reports,
         "stage_reports": stage_reports,
         "schema": FREEROUTING_PROFILE_SCHEMA,
         "elapsed_sec": elapsed_sec,
@@ -252,6 +260,18 @@ def run_freerouting_full(board_path: str | Path, profile_manifest_path: str | Pa
     }
     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     print(f"freerouting_profile_manifest = {metadata_path.resolve()}", flush=True)
+    for report in stage_quality_reports:
+        print(
+            "freerouting_profile_quality "
+            f"profile={report['profile']} "
+            f"unconnected={report['unconnected_count']} "
+            f"route_clearance_violations={report['route_clearance_violations']} "
+            f"pad_entry_violations={report.get('pad_entry_violations', 0)} "
+            f"via_count={report['via_count']} "
+            f"bend_proxy={report['bend_proxy']} "
+            f"wire_length_mm={float(report['wire_length_mm']):.3f}",
+            flush=True,
+        )
 
     return FreeroutingRunResult(
         original_board=original_board,
@@ -280,6 +300,19 @@ def run_freerouting_full(board_path: str | Path, profile_manifest_path: str | Pa
         stdout_log_path=stdout_log_path,
         stderr_log_path=stderr_log_path,
     )
+
+
+def _artifact_root(app_root: Path) -> Path:
+    """Return the root directory for generated router artifacts.
+
+    INTERACTIVE_ROUTER_ARTIFACT_ROOT is intended for headless regression runs
+    where the normal application out directory is not writable by the child
+    Python process. Without the override, runtime behavior stays unchanged.
+    """
+    override = os.environ.get("INTERACTIVE_ROUTER_ARTIFACT_ROOT")
+    if override:
+        return Path(override).expanduser().resolve()
+    return app_root / "out"
 
 
 def _export_dsn(board_path: Path, dsn_path: Path) -> None:
@@ -729,6 +762,22 @@ def _import_ses(board_path: Path, ses_path: Path, routed_board_path: Path) -> No
         raise RuntimeError(f"pcbnew failed to save routed board: {routed_board_path}")
 
 
+def _read_board_edge_clearance_mm(board_path: Path) -> float | None:
+    """Return KiCad's copper-to-edge clearance in millimeters when available."""
+    try:
+        board = pcbnew.LoadBoard(str(board_path))
+        design_settings = board.GetDesignSettings()
+        value_iu = getattr(design_settings, "m_CopperEdgeClearance", None)
+        if value_iu is None:
+            return None
+        value_mm = float(pcbnew.ToMM(value_iu))
+        if value_mm < 0.0:
+            return None
+        return value_mm
+    except Exception:
+        return None
+
+
 def _run_freerouting(
     jar_path: Path,
     dsn_path: Path,
@@ -740,6 +789,7 @@ def _run_freerouting(
     stderr_log_path: Path,
     order_strategy: str = "natural",
     order_seed: int | None = None,
+    board_edge_clearance_mm: float | None = None,
 ) -> dict[str, object]:
     java_exe = _resolve_java_executable()
     home_dir.mkdir(parents=True, exist_ok=True)
@@ -767,11 +817,20 @@ def _run_freerouting(
     env = os.environ.copy()
     env["FREEROUTING__USER_DATA_PATH"] = str(home_dir)
     env["FREEROUTING_ITEM_ORDER_STRATEGY"] = order_strategy
-    # Forward the public Interactive-Router switch into the freerouting JVM so
-    # candidate pad-entry repair happens while the writer can still see the
-    # router's live board state.
-    if _env_flag("INTERACTIVE_ROUTER_FREEROUTING_CANDIDATE_PAD_ENTRY_FIX"):
-        env["FREEROUTING_CANDIDATE_PAD_ENTRY_FIX"] = "1"
+    if "FREEROUTING_BOARD_EDGE_CLEARANCE_MM" not in env and board_edge_clearance_mm is not None:
+        # Pass KiCad's copper-to-edge clearance into freerouting because the
+        # DSN export often omits this design setting while KiCad DRC still
+        # enforces it on the returned board.
+        env["FREEROUTING_BOARD_EDGE_CLEARANCE_MM"] = f"{board_edge_clearance_mm:.6f}"
+    # Clear pad-entry experiment switches before launching freerouting.  The
+    # standalone JVM code also hard-disables these paths, but the bridge keeps
+    # the subprocess environment deterministic for replay logs.
+    for key in (
+        "FREEROUTING_NORMAL_CONE_HARD",
+        "FREEROUTING_NORMAL_CONE_TARGET_ACCESS",
+        "FREEROUTING_CANDIDATE_PAD_ENTRY_FIX",
+    ):
+        env.pop(key, None)
     if order_seed is not None:
         env["FREEROUTING_ITEM_ORDER_SEED"] = str(order_seed)
     completed = subprocess.run(
@@ -816,6 +875,7 @@ def _run_freerouting_stage(
             artifact.unlink()
     if home_dir is None:
         home_dir = app_root / ".freerouting-home" / profile_name
+    board_edge_clearance_mm = _read_board_edge_clearance_mm(board_path)
     run_report = _run_freerouting(
         jar_path=jar_path,
         dsn_path=dsn_path,
@@ -827,6 +887,7 @@ def _run_freerouting_stage(
         stderr_log_path=stderr_log_path,
         order_strategy=order_strategy,
         order_seed=order_seed,
+        board_edge_clearance_mm=board_edge_clearance_mm,
     )
     _import_ses(board_path, ses_path, routed_board_path)
     return {
@@ -973,6 +1034,308 @@ def _unconnected_count(stage_result: dict[str, object]) -> int:
     if isinstance(count, int):
         return count
     return 0 if not report.get("still_unconnected") else 10**9
+
+
+def _profile_selection_key(
+    stage_result: dict[str, object],
+    quality_by_profile: dict[str, dict[str, object]],
+    board_cache: BoardCache,
+) -> tuple[int, int, int, int, int, float]:
+    """Return the left-top display ranking key for one freerouting profile.
+
+    The left-top board must prefer a route that is both connected and clean.
+    Via count is still important, but it is considered only after known route
+    clearance violations are avoided.
+    """
+    profile_name = str(stage_result["profile_name"])
+    quality = quality_by_profile.get(profile_name)
+    if quality is None:
+        routed_board = _sanitize_freerouting_final_board(_load_board_cached(Path(stage_result["routed_board_path"]), board_cache))
+        return (_unconnected_count(stage_result), 10**9, _pad_entry_violation_count(routed_board), len(routed_board.vias), 10**9, _board_wire_length_mm(routed_board))
+    return (
+        int(quality["unconnected_count"]),
+        int(quality["route_clearance_violations"]),
+        int(quality.get("pad_entry_violations", 0)),
+        int(quality["via_count"]),
+        int(quality["bend_proxy"]),
+        float(quality["wire_length_mm"]),
+    )
+
+
+def _profile_quality_report(
+    stage_result: dict[str, object],
+    selector_board: BoardData,
+    board_cache: BoardCache,
+) -> dict[str, object]:
+    """Summarize profile quality used for deterministic left-top selection."""
+    routed_board = _sanitize_freerouting_final_board(_load_board_cached(Path(stage_result["routed_board_path"]), board_cache))
+    return {
+        "profile": str(stage_result["profile_name"]),
+        "unconnected_count": _unconnected_count(stage_result),
+        "route_clearance_violations": _route_clearance_violation_count(selector_board, routed_board),
+        "pad_entry_violations": _pad_entry_violation_count(routed_board),
+        "via_count": len(routed_board.vias),
+        "bend_proxy": _board_bend_proxy(routed_board),
+        "wire_length_mm": _board_wire_length_mm(routed_board),
+        "routed_board_path": str(stage_result["routed_board_path"]),
+    }
+
+
+def _sanitize_freerouting_final_board(board: BoardData) -> BoardData:
+    """Return freerouting final-board geometry unchanged.
+
+    Pad-entry diagnostics still run elsewhere, but this comparison mode never
+    rewrites final-board tracks for normal-cone or angle/Y cleanup.
+    """
+    return board
+
+
+def _pad_entry_violation_count(board: BoardData) -> int:
+    """Count routed-board net groups that still violate pad-entry normals."""
+    count = 0
+    by_net: dict[int, list[dict[str, object]]] = {}
+    for track in board.tracks:
+        by_net.setdefault(int(track.net_id), []).append(_segment_from_track(track))
+    for net_id, segments in by_net.items():
+        count += len(_find_invalid_pad_entry_locations(board, int(net_id), segments))
+    return count
+
+
+def _segment_from_track(track: TrackSegment) -> dict[str, object]:
+    """Convert a TrackSegment into the primitive dict used by repair helpers."""
+    return {
+        "layer": track.layer,
+        "start": tuple(map(float, track.start)),
+        "end": tuple(map(float, track.end)),
+        "width_mm": float(track.width),
+        "width": float(track.width),
+    }
+
+
+def _via_to_dict(via: Via) -> dict[str, object]:
+    """Convert a Via into the primitive dict used by clearance helpers."""
+    return {
+        "center": tuple(map(float, via.center)),
+        "diameter": float(via.diameter),
+        "start_layer": via.start_layer,
+        "end_layer": via.end_layer,
+    }
+
+
+def _route_clearance_violation_count(selector_board: BoardData, routed_board: BoardData) -> int:
+    """Count obvious copper-to-copper clearance violations in a routed profile.
+
+    Freerouting's own "fully connected" status does not mean DRC-clean. This
+    lightweight check catches different-net track/via overlaps before a profile
+    is allowed to win left-top display selection.
+    """
+    violations = 0
+    selector_net_id_by_name = {name: net_id for net_id, name in selector_board.nets.items()}
+    routed_tracks = list(routed_board.tracks)
+    routed_vias = list(routed_board.vias)
+
+    for left_index, left in enumerate(routed_tracks):
+        left_selector_net = selector_net_id_by_name.get(left.net_name)
+        for right in routed_tracks[left_index + 1 :]:
+            if left.net_id == right.net_id or left.net_name == right.net_name:
+                continue
+            if str(left.layer) != str(right.layer):
+                continue
+            required = _required_clearance_by_name(selector_board, selector_net_id_by_name, left.net_name, right.net_name)
+            edge_distance = _segment_to_segment_distance(left.start, left.end, right.start, right.end) - left.width * 0.5 - right.width * 0.5
+            if edge_distance + 1e-9 < required:
+                violations += 1
+        for via in routed_vias:
+            if left.net_id == via.net_id or left.net_name == via.net_name:
+                continue
+            if not _via_touches_layer(routed_board, via, str(left.layer)):
+                continue
+            required = _required_clearance_by_name(selector_board, selector_net_id_by_name, left.net_name, via.net_name)
+            edge_distance = _point_to_segment_distance(via.center, left.start, left.end) - left.width * 0.5 - via.diameter * 0.5
+            if edge_distance + 1e-9 < required:
+                violations += 1
+        _ = left_selector_net
+
+    for left_index, left in enumerate(routed_vias):
+        for right in routed_vias[left_index + 1 :]:
+            if left.net_id == right.net_id or left.net_name == right.net_name:
+                continue
+            if not _via_spans_intersect(routed_board, left, right):
+                continue
+            required = _required_clearance_by_name(selector_board, selector_net_id_by_name, left.net_name, right.net_name)
+            edge_distance = math.hypot(left.center[0] - right.center[0], left.center[1] - right.center[1]) - left.diameter * 0.5 - right.diameter * 0.5
+            if edge_distance + 1e-9 < required:
+                violations += 1
+    return violations
+
+
+def _required_clearance_by_name(
+    selector_board: BoardData,
+    selector_net_id_by_name: dict[str, int],
+    left_name: str,
+    right_name: str,
+) -> float:
+    """Return the stricter selector-board clearance for two routed net names."""
+    left_id = selector_net_id_by_name.get(left_name)
+    right_id = selector_net_id_by_name.get(right_name)
+    values: list[float] = []
+    if left_id is not None:
+        values.append(_clearance_for_selector_net(selector_board, left_id))
+    if right_id is not None:
+        values.append(_clearance_for_selector_net(selector_board, right_id))
+    if not values:
+        return _minimum_clearance(selector_board)
+    return max(values)
+
+
+def _clearance_for_selector_net(board: BoardData, net_id: int) -> float:
+    """Read a net-specific clearance, falling back to the board minimum."""
+    if board.net_clearances and int(net_id) in board.net_clearances:
+        return float(board.net_clearances[int(net_id)])
+    return _minimum_clearance(board)
+
+
+def _minimum_clearance(board: BoardData) -> float:
+    """Return the board default clearance used by the profile-quality check."""
+    if board.design_rules and board.design_rules.get("min_clearance"):
+        return float(board.design_rules["min_clearance"])
+    return 0.2
+
+
+def _via_touches_layer(board: BoardData, via: Via, layer_name: str) -> bool:
+    """Return true when a via span includes a copper layer name."""
+    layer_index = _layer_index(board, layer_name)
+    if layer_index is None:
+        return False
+    return layer_index in _via_layer_span(board, via)
+
+
+def _via_spans_intersect(board: BoardData, left: Via, right: Via) -> bool:
+    """Return true when two via layer spans overlap."""
+    return bool(_via_layer_span(board, left).intersection(_via_layer_span(board, right)))
+
+
+def _via_layer_span(board: BoardData, via: Via) -> set[int]:
+    """Return copper stack indices covered by one via."""
+    start_index = _layer_index(board, str(via.start_layer))
+    end_index = _layer_index(board, str(via.end_layer))
+    if start_index is None and end_index is None:
+        return set(range(len(board.copper_layers)))
+    if start_index is None:
+        start_index = end_index
+    if end_index is None:
+        end_index = start_index
+    assert start_index is not None and end_index is not None
+    return set(range(min(start_index, end_index), max(start_index, end_index) + 1))
+
+
+def _layer_index(board: BoardData, layer_name: str) -> int | None:
+    """Resolve a copper layer name to its stack index."""
+    aliases = board.layer_aliases or {}
+    normalized = aliases.get(layer_name, layer_name)
+    for index, candidate in enumerate(board.copper_layers):
+        if candidate == normalized or candidate == layer_name:
+            return index
+    return None
+
+
+def _segment_to_segment_distance(
+    a_start: tuple[float, float],
+    a_end: tuple[float, float],
+    b_start: tuple[float, float],
+    b_end: tuple[float, float],
+) -> float:
+    """Return the exact 2D distance between two finite line segments."""
+    if _segments_intersect_or_touch(a_start, a_end, b_start, b_end):
+        return 0.0
+    return min(
+        _point_to_segment_distance(a_start, b_start, b_end),
+        _point_to_segment_distance(a_end, b_start, b_end),
+        _point_to_segment_distance(b_start, a_start, a_end),
+        _point_to_segment_distance(b_end, a_start, a_end),
+    )
+
+
+def _point_to_segment_distance(
+    point: tuple[float, float],
+    start: tuple[float, float],
+    end: tuple[float, float],
+) -> float:
+    """Return the shortest 2D distance from a point to a segment."""
+    dx = end[0] - start[0]
+    dy = end[1] - start[1]
+    length2 = dx * dx + dy * dy
+    if length2 <= 1e-18:
+        return math.hypot(point[0] - start[0], point[1] - start[1])
+    t = max(0.0, min(1.0, ((point[0] - start[0]) * dx + (point[1] - start[1]) * dy) / length2))
+    projection = (start[0] + t * dx, start[1] + t * dy)
+    return math.hypot(point[0] - projection[0], point[1] - projection[1])
+
+
+def _segments_intersect_or_touch(
+    a_start: tuple[float, float],
+    a_end: tuple[float, float],
+    b_start: tuple[float, float],
+    b_end: tuple[float, float],
+) -> bool:
+    """Return true when two finite 2D segments intersect or touch."""
+    def orientation(p: tuple[float, float], q: tuple[float, float], r: tuple[float, float]) -> float:
+        return (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
+
+    def on_segment(p: tuple[float, float], q: tuple[float, float], r: tuple[float, float]) -> bool:
+        return min(p[0], r[0]) - 1e-9 <= q[0] <= max(p[0], r[0]) + 1e-9 and min(p[1], r[1]) - 1e-9 <= q[1] <= max(p[1], r[1]) + 1e-9
+
+    o1 = orientation(a_start, a_end, b_start)
+    o2 = orientation(a_start, a_end, b_end)
+    o3 = orientation(b_start, b_end, a_start)
+    o4 = orientation(b_start, b_end, a_end)
+    if o1 * o2 < -1e-12 and o3 * o4 < -1e-12:
+        return True
+    return (
+        abs(o1) <= 1e-9 and on_segment(a_start, b_start, a_end)
+        or abs(o2) <= 1e-9 and on_segment(a_start, b_end, a_end)
+        or abs(o3) <= 1e-9 and on_segment(b_start, a_start, b_end)
+        or abs(o4) <= 1e-9 and on_segment(b_start, a_end, b_end)
+    )
+
+
+def _board_wire_length_mm(board: BoardData) -> float:
+    """Return total routed track centerline length for profile tie-breaking."""
+    return sum(math.hypot(track.end[0] - track.start[0], track.end[1] - track.start[1]) for track in board.tracks)
+
+
+def _board_bend_proxy(board: BoardData) -> int:
+    """Return a cheap bend proxy based on non-collinear incident track axes."""
+    adjacency: dict[tuple[int, int, str, int], set[tuple[int, int]]] = {}
+    for track in board.tracks:
+        start_key = _profile_point_key(track.start, track.layer, track.net_id)
+        end_key = _profile_point_key(track.end, track.layer, track.net_id)
+        axis = _profile_axis(track.start, track.end)
+        if axis is None:
+            continue
+        adjacency.setdefault(start_key, set()).add(axis)
+        adjacency.setdefault(end_key, set()).add(axis)
+    return sum(max(0, len(axes) - 1) for axes in adjacency.values())
+
+
+def _profile_point_key(point: tuple[float, float], layer: str, net_id: int) -> tuple[int, int, str, int]:
+    """Quantize a routed endpoint for bend-proxy grouping."""
+    return (round(float(point[0]) * 1000), round(float(point[1]) * 1000), str(layer), int(net_id))
+
+
+def _profile_axis(start: tuple[float, float], end: tuple[float, float]) -> tuple[int, int] | None:
+    """Return a normalized integer direction axis for profile tie-breaking."""
+    dx = end[0] - start[0]
+    dy = end[1] - start[1]
+    length = math.hypot(dx, dy)
+    if length <= 1e-12:
+        return None
+    nx = round(dx / length, 3)
+    ny = round(dy / length, 3)
+    if nx < -1e-9 or (abs(nx) <= 1e-9 and ny < -1e-9):
+        nx = -nx
+        ny = -ny
+    return (round(nx * 1000), round(ny * 1000))
 
 
 def _is_stage_better(candidate_stage: dict[str, object], baseline_stage: dict[str, object]) -> bool:

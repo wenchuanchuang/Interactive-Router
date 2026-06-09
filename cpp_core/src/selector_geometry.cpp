@@ -1,5 +1,7 @@
 ﻿#include "router.h"
 
+#include "roaring_bitmap.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -87,8 +89,157 @@ double distancePointToSegment(
     return std::sqrt(ddx * ddx + ddy * ddy);
 }
 
+double distancePointToAabb(
+    double px,
+    double py,
+    double min_x,
+    double min_y,
+    double max_x,
+    double max_y
+) {
+    // Measure how far a point lies outside an axis-aligned grid cell box.
+    const double dx = std::max({min_x - px, 0.0, px - max_x});
+    const double dy = std::max({min_y - py, 0.0, py - max_y});
+    return std::sqrt(dx * dx + dy * dy);
+}
+
+double orientation(
+    double ax,
+    double ay,
+    double bx,
+    double by,
+    double cx,
+    double cy
+) {
+    return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+}
+
+bool pointInsideAabb(
+    double px,
+    double py,
+    double min_x,
+    double min_y,
+    double max_x,
+    double max_y
+) {
+    constexpr double kEpsilon = 1e-12;
+    return px >= min_x - kEpsilon && px <= max_x + kEpsilon &&
+           py >= min_y - kEpsilon && py <= max_y + kEpsilon;
+}
+
+bool segmentsIntersect(
+    double ax,
+    double ay,
+    double bx,
+    double by,
+    double cx,
+    double cy,
+    double dx,
+    double dy
+) {
+    // Detect whether two line segments cross or touch, including collinear contact.
+    constexpr double kEpsilon = 1e-12;
+    const double o1 = orientation(ax, ay, bx, by, cx, cy);
+    const double o2 = orientation(ax, ay, bx, by, dx, dy);
+    const double o3 = orientation(cx, cy, dx, dy, ax, ay);
+    const double o4 = orientation(cx, cy, dx, dy, bx, by);
+    if (((o1 > kEpsilon && o2 < -kEpsilon) || (o1 < -kEpsilon && o2 > kEpsilon)) &&
+        ((o3 > kEpsilon && o4 < -kEpsilon) || (o3 < -kEpsilon && o4 > kEpsilon))) {
+        return true;
+    }
+    if (std::abs(o1) <= kEpsilon && pointInsideAabb(cx, cy, std::min(ax, bx), std::min(ay, by), std::max(ax, bx), std::max(ay, by))) {
+        return true;
+    }
+    if (std::abs(o2) <= kEpsilon && pointInsideAabb(dx, dy, std::min(ax, bx), std::min(ay, by), std::max(ax, bx), std::max(ay, by))) {
+        return true;
+    }
+    if (std::abs(o3) <= kEpsilon && pointInsideAabb(ax, ay, std::min(cx, dx), std::min(cy, dy), std::max(cx, dx), std::max(cy, dy))) {
+        return true;
+    }
+    if (std::abs(o4) <= kEpsilon && pointInsideAabb(bx, by, std::min(cx, dx), std::min(cy, dy), std::max(cx, dx), std::max(cy, dy))) {
+        return true;
+    }
+    return false;
+}
+
+bool segmentIntersectsAabb(
+    double sx,
+    double sy,
+    double ex,
+    double ey,
+    double min_x,
+    double min_y,
+    double max_x,
+    double max_y
+) {
+    // Fast exact test for the centerline crossing a grid cell box.
+    if (pointInsideAabb(sx, sy, min_x, min_y, max_x, max_y) ||
+        pointInsideAabb(ex, ey, min_x, min_y, max_x, max_y)) {
+        return true;
+    }
+    return segmentsIntersect(sx, sy, ex, ey, min_x, min_y, max_x, min_y) ||
+           segmentsIntersect(sx, sy, ex, ey, max_x, min_y, max_x, max_y) ||
+           segmentsIntersect(sx, sy, ex, ey, max_x, max_y, min_x, max_y) ||
+           segmentsIntersect(sx, sy, ex, ey, min_x, max_y, min_x, min_y);
+}
+
+bool segmentCapsuleIntersectsCell(
+    const RasterRequest& request,
+    int x,
+    int y,
+    double sx,
+    double sy,
+    double ex,
+    double ey,
+    double radius
+) {
+    // Treat each selector vertex as a square cell and mark it when the
+    // clearance-expanded segment capsule touches any part of that cell.
+    const auto [cx, cy] = gridToMm(request, x, y);
+    const double half_pitch = request.grid_pitch * 0.5;
+    const double min_x = cx - half_pitch;
+    const double max_x = cx + half_pitch;
+    const double min_y = cy - half_pitch;
+    const double max_y = cy + half_pitch;
+    if (segmentIntersectsAabb(sx, sy, ex, ey, min_x, min_y, max_x, max_y)) {
+        return true;
+    }
+    const double endpoint_distance = std::min(
+        distancePointToAabb(sx, sy, min_x, min_y, max_x, max_y),
+        distancePointToAabb(ex, ey, min_x, min_y, max_x, max_y)
+    );
+    const double corner_distance = std::min({
+        distancePointToSegment(min_x, min_y, sx, sy, ex, ey),
+        distancePointToSegment(max_x, min_y, sx, sy, ex, ey),
+        distancePointToSegment(max_x, max_y, sx, sy, ex, ey),
+        distancePointToSegment(min_x, max_y, sx, sy, ex, ey),
+    });
+    return std::min(endpoint_distance, corner_distance) <= radius + 1e-9;
+}
+
+bool circleIntersectsCell(
+    const RasterRequest& request,
+    int x,
+    int y,
+    double circle_x,
+    double circle_y,
+    double radius
+) {
+    // Mark the cell when a clearance-expanded via circle touches its square area.
+    const auto [cx, cy] = gridToMm(request, x, y);
+    const double half_pitch = request.grid_pitch * 0.5;
+    return distancePointToAabb(
+        circle_x,
+        circle_y,
+        cx - half_pitch,
+        cy - half_pitch,
+        cx + half_pitch,
+        cy + half_pitch
+    ) <= radius + 1e-9;
+}
+
 void markSegmentVertices(
-    std::unordered_set<PackedVertexId>& occupied,
+    Roaring64Bitmap& occupied,
     const RasterRequest& request,
     const RasterSegment& segment
 ) {
@@ -107,16 +258,18 @@ void markSegmentVertices(
     const int max_y = std::min(request.ny - 1, static_cast<int>(std::ceil((std::max(sy, ey) + r - request.origin_y) / request.grid_pitch)));
     for (int y = min_y; y <= max_y; ++y) {
         for (int x = min_x; x <= max_x; ++x) {
+            // Mark only grid vertices whose center point falls inside the
+            // clearance-expanded trace capsule.
             const auto [px, py] = gridToMm(request, x, y);
             if (distancePointToSegment(px, py, sx, sy, ex, ey) <= r + 1e-9) {
-                occupied.insert(packVertex(x, y, z));
+                occupied.add(packVertex(x, y, z));
             }
         }
     }
 }
 
 void markCircleVertices(
-    std::unordered_set<PackedVertexId>& occupied,
+    Roaring64Bitmap& occupied,
     const RasterRequest& request,
     double cx,
     double cy,
@@ -133,11 +286,13 @@ void markCircleVertices(
     const double rr = radius * radius + 1e-9;
     for (int y = min_y; y <= max_y; ++y) {
         for (int x = min_x; x <= max_x; ++x) {
+            // Mark only grid vertices whose center point falls inside the
+            // clearance-expanded via disk.
             const auto [px, py] = gridToMm(request, x, y);
             const double dx = px - cx;
             const double dy = py - cy;
             if (dx * dx + dy * dy <= rr) {
-                occupied.insert(packVertex(x, y, z));
+                occupied.add(packVertex(x, y, z));
             }
         }
     }
@@ -195,6 +350,15 @@ std::vector<GridPoint> sortedGridPoints(const std::unordered_set<PackedVertexId>
     return out;
 }
 
+std::vector<GridPoint> sortedGridPoints(const Roaring64Bitmap& values) {
+    std::vector<GridPoint> out;
+    out.reserve(values.size());
+    values.forEach([&out](PackedVertexId packed) {
+        out.push_back(unpackVertex(packed));
+    });
+    return out;
+}
+
 std::vector<std::vector<GridPoint>> buildPadGroupsInternal(const RasterRequest& request) {
     std::vector<std::vector<GridPoint>> groups;
     groups.reserve(request.pads.size());
@@ -203,7 +367,7 @@ std::vector<std::vector<GridPoint>> buildPadGroupsInternal(const RasterRequest& 
         {1, 1}, {1, -1}, {-1, 1}, {-1, -1},
     };
     for (const auto& pad : request.pads) {
-        std::unordered_set<PackedVertexId> inside;
+        Roaring64Bitmap inside;
         const double radius = std::hypot(pad.size_x * 0.5, pad.size_y * 0.5) + request.grid_pitch * 1.5;
         const int gx0 = std::max(0, static_cast<int>(std::floor((pad.center.x - radius - request.origin_x) / request.grid_pitch)) - 1);
         const int gx1 = std::min(request.nx - 1, static_cast<int>(std::ceil((pad.center.x + radius - request.origin_x) / request.grid_pitch)) + 1);
@@ -217,29 +381,29 @@ std::vector<std::vector<GridPoint>> buildPadGroupsInternal(const RasterRequest& 
                 for (int y = gy0; y <= gy1; ++y) {
                     const auto [x_mm, y_mm] = gridToMm(request, x, y);
                     if (pointInsidePad(x_mm, y_mm, pad, 0.0)) {
-                        inside.insert(packVertex(x, y, z));
+                        inside.add(packVertex(x, y, z));
                     }
                 }
             }
         }
 
-        std::unordered_set<PackedVertexId> boundary;
-        for (PackedVertexId packed : inside) {
+        Roaring64Bitmap boundary;
+        inside.forEach([&](PackedVertexId packed) {
             const GridPoint p = unpackVertex(packed);
             bool is_boundary = false;
             for (const auto& delta : neighbors) {
                 const int nx = p.x + delta[0];
                 const int ny = p.y + delta[1];
                 if (nx < 0 || nx >= request.nx || ny < 0 || ny >= request.ny ||
-                    inside.find(packVertex(nx, ny, p.z)) == inside.end()) {
+                    !inside.contains(packVertex(nx, ny, p.z))) {
                     is_boundary = true;
                     break;
                 }
             }
             if (is_boundary) {
-                boundary.insert(packed);
+                boundary.add(packed);
             }
-        }
+        });
         groups.push_back(sortedGridPoints(boundary));
     }
     return groups;
@@ -446,7 +610,7 @@ RasterResult rasterizeSelectorGeometry(const RasterRequest& request) {
         return result;
     }
 
-    std::unordered_set<PackedVertexId> occupied;
+    Roaring64Bitmap occupied;
     for (const auto& segment : request.segments) {
         markSegmentVertices(occupied, request, segment);
     }
@@ -457,51 +621,53 @@ RasterResult rasterizeSelectorGeometry(const RasterRequest& request) {
             markCircleVertices(occupied, request, via.center.x, via.center.y, z, via.radius_mm);
         }
     }
+    result.occupied_vertex_ids = occupied.values();
     result.occupied_vertices = sortedGridPoints(occupied);
 
     static const int neighbors[8][2] = {
         {1, 0}, {-1, 0}, {0, 1}, {0, -1},
         {1, 1}, {1, -1}, {-1, 1}, {-1, -1},
     };
-    std::unordered_set<PackedVertexId> shell;
-    for (PackedVertexId packed : occupied) {
+    Roaring64Bitmap shell;
+    occupied.forEach([&](PackedVertexId packed) {
         const GridPoint p = unpackVertex(packed);
         for (const auto& delta : neighbors) {
             const int nx = p.x + delta[0];
             const int ny = p.y + delta[1];
             if (nx < 0 || nx >= request.nx || ny < 0 || ny >= request.ny ||
-                occupied.find(packVertex(nx, ny, p.z)) == occupied.end()) {
-                shell.insert(packed);
+                !occupied.contains(packVertex(nx, ny, p.z))) {
+                shell.add(packed);
                 break;
             }
         }
-    }
+    });
 
-    std::unordered_set<PackedVertexId> anchors;
+    Roaring64Bitmap anchors;
     for (const auto& anchor : request.anchor_vertices) {
-        anchors.insert(packVertex(anchor.x, anchor.y, anchor.z));
+        anchors.add(packVertex(anchor.x, anchor.y, anchor.z));
     }
 
-    std::unordered_set<PackedVertexId> filtered;
-    for (PackedVertexId packed : shell) {
-        if (anchors.find(packed) != anchors.end()) {
-            filtered.insert(packed);
-            continue;
-        }
-        bool inside_any_pad = false;
-        for (const auto& pad : request.pads) {
-            if (vertexInsidePad(request, packed, pad, request.pad_clearance)) {
-                inside_any_pad = true;
-                break;
+    Roaring64Bitmap filtered;
+    shell.forEach([&](PackedVertexId packed) {
+        if (anchors.contains(packed)) {
+            filtered.add(packed);
+        } else {
+            bool inside_any_pad = false;
+            for (const auto& pad : request.pads) {
+                if (vertexInsidePad(request, packed, pad, request.pad_clearance)) {
+                    inside_any_pad = true;
+                    break;
+                }
+            }
+            if (!inside_any_pad) {
+                filtered.add(packed);
             }
         }
-        if (!inside_any_pad) {
-            filtered.insert(packed);
-        }
-    }
-    for (PackedVertexId anchor : anchors) {
-        filtered.insert(anchor);
-    }
+    });
+    anchors.forEach([&](PackedVertexId anchor) {
+        filtered.add(anchor);
+    });
+    result.boundary_vertex_ids = filtered.values();
     result.boundary_vertices = sortedGridPoints(filtered);
     result.pad_boundary_groups = buildPadGroupsInternal(request);
     return result;

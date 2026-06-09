@@ -99,6 +99,8 @@ struct RasterRequest {
 struct RasterResult {
     std::vector<GridPoint> occupied_vertices;
     std::vector<GridPoint> boundary_vertices;
+    std::vector<std::uint64_t> occupied_vertex_ids;
+    std::vector<std::uint64_t> boundary_vertex_ids;
     std::vector<std::vector<GridPoint>> pad_boundary_groups;
 };
 
@@ -191,10 +193,29 @@ struct NetCandidateSet {
     std::vector<std::vector<GridPoint>> candidate_cover_vertices;
     std::vector<std::vector<GridPoint>> candidate_terminal_coords;
     std::vector<std::vector<std::vector<GridPoint>>> candidate_terminal_groups;
+    std::vector<std::vector<std::uint64_t>> candidate_boundary_vertex_ids;
+    std::vector<std::vector<std::uint64_t>> candidate_cover_vertex_ids;
+    std::vector<std::vector<std::uint64_t>> candidate_terminal_coord_ids;
+    std::vector<std::vector<std::vector<std::uint64_t>>> candidate_terminal_group_ids;
+};
+
+struct ForbiddenSelectionItem {
+    int net_id = 0;
+    int candidate_index = -1;
+};
+
+struct ForbiddenSelection {
+    std::vector<ForbiddenSelectionItem> items;
+};
+
+struct ForbiddenPair {
+    std::vector<ForbiddenSelectionItem> items;
 };
 
 struct SelectionRequest {
     std::vector<NetCandidateSet> nets;
+    std::vector<ForbiddenSelection> forbidden_selections;
+    std::vector<ForbiddenPair> forbidden_pairs;
     int max_paths_per_net = 1;
     bool prefer_gurobi = true;
     bool allow_fallback = true;

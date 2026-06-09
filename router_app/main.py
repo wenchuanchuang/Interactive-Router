@@ -14,6 +14,9 @@ def main() -> int:
     parser.add_argument("--freerouting-full", action="store_true")
     parser.add_argument("--pcb-router", action="store_true")
     parser.add_argument("--router-profile-manifest")
+    parser.add_argument("--drc-feedback-pairwise", action="store_true")
+    parser.add_argument("--drc-feedback-max-iterations", type=int, default=0)
+    parser.add_argument("--drc-feedback-kicad-cli")
     args = parser.parse_args(sys.argv[1:])
 
     app = QApplication([sys.argv[0]])
@@ -22,6 +25,9 @@ def main() -> int:
         freerouting_full=args.freerouting_full,
         pcb_router=args.pcb_router,
         router_profile_manifest=args.router_profile_manifest,
+        drc_feedback_pairwise=args.drc_feedback_pairwise,
+        drc_feedback_max_iterations=args.drc_feedback_max_iterations,
+        drc_feedback_kicad_cli=args.drc_feedback_kicad_cli,
     )
     window.show()
     return app.exec_()

@@ -102,6 +102,8 @@ PYBIND11_MODULE(router_core, m) {
         .def(py::init<>())
         .def_readonly("occupied_vertices", &RasterResult::occupied_vertices)
         .def_readonly("boundary_vertices", &RasterResult::boundary_vertices)
+        .def_readonly("occupied_vertex_ids", &RasterResult::occupied_vertex_ids)
+        .def_readonly("boundary_vertex_ids", &RasterResult::boundary_vertex_ids)
         .def_readonly("pad_boundary_groups", &RasterResult::pad_boundary_groups);
 
     py::class_<PadCoverageResult>(m, "PadCoverageResult")
@@ -193,11 +195,30 @@ PYBIND11_MODULE(router_core, m) {
         .def_readwrite("candidate_boundary_vertices", &NetCandidateSet::candidate_boundary_vertices)
         .def_readwrite("candidate_cover_vertices", &NetCandidateSet::candidate_cover_vertices)
         .def_readwrite("candidate_terminal_coords", &NetCandidateSet::candidate_terminal_coords)
-        .def_readwrite("candidate_terminal_groups", &NetCandidateSet::candidate_terminal_groups);
+        .def_readwrite("candidate_terminal_groups", &NetCandidateSet::candidate_terminal_groups)
+        .def_readwrite("candidate_boundary_vertex_ids", &NetCandidateSet::candidate_boundary_vertex_ids)
+        .def_readwrite("candidate_cover_vertex_ids", &NetCandidateSet::candidate_cover_vertex_ids)
+        .def_readwrite("candidate_terminal_coord_ids", &NetCandidateSet::candidate_terminal_coord_ids)
+        .def_readwrite("candidate_terminal_group_ids", &NetCandidateSet::candidate_terminal_group_ids);
+
+    py::class_<ForbiddenSelectionItem>(m, "ForbiddenSelectionItem")
+        .def(py::init<>())
+        .def_readwrite("net_id", &ForbiddenSelectionItem::net_id)
+        .def_readwrite("candidate_index", &ForbiddenSelectionItem::candidate_index);
+
+    py::class_<ForbiddenSelection>(m, "ForbiddenSelection")
+        .def(py::init<>())
+        .def_readwrite("items", &ForbiddenSelection::items);
+
+    py::class_<ForbiddenPair>(m, "ForbiddenPair")
+        .def(py::init<>())
+        .def_readwrite("items", &ForbiddenPair::items);
 
     py::class_<SelectionRequest>(m, "SelectionRequest")
         .def(py::init<>())
         .def_readwrite("nets", &SelectionRequest::nets)
+        .def_readwrite("forbidden_selections", &SelectionRequest::forbidden_selections)
+        .def_readwrite("forbidden_pairs", &SelectionRequest::forbidden_pairs)
         .def_readwrite("max_paths_per_net", &SelectionRequest::max_paths_per_net)
         .def_readwrite("prefer_gurobi", &SelectionRequest::prefer_gurobi)
         .def_readwrite("allow_fallback", &SelectionRequest::allow_fallback);

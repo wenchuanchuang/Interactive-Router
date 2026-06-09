@@ -2,6 +2,9 @@
 
 import json
 import os
+import re
+import shutil
+import subprocess
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
@@ -20,6 +23,38 @@ from router_app.path_selector.types import NetSelection as PyNetSelection
 
 _DLL_DIR_HANDLES: list[Any] = []
 
+_PACKED_X_BITS = 28
+_PACKED_Y_BITS = 28
+_PACKED_X_MASK = (1 << _PACKED_X_BITS) - 1
+_PACKED_Y_MASK = (1 << _PACKED_Y_BITS) - 1
+_PACKED_Z_SHIFT = _PACKED_X_BITS + _PACKED_Y_BITS
+
+
+def _pack_grid_vertex_id(x: int, y: int, z: int) -> int:
+    """Pack a selector grid vertex into the same 64-bit id used by C++."""
+    return (int(z) << _PACKED_Z_SHIFT) | (int(y) << _PACKED_X_BITS) | int(x)
+
+
+def _unpack_grid_vertex_id(vertex_id: int) -> tuple[int, int, int]:
+    """Unpack a selector 64-bit vertex id into x/y/z grid coordinates."""
+    packed = int(vertex_id)
+    return (
+        packed & _PACKED_X_MASK,
+        (packed >> _PACKED_X_BITS) & _PACKED_Y_MASK,
+        packed >> _PACKED_Z_SHIFT,
+    )
+
+
+def _grid_vertex_id(point: Any) -> int:
+    """Return the packed id for either a GridPoint-like object or an int id."""
+    if isinstance(point, int):
+        return int(point)
+    return _pack_grid_vertex_id(
+        int(getattr(point, "x", 0)),
+        int(getattr(point, "y", 0)),
+        int(getattr(point, "z", 0)),
+    )
+
 
 @dataclass(frozen=True)
 class RerouteOutcome:
@@ -32,10 +67,26 @@ class RerouteOutcome:
     left_top_reference_board: BoardData | None = None
 
 
+@dataclass(frozen=True)
+class GurobiSelectedBoardArtifact:
+    """Board artifact plus a UUID-to-candidate map for post-selection DRC feedback."""
+
+    path: Path
+    uuid_to_candidate: dict[str, tuple[int, int]]
+
+
 def select_reroute_candidates(
     outcome: RerouteOutcome,
     max_paths_per_net: int = 1,
     prefer_gurobi: bool = True,
+    allow_fallback: bool = True,
+    forbidden_selections: list[list[tuple[int, int]]] | None = None,
+    forbidden_pairs: list[tuple[tuple[int, int], tuple[int, int]]] | None = None,
+    drc_feedback_pairwise: bool = False,
+    drc_feedback_max_iterations: int = 0,
+    drc_feedback_kicad_cli: str | Path | None = None,
+    _drc_feedback_attempt: int = 0,
+    _drc_feedback_seen_pairs: set[tuple[tuple[int, int], tuple[int, int]]] | None = None,
 ) -> SelectionResult:
     selector_started_at = perf_counter()
     if not outcome.result or not isinstance(outcome.result, list):
@@ -58,7 +109,17 @@ def select_reroute_candidates(
     request = router_core.SelectionRequest()
     request.max_paths_per_net = max_paths_per_net
     request.prefer_gurobi = prefer_gurobi
-    request.allow_fallback = True
+    request.allow_fallback = allow_fallback
+    if forbidden_selections:
+        request.forbidden_selections = [
+            _cpp_forbidden_selection(router_core, selection)
+            for selection in forbidden_selections
+        ]
+    if forbidden_pairs:
+        request.forbidden_pairs = [
+            _cpp_forbidden_pair(router_core, pair)
+            for pair in forbidden_pairs
+        ]
 
     load_started_at = perf_counter()
     exported_boundary_by_net = _load_exported_boundary_vertices(outcome.candidate_export_path)
@@ -89,6 +150,7 @@ def select_reroute_candidates(
         candidate_bend_counts: list[int]
         candidate_lengths_mm: list[float]
         candidate_cover_vertices: list[list[Any]]
+        candidate_cover_vertex_ids: list[list[int]]
         if outcome.selector_external_only:
             candidate_paths_grid = []
             candidate_paths_mm = []
@@ -96,6 +158,7 @@ def select_reroute_candidates(
             candidate_bend_counts = []
             candidate_lengths_mm = []
             candidate_cover_vertices = []
+            candidate_cover_vertex_ids = []
         else:
             candidate_paths_grid = list(getattr(result, "candidate_paths_grid", []))
             candidate_paths_mm = list(getattr(result, "candidate_paths_mm", []))
@@ -103,6 +166,10 @@ def select_reroute_candidates(
             candidate_bend_counts = list(getattr(result, "candidate_bend_counts", []))
             candidate_lengths_mm = list(getattr(result, "candidate_lengths_mm", []))
             candidate_cover_vertices = list(getattr(result, "candidate_cover_vertices", []))
+            candidate_cover_vertex_ids = [
+                [_grid_vertex_id(point) for point in vertices]
+                for vertices in candidate_cover_vertices
+            ]
         boundary_payload = list(exported_boundary_by_net.get(item.net_id, []))
         candidate_preview_items: list[Any] = []
         external_summary: dict[str, Any] = {
@@ -135,6 +202,7 @@ def select_reroute_candidates(
                 candidate_paths_mm=candidate_paths_mm,
                 candidate_via_counts=candidate_via_counts,
                 candidate_cover_vertices=candidate_cover_vertices,
+                candidate_cover_vertex_ids=candidate_cover_vertex_ids,
                 boundary_payload=boundary_payload,
                 candidate_preview_items=candidate_preview_items,
                 summary=external_summary,
@@ -147,6 +215,7 @@ def select_reroute_candidates(
         item.candidate_paths_mm = candidate_paths_mm
         item.candidate_via_counts = candidate_via_counts
         item.candidate_cover_vertices = candidate_cover_vertices
+        item.candidate_cover_vertex_ids = candidate_cover_vertex_ids
         # Keep Python-side results aligned with selector candidates so GUI preview
         # can render the exact candidate index chosen by Gurobi.
         try:
@@ -154,6 +223,7 @@ def select_reroute_candidates(
             setattr(result, "candidate_paths_mm", candidate_paths_mm)
             setattr(result, "candidate_via_counts", candidate_via_counts)
             setattr(result, "candidate_cover_vertices", candidate_cover_vertices)
+            setattr(result, "candidate_cover_vertex_ids", candidate_cover_vertex_ids)
             setattr(result, "candidate_preview_items", candidate_preview_items)
         except Exception:
             pass
@@ -162,6 +232,9 @@ def select_reroute_candidates(
             item.candidate_boundary_vertices,
             item.candidate_terminal_coords,
             item.candidate_terminal_groups,
+            item.candidate_boundary_vertex_ids,
+            item.candidate_terminal_coord_ids,
+            item.candidate_terminal_group_ids,
         ) = _selector_boundary_payload_from_export(
             router_core,
             selector_board,
@@ -178,6 +251,17 @@ def select_reroute_candidates(
             item.candidate_terminal_groups,
             item.candidate_terminal_coords,
         )
+        item.candidate_terminal_coord_ids = [
+            [_grid_vertex_id(point) for point in coords]
+            for coords in item.candidate_terminal_coords
+        ]
+        item.candidate_terminal_group_ids = [
+            [
+                [_grid_vertex_id(point) for point in group]
+                for group in groups
+            ]
+            for groups in item.candidate_terminal_groups
+        ]
         candidate_lengths_mm = _candidate_lengths_for_selector(
             candidate_paths_mm,
             candidate_preview_items,
@@ -207,6 +291,9 @@ def select_reroute_candidates(
             setattr(result, "candidate_lengths_mm", candidate_lengths_mm)
             setattr(result, "candidate_display_lengths_mm", candidate_display_lengths_mm)
             setattr(result, "candidate_bend_counts", candidate_bend_counts)
+            setattr(result, "candidate_boundary_vertex_ids", item.candidate_boundary_vertex_ids)
+            setattr(result, "candidate_terminal_coord_ids", item.candidate_terminal_coord_ids)
+            setattr(result, "candidate_terminal_group_ids", item.candidate_terminal_group_ids)
         except Exception:
             pass
         normalize_elapsed = perf_counter() - normalize_started_at
@@ -237,8 +324,11 @@ def select_reroute_candidates(
         valid_candidate_count = _valid_selector_candidate_count(
             item.candidate_paths_grid,
             item.candidate_boundary_vertices,
+            item.candidate_boundary_vertex_ids,
             item.candidate_terminal_coords,
             item.candidate_terminal_groups,
+            item.candidate_terminal_coord_ids,
+            item.candidate_terminal_group_ids,
         )
         if valid_candidate_count <= 0:
             rejection_text = ", ".join(external_summary.get("rejections", [])) or "(none)"
@@ -382,6 +472,41 @@ def select_reroute_candidates(
         f"selector_selected_total_wire_length_mm = {selected_wire_length_mm:.3f}  # Gurobi 選出結果總線長(mm)",
         flush=True,
     )
+    gurobi_result_path: Path | None = None
+    gurobi_result_save_error: str | None = None
+    gurobi_board_artifact: GurobiSelectedBoardArtifact | None = None
+    gurobi_board_save_error: str | None = None
+    try:
+        gurobi_result_path = _write_gurobi_selection_result(
+            outcome=outcome,
+            selector_board=selector_board,
+            selections=selections,
+            solver=str(cpp_result.solver),
+            ok=bool(cpp_result.ok),
+            message=str(cpp_result.message),
+            max_paths_per_net=max_paths_per_net,
+            prefer_gurobi=prefer_gurobi,
+            allow_fallback=allow_fallback,
+            forbidden_selections=forbidden_selections,
+            forbidden_pairs=forbidden_pairs,
+            selected_via_count=selected_via_count,
+            selected_bend_count=selected_bend_count,
+            selected_wire_length_mm=selected_wire_length_mm,
+        )
+    except Exception as exc:
+        # Saving the diagnostic artifact must never change selector behavior.
+        gurobi_result_save_error = str(exc)
+    try:
+        if bool(cpp_result.ok):
+            gurobi_board_artifact = _write_gurobi_selected_board_artifact(
+                outcome=outcome,
+                selector_board=selector_board,
+                selections=selections,
+                solver=str(cpp_result.solver),
+            )
+    except Exception as exc:
+        # Board artifact generation is diagnostic only and must not affect solve results.
+        gurobi_board_save_error = str(exc)
     total_elapsed = perf_counter() - selector_started_at
     print(
         "selector_timing_summary "
@@ -401,12 +526,230 @@ def select_reroute_candidates(
         )
         for detail in zero_valid_net_details:
             print(detail, flush=True)
+    if gurobi_result_path is not None:
+        print(f"selector_gurobi_result_saved = {gurobi_result_path.resolve()}", flush=True)
+    elif gurobi_result_save_error:
+        print(f"selector_gurobi_result_save_failed reason={gurobi_result_save_error}", flush=True)
+    if gurobi_board_artifact is not None:
+        print(f"selector_gurobi_board_saved = {gurobi_board_artifact.path.resolve()}", flush=True)
+    elif gurobi_board_save_error:
+        print(f"selector_gurobi_board_save_failed reason={gurobi_board_save_error}", flush=True)
+    feedback_result = _maybe_resolve_with_pairwise_drc_feedback(
+        outcome=outcome,
+        selection_ok=bool(cpp_result.ok) and str(cpp_result.solver).lower().startswith("gurobi"),
+        board_artifact=gurobi_board_artifact,
+        forbidden_selections=forbidden_selections,
+        forbidden_pairs=forbidden_pairs,
+        max_paths_per_net=max_paths_per_net,
+        prefer_gurobi=prefer_gurobi,
+        allow_fallback=allow_fallback,
+        drc_feedback_pairwise=drc_feedback_pairwise,
+        drc_feedback_max_iterations=drc_feedback_max_iterations,
+        drc_feedback_kicad_cli=drc_feedback_kicad_cli,
+        drc_feedback_attempt=_drc_feedback_attempt,
+        drc_feedback_seen_pairs=_drc_feedback_seen_pairs,
+    )
+    if feedback_result is not None:
+        return feedback_result
+    artifacts = {}
+    if gurobi_result_path is not None:
+        artifacts["gurobi_result_json"] = str(gurobi_result_path.resolve())
+    if gurobi_board_artifact is not None:
+        artifacts["gurobi_selected_board"] = str(gurobi_board_artifact.path.resolve())
     return SelectionResult(
         ok=bool(cpp_result.ok),
         selections=selections,
         solver=str(cpp_result.solver),
         message=str(cpp_result.message),
+        artifacts=artifacts or None,
     )
+
+
+def _maybe_resolve_with_pairwise_drc_feedback(
+    outcome: RerouteOutcome,
+    selection_ok: bool,
+    board_artifact: GurobiSelectedBoardArtifact | None,
+    forbidden_selections: list[list[tuple[int, int]]] | None,
+    forbidden_pairs: list[tuple[tuple[int, int], tuple[int, int]]] | None,
+    max_paths_per_net: int,
+    prefer_gurobi: bool,
+    allow_fallback: bool,
+    drc_feedback_pairwise: bool,
+    drc_feedback_max_iterations: int,
+    drc_feedback_kicad_cli: str | Path | None,
+    drc_feedback_attempt: int,
+    drc_feedback_seen_pairs: set[tuple[tuple[int, int], tuple[int, int]]] | None,
+) -> SelectionResult | None:
+    """Run KiCad DRC on a selected board and re-solve with new pairwise cuts."""
+    if not drc_feedback_pairwise or not selection_ok or board_artifact is None:
+        return None
+    if drc_feedback_max_iterations > 0 and drc_feedback_attempt >= drc_feedback_max_iterations:
+        print(
+            "drc_feedback_stop "
+            f"attempt={drc_feedback_attempt} reason=max_iterations limit={drc_feedback_max_iterations}",
+            flush=True,
+        )
+        return None
+    kicad_cli = _resolve_kicad_cli(drc_feedback_kicad_cli)
+    if kicad_cli is None:
+        print(f"drc_feedback_stop attempt={drc_feedback_attempt} reason=kicad_cli_not_found", flush=True)
+        return None
+
+    report_path = _drc_feedback_report_path(board_artifact.path, drc_feedback_attempt)
+    drc_summary = _run_kicad_drc_for_feedback(board_artifact.path, report_path, kicad_cli)
+    extracted_pairs = _pairwise_cuts_from_drc_report(report_path, board_artifact.uuid_to_candidate)
+    seen_pairs = set(drc_feedback_seen_pairs or set())
+    seen_pairs.update(_canonical_candidate_pair(pair) for pair in (forbidden_pairs or []))
+    new_pairs = [
+        pair
+        for pair in extracted_pairs
+        if _canonical_candidate_pair(pair) not in seen_pairs
+    ]
+    print(
+        "drc_feedback_iteration "
+        f"attempt={drc_feedback_attempt} "
+        f"clearance={drc_summary['clearance']} "
+        f"total={drc_summary['total']} "
+        f"existing_pairs={len(forbidden_pairs or [])} "
+        f"extracted_pairs={len(extracted_pairs)} "
+        f"new_pairs={len(new_pairs)} "
+        f"report={report_path.resolve()}",
+        flush=True,
+    )
+    if drc_summary["clearance"] <= 0:
+        print(f"drc_feedback_stop attempt={drc_feedback_attempt} reason=no_clearance", flush=True)
+        return None
+    if not new_pairs:
+        print(f"drc_feedback_stop attempt={drc_feedback_attempt} reason=no_new_pair_cuts", flush=True)
+        return None
+
+    next_pairs = list(forbidden_pairs or [])
+    for pair in new_pairs:
+        canonical = _canonical_candidate_pair(pair)
+        if canonical in seen_pairs:
+            continue
+        seen_pairs.add(canonical)
+        # Pairwise feedback excludes only candidate pairs observed in KiCad DRC.
+        next_pairs.append(canonical)
+    print(
+        "drc_feedback_resolve "
+        f"next_attempt={drc_feedback_attempt + 1} "
+        f"forbidden_pairs={len(next_pairs)}",
+        flush=True,
+    )
+    return select_reroute_candidates(
+        outcome,
+        max_paths_per_net=max_paths_per_net,
+        prefer_gurobi=prefer_gurobi,
+        allow_fallback=allow_fallback,
+        forbidden_selections=forbidden_selections,
+        forbidden_pairs=next_pairs,
+        drc_feedback_pairwise=drc_feedback_pairwise,
+        drc_feedback_max_iterations=drc_feedback_max_iterations,
+        drc_feedback_kicad_cli=kicad_cli,
+        _drc_feedback_attempt=drc_feedback_attempt + 1,
+        _drc_feedback_seen_pairs=seen_pairs,
+    )
+
+
+def _resolve_kicad_cli(explicit_path: str | Path | None) -> Path | None:
+    """Find the KiCad CLI used for post-selection DRC feedback."""
+    candidates: list[Path] = []
+    if explicit_path:
+        candidates.append(Path(explicit_path))
+    env_cli = os.environ.get("INTERACTIVE_ROUTER_KICAD_CLI")
+    if env_cli:
+        candidates.append(Path(env_cli))
+    kicad_bin = os.environ.get("KICAD_PCBNEW_PATH") or os.environ.get("KICAD_BIN")
+    if kicad_bin:
+        candidates.append(Path(kicad_bin) / "kicad-cli.exe")
+    path_cli = shutil.which("kicad-cli")
+    if path_cli:
+        candidates.append(Path(path_cli))
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _drc_feedback_report_path(board_path: Path, attempt: int) -> Path:
+    """Return a stable artifact path for one feedback DRC report."""
+    root = Path(__file__).resolve().parents[1]
+    output_dir = _artifact_root(root) / "gurobi_selection_drc"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    safe_stem = "".join(ch if ch.isalnum() or ch in ("_", "-", ".") else "_" for ch in board_path.stem)
+    return output_dir / f"{safe_stem}__attempt_{int(attempt)}.drc.json"
+
+
+def _run_kicad_drc_for_feedback(board_path: Path, report_path: Path, kicad_cli: Path) -> dict[str, int]:
+    """Run KiCad DRC and return lightweight type counts for feedback control."""
+    completed = subprocess.run(
+        [
+            str(kicad_cli),
+            "pcb",
+            "drc",
+            "--format",
+            "json",
+            "--severity-all",
+            "--all-track-errors",
+            "--output",
+            str(report_path),
+            str(board_path),
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    text = report_path.read_text(encoding="utf-8", errors="replace") if report_path.exists() else ""
+    types = re.findall(r'"type"\s*:\s*"([^"]+)"', text)
+    clearance = sum(1 for violation_type in types if "clearance" in violation_type.lower())
+    if completed.returncode not in (0,):
+        print(
+            "drc_feedback_kicad_cli_exit "
+            f"code={completed.returncode} stdout={completed.stdout.strip()!r} stderr={completed.stderr.strip()!r}",
+            flush=True,
+        )
+    return {"total": len(types), "clearance": clearance}
+
+
+def _canonical_candidate_pair(
+    pair: tuple[tuple[int, int], tuple[int, int]],
+) -> tuple[tuple[int, int], tuple[int, int]]:
+    """Return a deterministic order for a two-candidate no-good pair."""
+    first, second = pair
+    return tuple(sorted((first, second)))  # type: ignore[return-value]
+
+
+def _pairwise_cuts_from_drc_report(
+    report_path: Path,
+    uuid_to_candidate: dict[str, tuple[int, int]],
+) -> list[tuple[tuple[int, int], tuple[int, int]]]:
+    """Extract candidate pairs from KiCad clearance DRC item UUIDs."""
+    text = report_path.read_text(encoding="utf-8", errors="replace") if report_path.exists() else ""
+    pairs: list[tuple[tuple[int, int], tuple[int, int]]] = []
+    seen: set[tuple[tuple[int, int], tuple[int, int]]] = set()
+    for type_match in re.finditer(r'"type"\s*:\s*"([^"]*clearance[^"]*)"', text, re.I):
+        block_start = text.rfind('"items"', 0, type_match.start())
+        violation_start = text.rfind("\n        {", 0, type_match.start())
+        if block_start < 0:
+            continue
+        if violation_start >= 0:
+            block_start = min(block_start, violation_start)
+        block = text[block_start:type_match.end()]
+        candidates: list[tuple[int, int]] = []
+        for uuid in re.findall(r'"uuid"\s*:\s*"([0-9a-fA-F-]{36})"', block):
+            candidate = uuid_to_candidate.get(uuid.lower())
+            if candidate is not None and candidate[1] >= 0 and candidate not in candidates:
+                candidates.append(candidate)
+        for index, first in enumerate(candidates):
+            for second in candidates[index + 1:]:
+                if first == second:
+                    continue
+                pair = _canonical_candidate_pair((first, second))
+                if pair not in seen:
+                    seen.add(pair)
+                    pairs.append(pair)
+    return pairs
 
 
 def _candidate_slot_count(item: Any) -> int:
@@ -420,7 +763,37 @@ def _candidate_slot_count(item: Any) -> int:
         len(getattr(item, "candidate_cover_vertices", [])),
         len(getattr(item, "candidate_terminal_coords", [])),
         len(getattr(item, "candidate_terminal_groups", [])),
+        len(getattr(item, "candidate_boundary_vertex_ids", [])),
+        len(getattr(item, "candidate_cover_vertex_ids", [])),
+        len(getattr(item, "candidate_terminal_coord_ids", [])),
+        len(getattr(item, "candidate_terminal_group_ids", [])),
     )
+
+
+def _cpp_forbidden_selection(router_core: Any, selection: list[tuple[int, int]]) -> Any:
+    """Build a C++ no-good selection row from net/candidate index pairs."""
+    forbidden = router_core.ForbiddenSelection()
+    items = []
+    for net_id, candidate_index in selection:
+        item = router_core.ForbiddenSelectionItem()
+        item.net_id = int(net_id)
+        item.candidate_index = int(candidate_index)
+        items.append(item)
+    forbidden.items = items
+    return forbidden
+
+
+def _cpp_forbidden_pair(router_core: Any, pair: tuple[tuple[int, int], tuple[int, int]]) -> Any:
+    """Build a C++ pairwise no-good row from two net/candidate index pairs."""
+    forbidden = router_core.ForbiddenPair()
+    items = []
+    for net_id, candidate_index in pair:
+        item = router_core.ForbiddenSelectionItem()
+        item.net_id = int(net_id)
+        item.candidate_index = int(candidate_index)
+        items.append(item)
+    forbidden.items = items
+    return forbidden
 
 
 def _selected_external_router_source_bucket(source: str) -> str:
@@ -1202,6 +1575,30 @@ def _pad_applies_to_layer(pad: Any, layer_name: str) -> bool:
     return layer_name.endswith(".Cu") and any(layer == "*.Cu" or layer.endswith(".Cu") for layer in layers)
 
 
+def _segment_inside_same_net_pad_body(
+    board: BoardData,
+    net_id: int,
+    layer_name: str,
+    start: tuple[float, float],
+    end: tuple[float, float],
+) -> bool:
+    """Return true when a segment is only synthetic copper inside one same-net pad.
+
+    Post-Gurobi pad-entry repair may add a small pad-center-to-entry stub so the
+    selector still sees terminal coverage. That stub does not add copper outside
+    the pad body, so it should not be treated as a new route-to-foreign-pad DRC
+    violation; any pad-to-pad spacing issue already belongs to the board pads.
+    """
+    if math.hypot(float(end[0]) - float(start[0]), float(end[1]) - float(start[1])) <= 1e-9:
+        return False
+    for pad in _all_net_pads(board, net_id):
+        if not _pad_applies_to_layer(pad, layer_name):
+            continue
+        if _point_inside_pad_body(float(start[0]), float(start[1]), pad) and _point_inside_pad_body(float(end[0]), float(end[1]), pad):
+            return True
+    return False
+
+
 def _board_bend_count_outside_pads(board: BoardData) -> int:
     """Estimate a routed board's bend count while ignoring turns inside same-net pads.
 
@@ -1458,7 +1855,416 @@ def _selected_solution_stats(
     return total_via_count, total_bend_count, total_wire_length_mm
 
 
+def _write_gurobi_selection_result(
+    outcome: RerouteOutcome,
+    selector_board: BoardData | None,
+    selections: list[PyNetSelection],
+    solver: str,
+    ok: bool,
+    message: str,
+    max_paths_per_net: int,
+    prefer_gurobi: bool,
+    allow_fallback: bool,
+    forbidden_selections: list[list[tuple[int, int]]] | None,
+    forbidden_pairs: list[tuple[tuple[int, int], tuple[int, int]]] | None,
+    selected_via_count: int,
+    selected_bend_count: int,
+    selected_wire_length_mm: float,
+) -> Path:
+    """Persist the post-solver selection for later DRC/source analysis.
+
+    The artifact is written after Gurobi/C++ selector returns. It records only
+    diagnostic data and selected candidate geometry; it does not feed anything
+    back into the solver or alter any model coefficient/constraint.
+    """
+    root = Path(__file__).resolve().parents[1]
+    output_dir = _artifact_root(root) / "gurobi_selection_results"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    board_path = getattr(selector_board, "path", None)
+    if board_path is None and outcome.candidate_export_path is not None:
+        board_stem = Path(outcome.candidate_export_path).stem
+    elif board_path is not None:
+        board_stem = Path(board_path).stem or "board"
+    else:
+        board_stem = "board"
+    safe_board_stem = "".join(ch if ch.isalnum() or ch in ("_", "-", ".") else "_" for ch in board_stem)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    output_path = output_dir / f"{safe_board_stem}__gurobi_selection__{timestamp}.json"
+
+    result_by_net = {
+        int(getattr(result, "net_id", 0)): result
+        for result in (outcome.result or [])
+    }
+    payload = {
+        "schema_version": 1,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "solver": str(solver),
+        "ok": bool(ok),
+        "message": str(message),
+        "request": {
+            "max_paths_per_net": int(max_paths_per_net),
+            "prefer_gurobi": bool(prefer_gurobi),
+            "allow_fallback": bool(allow_fallback),
+            "forbidden_selection_count": len(forbidden_selections or []),
+            "forbidden_pair_count": len(forbidden_pairs or []),
+        },
+        "board": {
+            "path": str(board_path) if board_path is not None else None,
+            "backend": getattr(selector_board, "backend", None) if selector_board is not None else None,
+            "copper_layers": list(getattr(selector_board, "copper_layers", []) or []) if selector_board is not None else [],
+        },
+        "candidate_export_path": str(outcome.candidate_export_path) if outcome.candidate_export_path is not None else None,
+        "selector_external_only": bool(outcome.selector_external_only),
+        "summary": {
+            "selected_net_count": len(selections),
+            "selected_via_count": int(selected_via_count),
+            "selected_bend_count": int(selected_bend_count),
+            "selected_wire_length_mm": float(selected_wire_length_mm),
+        },
+        "selections": [
+            _serialize_gurobi_net_selection(selector_board, result_by_net, selection)
+            for selection in selections
+        ],
+    }
+    output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return output_path
+
+
+def _write_gurobi_selected_board(
+    outcome: RerouteOutcome,
+    selector_board: BoardData | None,
+    selections: list[PyNetSelection],
+    solver: str,
+) -> Path:
+    """Write the selected board and return only its path for legacy callers."""
+    return _write_gurobi_selected_board_artifact(
+        outcome=outcome,
+        selector_board=selector_board,
+        selections=selections,
+        solver=solver,
+    ).path
+
+
+def _write_gurobi_selected_board_artifact(
+    outcome: RerouteOutcome,
+    selector_board: BoardData | None,
+    selections: list[PyNetSelection],
+    solver: str,
+) -> GurobiSelectedBoardArtifact:
+    """Write the selected solver result as a KiCad board artifact.
+
+    The writer copies the input board, removes existing copper for selected
+    nets, and adds the selected candidate primitives. The UUID map lets optional
+    DRC feedback translate KiCad-reported items back into selected candidates.
+    """
+    if selector_board is None:
+        raise RuntimeError("selector board is unavailable")
+    raw_board_path = getattr(selector_board, "path", None)
+    if raw_board_path is None:
+        raise RuntimeError("selector board path is unavailable")
+    board_path = Path(raw_board_path)
+    if not board_path.exists():
+        raise RuntimeError(f"selector board path is unavailable: {board_path}")
+
+    root = Path(__file__).resolve().parents[1]
+    output_dir = _artifact_root(root) / "gurobi_selection_boards"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    safe_board_stem = "".join(ch if ch.isalnum() or ch in ("_", "-", ".") else "_" for ch in (board_path.stem or "board"))
+    safe_solver = "".join(ch if ch.isalnum() or ch in ("_", "-", ".") else "_" for ch in (str(solver) or "solver"))
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    output_path = output_dir / f"{safe_board_stem}__{safe_solver}_selected__{timestamp}.kicad_pcb"
+
+    segments, vias, selected_net_ids = _gurobi_selected_board_primitives(selector_board, outcome, selections)
+    shutil.copyfile(board_path, output_path)
+    pcbnew = _import_pcbnew_for_board_write()
+    board = pcbnew.LoadBoard(str(output_path))
+    if board is None:
+        raise RuntimeError(f"pcbnew failed to load output board: {output_path}")
+
+    _remove_existing_copper_for_nets(board, selected_net_ids)
+    uuid_to_candidate: dict[str, tuple[int, int]] = {}
+    for segment in segments:
+        uuid = _add_selected_track_to_board(pcbnew, board, segment)
+        if uuid:
+            uuid_to_candidate[uuid.lower()] = (
+                int(segment["net_id"]),
+                int(segment.get("candidate_index", -1)),
+            )
+    for via in vias:
+        uuid = _add_selected_via_to_board(pcbnew, board, via)
+        if uuid:
+            uuid_to_candidate[uuid.lower()] = (
+                int(via["net_id"]),
+                int(via.get("candidate_index", -1)),
+            )
+
+    if not pcbnew.SaveBoard(str(output_path), board):
+        raise RuntimeError(f"pcbnew failed to save output board: {output_path}")
+    return GurobiSelectedBoardArtifact(path=output_path, uuid_to_candidate=uuid_to_candidate)
+
+
+def _import_pcbnew_for_board_write() -> Any:
+    """Import KiCad's pcbnew module using the same search path as the parser."""
+    from router_app.kicad_parser import _import_pcbnew
+
+    return _import_pcbnew()
+
+
+def _gurobi_selected_board_primitives(
+    selector_board: BoardData,
+    outcome: RerouteOutcome,
+    selections: list[PyNetSelection],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], set[int]]:
+    """Collect selected candidate segments and vias for KiCad board writing."""
+    result_by_net = {
+        int(getattr(result, "net_id", 0)): result
+        for result in (outcome.result or [])
+    }
+    segments: list[dict[str, Any]] = []
+    vias: list[dict[str, Any]] = []
+    selected_net_ids: set[int] = set()
+    for selection in selections:
+        net_id = int(selection.net_id)
+        route_result = result_by_net.get(net_id)
+        if route_result is None:
+            continue
+        previews = list(getattr(route_result, "candidate_preview_items", []))
+        net_name = str(selector_board.nets.get(net_id, f"Net {net_id}"))
+        for raw_index in selection.selected_candidate_indices:
+            index = int(raw_index)
+            if index < 0 or index >= len(previews):
+                continue
+            selected_net_ids.add(net_id)
+            preview = previews[index]
+            for segment in getattr(preview, "segments", []) or []:
+                segments.append(_selected_segment_dict(segment, net_id, net_name, index))
+            for via in getattr(preview, "vias", []) or []:
+                vias.append(_selected_via_dict(via, net_id, net_name, index))
+    return segments, vias, selected_net_ids
+
+
+def _selected_segment_dict(segment: Any, net_id: int, net_name: str, candidate_index: int) -> dict[str, Any]:
+    """Normalize one selected preview segment for pcbnew output."""
+    width = float(getattr(segment, "width", getattr(segment, "width_mm", 0.2)) or 0.2)
+    return {
+        "net_id": int(net_id),
+        "net_name": str(net_name),
+        "candidate_index": int(candidate_index),
+        "start": _xy_tuple(getattr(segment, "start", (0.0, 0.0))),
+        "end": _xy_tuple(getattr(segment, "end", (0.0, 0.0))),
+        "width_mm": width,
+        "layer": str(getattr(segment, "layer", "F.Cu") or "F.Cu"),
+    }
+
+
+def _selected_via_dict(via: Any, net_id: int, net_name: str, candidate_index: int) -> dict[str, Any]:
+    """Normalize one selected preview via for pcbnew output."""
+    diameter = float(getattr(via, "diameter", getattr(via, "diameter_mm", 0.6)) or 0.6)
+    return {
+        "net_id": int(net_id),
+        "net_name": str(net_name),
+        "candidate_index": int(candidate_index),
+        "center": _xy_tuple(getattr(via, "center", (0.0, 0.0))),
+        "diameter_mm": diameter,
+        "start_layer": str(getattr(via, "start_layer", "F.Cu") or "F.Cu"),
+        "end_layer": str(getattr(via, "end_layer", "B.Cu") or "B.Cu"),
+    }
+
+
+def _xy_tuple(point: Any) -> tuple[float, float]:
+    """Return a two-coordinate tuple from tuple-like or object-like points."""
+    if isinstance(point, (tuple, list)):
+        x = float(point[0]) if len(point) > 0 else 0.0
+        y = float(point[1]) if len(point) > 1 else 0.0
+        return x, y
+    return float(getattr(point, "x", 0.0)), float(getattr(point, "y", 0.0))
+
+
+def _remove_existing_copper_for_nets(board: Any, selected_net_ids: set[int]) -> None:
+    """Remove old tracks/vias for nets that will be replaced by selected candidates."""
+    if not selected_net_ids:
+        return
+    for item in list(board.GetTracks()):
+        net = item.GetNet()
+        net_code = int(net.GetNetCode()) if net is not None else 0
+        if net_code in selected_net_ids:
+            board.Remove(item)
+
+
+def _add_selected_track_to_board(pcbnew: Any, board: Any, segment: dict[str, Any]) -> str | None:
+    """Add one selected segment to a pcbnew board."""
+    start = tuple(segment.get("start", (0.0, 0.0)))
+    end = tuple(segment.get("end", (0.0, 0.0)))
+    track = pcbnew.PCB_TRACK(board)
+    track.SetStart(pcbnew.VECTOR2I(pcbnew.FromMM(float(start[0])), pcbnew.FromMM(float(start[1]))))
+    track.SetEnd(pcbnew.VECTOR2I(pcbnew.FromMM(float(end[0])), pcbnew.FromMM(float(end[1]))))
+    track.SetWidth(pcbnew.FromMM(float(segment.get("width_mm", 0.2))))
+    track.SetLayer(board.GetLayerID(str(segment.get("layer", "F.Cu"))))
+    track.SetNet(board.FindNet(int(segment["net_id"])))
+    board.Add(track)
+    return _board_item_uuid(track)
+
+
+def _add_selected_via_to_board(pcbnew: Any, board: Any, via: dict[str, Any]) -> str | None:
+    """Add one selected via to a pcbnew board."""
+    center = tuple(via.get("center", (0.0, 0.0)))
+    diameter = float(via.get("diameter_mm", via.get("diameter", 0.6)))
+    item = pcbnew.PCB_VIA(board)
+    item.SetPosition(pcbnew.VECTOR2I(pcbnew.FromMM(float(center[0])), pcbnew.FromMM(float(center[1]))))
+    item.SetWidth(pcbnew.FromMM(diameter))
+    item.SetDrill(pcbnew.FromMM(max(0.1, diameter * 0.5)))
+    item.SetLayerPair(
+        board.GetLayerID(str(via.get("start_layer", "F.Cu"))),
+        board.GetLayerID(str(via.get("end_layer", "B.Cu"))),
+    )
+    item.SetNet(board.FindNet(int(via["net_id"])))
+    board.Add(item)
+    return _board_item_uuid(item)
+
+
+def _board_item_uuid(item: Any) -> str | None:
+    """Return a KiCad board item's UUID string when pcbnew exposes one."""
+    try:
+        return str(item.m_Uuid.AsString())
+    except Exception:
+        return None
+
+
+def _serialize_gurobi_net_selection(
+    board: BoardData | None,
+    result_by_net: dict[int, Any],
+    selection: PyNetSelection,
+) -> dict[str, Any]:
+    """Serialize one net's selected candidate records into JSON primitives."""
+    net_id = int(selection.net_id)
+    route_result = result_by_net.get(net_id)
+    preview_items = list(getattr(route_result, "candidate_preview_items", [])) if route_result is not None else []
+    via_counts = list(getattr(route_result, "candidate_via_counts", [])) if route_result is not None else []
+    bend_counts = list(getattr(route_result, "candidate_bend_counts", [])) if route_result is not None else []
+    lengths = list(getattr(route_result, "candidate_lengths_mm", [])) if route_result is not None else []
+    display_lengths = list(getattr(route_result, "candidate_display_lengths_mm", [])) if route_result is not None else []
+    paths_grid = list(getattr(route_result, "candidate_paths_grid", [])) if route_result is not None else []
+    paths_mm = list(getattr(route_result, "candidate_paths_mm", [])) if route_result is not None else []
+    boundary_vertex_ids = list(getattr(route_result, "candidate_boundary_vertex_ids", [])) if route_result is not None else []
+    cover_vertex_ids = list(getattr(route_result, "candidate_cover_vertex_ids", [])) if route_result is not None else []
+
+    return {
+        "net_id": net_id,
+        "net_name": board.nets.get(net_id, f"Net {net_id}") if board is not None else f"Net {net_id}",
+        "solver": str(selection.solver),
+        "objective": float(selection.objective) if selection.objective is not None else None,
+        "selected_candidate_indices": [int(index) for index in selection.selected_candidate_indices],
+        "selected_candidates": [
+            _serialize_gurobi_candidate_record(
+                candidate_index=int(index),
+                preview=preview_items[int(index)] if 0 <= int(index) < len(preview_items) else None,
+                via_counts=via_counts,
+                bend_counts=bend_counts,
+                lengths=lengths,
+                display_lengths=display_lengths,
+                paths_grid=paths_grid,
+                paths_mm=paths_mm,
+                boundary_vertex_ids=boundary_vertex_ids,
+                cover_vertex_ids=cover_vertex_ids,
+            )
+            for index in selection.selected_candidate_indices
+        ],
+    }
+
+
+def _serialize_gurobi_candidate_record(
+    candidate_index: int,
+    preview: Any | None,
+    via_counts: list[Any],
+    bend_counts: list[Any],
+    lengths: list[Any],
+    display_lengths: list[Any],
+    paths_grid: list[Any],
+    paths_mm: list[Any],
+    boundary_vertex_ids: list[Any],
+    cover_vertex_ids: list[Any],
+) -> dict[str, Any]:
+    """Serialize the chosen candidate metadata and visible route geometry."""
+    record: dict[str, Any] = {
+        "candidate_index": int(candidate_index),
+        "source": str(getattr(preview, "source", "unknown")) if preview is not None else "unknown",
+        "source_net_id": int(getattr(preview, "source_net_id", 0)) if preview is not None else None,
+        "occurrence_index": int(getattr(preview, "occurrence_index", 0)) if preview is not None else 0,
+        "via_count": int(via_counts[candidate_index]) if 0 <= candidate_index < len(via_counts) else None,
+        "bend_count": int(bend_counts[candidate_index]) if 0 <= candidate_index < len(bend_counts) else None,
+        "length_mm": float(lengths[candidate_index]) if 0 <= candidate_index < len(lengths) else None,
+        "display_length_mm": float(display_lengths[candidate_index]) if 0 <= candidate_index < len(display_lengths) else None,
+        "path_grid_point_count": len(paths_grid[candidate_index]) if 0 <= candidate_index < len(paths_grid) else 0,
+        "path_mm_point_count": len(paths_mm[candidate_index]) if 0 <= candidate_index < len(paths_mm) else 0,
+        "boundary_vertex_count": len(boundary_vertex_ids[candidate_index]) if 0 <= candidate_index < len(boundary_vertex_ids) else 0,
+        "cover_vertex_count": len(cover_vertex_ids[candidate_index]) if 0 <= candidate_index < len(cover_vertex_ids) else 0,
+    }
+    if 0 <= candidate_index < len(paths_mm):
+        # Store the chosen centerline in physical units so the JSON can be
+        # inspected without loading the full candidate export manifest.
+        record["path_mm"] = [_serialize_point_like(point) for point in paths_mm[candidate_index]]
+    if preview is not None:
+        record["segments"] = [
+            _serialize_preview_segment(segment)
+            for segment in (getattr(preview, "segments", []) or [])
+        ]
+        record["vias"] = [
+            _serialize_preview_via(via)
+            for via in (getattr(preview, "vias", []) or [])
+        ]
+    return record
+
+
+def _serialize_point_like(point: Any) -> dict[str, float]:
+    """Convert tuple-like or object-like coordinates into JSON-safe x/y/z."""
+    if isinstance(point, (tuple, list)):
+        return {
+            "x": float(point[0]) if len(point) > 0 else 0.0,
+            "y": float(point[1]) if len(point) > 1 else 0.0,
+            "z": float(point[2]) if len(point) > 2 else 0.0,
+        }
+    return {
+        "x": float(getattr(point, "x", 0.0)),
+        "y": float(getattr(point, "y", 0.0)),
+        "z": float(getattr(point, "z", 0.0)),
+    }
+
+
+def _serialize_preview_segment(segment: Any) -> dict[str, Any]:
+    """Serialize one selected preview segment for source-level debugging."""
+    return {
+        "start": _serialize_xy_like(getattr(segment, "start", (0.0, 0.0))),
+        "end": _serialize_xy_like(getattr(segment, "end", (0.0, 0.0))),
+        "width_mm": float(getattr(segment, "width", 0.0)),
+        "layer": str(getattr(segment, "layer", "")),
+    }
+
+
+def _serialize_preview_via(via: Any) -> dict[str, Any]:
+    """Serialize one selected preview via for DRC and size-rule debugging."""
+    return {
+        "center": _serialize_xy_like(getattr(via, "center", (0.0, 0.0))),
+        "diameter_mm": float(getattr(via, "diameter", 0.0)),
+        "start_layer": str(getattr(via, "start_layer", "")),
+        "end_layer": str(getattr(via, "end_layer", "")),
+    }
+
+
+def _serialize_xy_like(point: Any) -> list[float]:
+    """Convert a tuple-like coordinate into a compact JSON x/y pair."""
+    if isinstance(point, (tuple, list)):
+        return [
+            float(point[0]) if len(point) > 0 else 0.0,
+            float(point[1]) if len(point) > 1 else 0.0,
+        ]
+    return [float(getattr(point, "x", 0.0)), float(getattr(point, "y", 0.0))]
+
+
 def _grid_point_key(point: Any) -> tuple[int, int, int]:
+    if isinstance(point, int):
+        return _unpack_grid_vertex_id(point)
     return (
         int(getattr(point, "x", 0)),
         int(getattr(point, "y", 0)),
@@ -1540,8 +2346,8 @@ def _final_witness_diagnostics(results: list[Any] | None, nets: list[Any]) -> li
         if final_index is None:
             continue
 
-        cover_vertices_all = list(getattr(item, "candidate_cover_vertices", []))
-        boundary_vertices_all = list(getattr(item, "candidate_boundary_vertices", []))
+        cover_vertices_all = list(getattr(item, "candidate_cover_vertex_ids", [])) or list(getattr(item, "candidate_cover_vertices", []))
+        boundary_vertices_all = list(getattr(item, "candidate_boundary_vertex_ids", [])) or list(getattr(item, "candidate_boundary_vertices", []))
         terminal_groups_all = list(getattr(item, "candidate_terminal_groups", []))
 
         if not (0 <= final_index < len(cover_vertices_all)):
@@ -1617,30 +2423,44 @@ def _final_witness_diagnostics(results: list[Any] | None, nets: list[Any]) -> li
 def _valid_selector_candidate_count(
     candidate_paths_grid: list[list[Any]],
     candidate_boundary_vertices: list[list[Any]],
+    candidate_boundary_vertex_ids: list[list[int]],
     candidate_terminal_coords: list[list[Any]],
     candidate_terminal_groups: list[list[list[Any]]],
+    candidate_terminal_coord_ids: list[list[int]],
+    candidate_terminal_group_ids: list[list[list[int]]],
 ) -> int:
     valid_count = 0
     candidate_count = max(
         len(candidate_paths_grid),
         len(candidate_boundary_vertices),
+        len(candidate_boundary_vertex_ids),
         len(candidate_terminal_coords),
         len(candidate_terminal_groups),
+        len(candidate_terminal_coord_ids),
+        len(candidate_terminal_group_ids),
     )
     for candidate_idx in range(candidate_count):
         path_grid = candidate_paths_grid[candidate_idx] if candidate_idx < len(candidate_paths_grid) else []
         occupied_vertices = (
-            candidate_boundary_vertices[candidate_idx]
+            candidate_boundary_vertex_ids[candidate_idx]
+            if candidate_idx < len(candidate_boundary_vertex_ids) and candidate_boundary_vertex_ids[candidate_idx]
+            else candidate_boundary_vertices[candidate_idx]
             if candidate_idx < len(candidate_boundary_vertices) and candidate_boundary_vertices[candidate_idx]
             else path_grid
         )
         terminal_coords = list(candidate_terminal_coords[candidate_idx]) if candidate_idx < len(candidate_terminal_coords) else []
         terminal_groups = list(candidate_terminal_groups[candidate_idx]) if candidate_idx < len(candidate_terminal_groups) else []
+        terminal_coord_ids = list(candidate_terminal_coord_ids[candidate_idx]) if candidate_idx < len(candidate_terminal_coord_ids) else []
+        terminal_group_ids = list(candidate_terminal_group_ids[candidate_idx]) if candidate_idx < len(candidate_terminal_group_ids) else []
         if not terminal_groups:
             terminal_groups = [[point] for point in terminal_coords]
+        if not terminal_group_ids:
+            terminal_group_ids = [[point] for point in terminal_coord_ids]
         if not terminal_coords and terminal_groups:
             terminal_coords = [group[0] for group in terminal_groups if group]
-        if occupied_vertices and terminal_coords:
+        if not terminal_coord_ids and terminal_group_ids:
+            terminal_coord_ids = [group[0] for group in terminal_group_ids if group]
+        if occupied_vertices and (terminal_coords or terminal_coord_ids):
             valid_count += 1
     return valid_count
 
@@ -1737,10 +2557,20 @@ def _selector_boundary_payload_from_export(
     candidate_paths_grid: list[list[Any]],
     boundary_payload: list[list[dict[str, Any]]],
     precomputed_pad_groups: list[list[Any]] | None = None,
-) -> tuple[list[list[Any]], list[list[Any]], list[list[list[Any]]]]:
+) -> tuple[
+    list[list[Any]],
+    list[list[Any]],
+    list[list[list[Any]]],
+    list[list[int]],
+    list[list[int]],
+    list[list[list[int]]],
+]:
     boundary_vertices: list[list[Any]] = []
     terminal_coords: list[list[Any]] = []
     terminal_groups: list[list[list[Any]]] = []
+    boundary_vertex_ids: list[list[int]] = []
+    terminal_coord_ids: list[list[int]] = []
+    terminal_group_ids: list[list[list[int]]] = []
     pad_boundary_cache: dict[tuple[Any, ...], list[tuple[int, int, int]]] = {}
     net_pads = _all_net_pads(board, net_id) if board is not None else []
     path_count = max(len(candidate_paths_grid), len(boundary_payload))
@@ -1749,6 +2579,7 @@ def _selector_boundary_payload_from_export(
         raw_vertices = boundary_payload[index] if index < len(boundary_payload) else []
 
         vertices_for_path: list[Any] = []
+        vertex_ids_for_path: list[int] = []
         start_anchor: Any | None = None
         goal_anchor: Any | None = None
         seen: set[tuple[int, int, int]] = set()
@@ -1762,33 +2593,57 @@ def _selector_boundary_payload_from_export(
             if key in seen:
                 continue
             seen.add(key)
-            point = router_core.GridPoint(x, y, z)
-            vertices_for_path.append(point)
+            vertex_ids_for_path.append(_pack_grid_vertex_id(x, y, z))
             anchor = str(vertex.get("anchor", ""))
             if anchor == "start":
-                start_anchor = point
+                start_anchor = router_core.GridPoint(x, y, z)
             elif anchor == "goal":
-                goal_anchor = point
+                goal_anchor = router_core.GridPoint(x, y, z)
 
-        if not path and not vertices_for_path:
+        # Packed-id boundary payloads keep large rasterized vertex sets out of
+        # Python objects.  External-router candidates therefore often have no
+        # path_grid and no expanded GridPoint list, but they still carry valid
+        # anchor/boundary ids that must be used to build terminal constraints.
+        if not path and not vertex_ids_for_path:
             boundary_vertices.append(vertices_for_path)
             terminal_coords.append([])
             terminal_groups.append([])
+            boundary_vertex_ids.append(vertex_ids_for_path)
+            terminal_coord_ids.append([])
+            terminal_group_ids.append([])
             continue
 
         if start_anchor is None:
+            if not path:
+                boundary_vertices.append(vertices_for_path)
+                terminal_coords.append([])
+                terminal_groups.append([])
+                boundary_vertex_ids.append(sorted(set(vertex_ids_for_path)))
+                terminal_coord_ids.append([])
+                terminal_group_ids.append([])
+                continue
             p0 = path[0]
             start_anchor = router_core.GridPoint(int(getattr(p0, "x", 0)), int(getattr(p0, "y", 0)), int(getattr(p0, "z", 0)))
         if goal_anchor is None:
+            if not path:
+                boundary_vertices.append(vertices_for_path)
+                terminal_coords.append([])
+                terminal_groups.append([])
+                boundary_vertex_ids.append(sorted(set(vertex_ids_for_path)))
+                terminal_coord_ids.append([])
+                terminal_group_ids.append([])
+                continue
             p1 = path[-1]
             goal_anchor = router_core.GridPoint(int(getattr(p1, "x", 0)), int(getattr(p1, "y", 0)), int(getattr(p1, "z", 0)))
 
         if (start_anchor.x, start_anchor.y, start_anchor.z) not in seen:
             vertices_for_path.append(start_anchor)
             seen.add((start_anchor.x, start_anchor.y, start_anchor.z))
+            vertex_ids_for_path.append(_grid_vertex_id(start_anchor))
         if (goal_anchor.x, goal_anchor.y, goal_anchor.z) not in seen:
             vertices_for_path.append(goal_anchor)
             seen.add((goal_anchor.x, goal_anchor.y, goal_anchor.z))
+            vertex_ids_for_path.append(_grid_vertex_id(goal_anchor))
 
         groups_for_path: list[list[Any]] = []
         terminals_for_path: list[Any] = []
@@ -1853,7 +2708,20 @@ def _selector_boundary_payload_from_export(
         boundary_vertices.append(vertices_for_path)
         terminal_coords.append(terminals_for_path)
         terminal_groups.append(groups_for_path)
-    return boundary_vertices, terminal_coords, terminal_groups
+        boundary_vertex_ids.append(sorted(set(vertex_ids_for_path)))
+        terminal_coord_ids.append([_grid_vertex_id(point) for point in terminals_for_path])
+        terminal_group_ids.append([
+            [_grid_vertex_id(point) for point in group]
+            for group in groups_for_path
+        ])
+    return (
+        boundary_vertices,
+        terminal_coords,
+        terminal_groups,
+        boundary_vertex_ids,
+        terminal_coord_ids,
+        terminal_group_ids,
+    )
 
 
 def _append_external_candidates_for_selector(
@@ -1867,6 +2735,7 @@ def _append_external_candidates_for_selector(
     candidate_paths_mm: list[list[Any]],
     candidate_via_counts: list[int],
     candidate_cover_vertices: list[list[Any]],
+    candidate_cover_vertex_ids: list[list[int]],
     boundary_payload: list[list[dict[str, Any]]],
     candidate_preview_items: list[Any],
     summary: dict[str, Any],
@@ -1993,6 +2862,24 @@ def _append_external_candidates_for_selector(
                 print(line, flush=True)
         else:
             candidate_append_started_at = perf_counter()
+            preview_item = _candidate_preview_item(
+                net_id,
+                final_segments,
+                final_vias,
+                0,
+                f"final:{final_source}",
+                net_id,
+            )
+            split_reason = _external_candidate_split_pin_group_reason(board, net_id, preview_item)
+            if split_reason is not None:
+                _record_external_split_pin_group_rejection(
+                    summary=summary,
+                    net_id=net_id,
+                    source_label=f"final:{final_source}",
+                    reason=split_reason,
+                )
+                candidate_append_total += perf_counter() - candidate_append_started_at
+                continue
             appended = _append_external_payload_candidate(
                 router_core=router_core,
                 board=board,
@@ -2004,20 +2891,14 @@ def _append_external_candidates_for_selector(
                 candidate_paths_mm=candidate_paths_mm,
                 candidate_via_counts=candidate_via_counts,
                 candidate_cover_vertices=candidate_cover_vertices,
+                candidate_cover_vertex_ids=candidate_cover_vertex_ids,
                 boundary_payload=boundary_payload,
                 candidate_preview_items=candidate_preview_items,
                 existing_keys=existing_keys,
                 segments=final_segments,
                 vias=final_vias,
-                cover_vertices_points=final_cover_vertices,
-                preview_item=_candidate_preview_item(
-                    net_id,
-                    final_segments,
-                    final_vias,
-                    0,
-                    f"final:{final_source}",
-                    net_id,
-                ),
+                cover_vertex_ids=final_cover_vertices,
+                preview_item=preview_item,
             )
             candidate_append_total += perf_counter() - candidate_append_started_at
             if appended:
@@ -2096,6 +2977,24 @@ def _append_external_candidates_for_selector(
                 print(line, flush=True)
         else:
             candidate_append_started_at = perf_counter()
+            preview_item = _candidate_preview_item(
+                net_id,
+                original_segments,
+                original_vias,
+                0,
+                f"original:{original_source}",
+                original_net_id,
+            )
+            split_reason = _external_candidate_split_pin_group_reason(board, net_id, preview_item)
+            if split_reason is not None:
+                _record_external_split_pin_group_rejection(
+                    summary=summary,
+                    net_id=net_id,
+                    source_label=f"original:{original_source}",
+                    reason=split_reason,
+                )
+                candidate_append_total += perf_counter() - candidate_append_started_at
+                continue
             appended = _append_external_payload_candidate(
                 router_core=router_core,
                 board=board,
@@ -2107,20 +3006,14 @@ def _append_external_candidates_for_selector(
                 candidate_paths_mm=candidate_paths_mm,
                 candidate_via_counts=candidate_via_counts,
                 candidate_cover_vertices=candidate_cover_vertices,
+                candidate_cover_vertex_ids=candidate_cover_vertex_ids,
                 boundary_payload=boundary_payload,
                 candidate_preview_items=candidate_preview_items,
                 existing_keys=existing_keys,
                 segments=original_segments,
                 vias=original_vias,
-                cover_vertices_points=original_cover_vertices,
-                preview_item=_candidate_preview_item(
-                    net_id,
-                    original_segments,
-                    original_vias,
-                    0,
-                    f"original:{original_source}",
-                    original_net_id,
-                ),
+                cover_vertex_ids=original_cover_vertices,
+                preview_item=preview_item,
             )
             candidate_append_total += perf_counter() - candidate_append_started_at
             if appended:
@@ -2255,6 +3148,24 @@ def _append_external_candidates_for_selector(
                     print(line, flush=True)
         else:
             candidate_append_started_at = perf_counter()
+            preview_item = _candidate_preview_item(
+                net_id,
+                occ_segments,
+                occ_vias,
+                occurrence_index,
+                source_label,
+                int(getattr(occurrence_entry, "preview_source_net_id", net_id) or net_id),
+            )
+            split_reason = _external_candidate_split_pin_group_reason(board, net_id, preview_item)
+            if split_reason is not None:
+                _record_external_split_pin_group_rejection(
+                    summary=summary,
+                    net_id=net_id,
+                    source_label=f"{source_label}@E{occurrence_index}",
+                    reason=split_reason,
+                )
+                candidate_append_total += perf_counter() - candidate_append_started_at
+                continue
             appended = _append_external_payload_candidate(
                 router_core=router_core,
                 board=board,
@@ -2266,21 +3177,15 @@ def _append_external_candidates_for_selector(
                 candidate_paths_mm=candidate_paths_mm,
                 candidate_via_counts=candidate_via_counts,
                 candidate_cover_vertices=candidate_cover_vertices,
+                candidate_cover_vertex_ids=candidate_cover_vertex_ids,
                 boundary_payload=boundary_payload,
                 candidate_preview_items=candidate_preview_items,
                 existing_keys=existing_keys,
                 segments=occ_segments,
                 vias=occ_vias,
                 explicit_graph=occ_graph,
-                cover_vertices_points=occ_cover_vertices,
-                preview_item=_candidate_preview_item(
-                    net_id,
-                    occ_segments,
-                    occ_vias,
-                    occurrence_index,
-                    source_label,
-                    int(getattr(occurrence_entry, "preview_source_net_id", net_id) or net_id),
-                ),
+                cover_vertex_ids=occ_cover_vertices,
+                preview_item=preview_item,
             )
             candidate_append_total += perf_counter() - candidate_append_started_at
             if appended:
@@ -2315,8 +3220,61 @@ def _append_external_candidates_for_selector(
         f"final_angle_y_checked={int(summary.get('final_angle_y_checked', 0))} "
         f"final_angle_y_repaired={int(summary.get('final_angle_y_repaired', 0))} "
         f"final_angle_y_rejected={int(summary.get('final_angle_y_rejected', 0))} "
+        f"split_pin_group_rejected={int(summary.get('split_pin_group_rejected', 0))} "
         f"occurrence_count={occurrence_count} "
         f"occurrence_total_sec={occurrence_total:.3f}",
+        flush=True,
+    )
+
+
+def _external_candidate_split_pin_group_reason(
+    board: BoardData,
+    net_id: int,
+    preview_item: Any,
+) -> str | None:
+    """Reject a single candidate if its own same-net pads form disconnected groups.
+
+    Gurobi terminal coverage only checks whether pads are covered. This precheck
+    makes sure one candidate that claims to represent a route does not actually
+    contain multiple independent same-net copper islands.
+    """
+    pad_entries = _topology_pad_entries(board, net_id)
+    if not pad_entries:
+        return None
+    components, padless_components = _selected_net_pin_components(
+        board,
+        net_id,
+        pad_entries,
+        [preview_item],
+    )
+    pin_components = [component for component in components if component["pads"]]
+    if len(pin_components) <= 1:
+        return None
+    group_sizes = ",".join(str(len(component["pads"])) for component in pin_components)
+    pad_samples = ";".join(
+        ",".join(list(component["pads"])[:4]) + ("..." if len(component["pads"]) > 4 else "")
+        for component in pin_components[:4]
+    )
+    reason = f"split_pin_groups={len(pin_components)} group_sizes={group_sizes}"
+    if padless_components:
+        reason += f" padless_copper_components={padless_components}"
+    if pad_samples:
+        reason += f" pads={pad_samples}"
+    return reason
+
+
+def _record_external_split_pin_group_rejection(
+    summary: dict[str, Any],
+    net_id: int,
+    source_label: str,
+    reason: str,
+) -> None:
+    """Record and print a split-pin-group candidate rejection."""
+    summary["split_pin_group_rejected"] = int(summary.get("split_pin_group_rejected", 0)) + 1
+    summary.setdefault("rejections", []).append(f"{source_label}:{reason}")
+    print(
+        "selector_external_rejected_split_pin_groups "
+        f"net={net_id} source={source_label} reason={reason}",
         flush=True,
     )
 
@@ -2332,6 +3290,7 @@ def _append_external_payload_candidate(
     candidate_paths_mm: list[list[Any]],
     candidate_via_counts: list[int],
     candidate_cover_vertices: list[list[Any]],
+    candidate_cover_vertex_ids: list[list[int]],
     boundary_payload: list[list[dict[str, Any]]],
     candidate_preview_items: list[Any],
     existing_keys: set[tuple[tuple[int, int, int], ...]],
@@ -2339,6 +3298,7 @@ def _append_external_payload_candidate(
     vias: list[dict[str, Any]] | None = None,
     explicit_graph: dict[str, Any] | None = None,
     cover_vertices_points: list[Any] | None = None,
+    cover_vertex_ids: list[int] | None = None,
     preview_item: Any | None = None,
 ) -> bool:
     graph = _build_external_grid_graph(
@@ -2355,12 +3315,17 @@ def _append_external_payload_candidate(
     existing_keys.add(key)
     boundary_payload.append(raw_vertices)
     candidate_via_counts.append(len(vias or []))
-    if cover_vertices_points is not None:
+    if cover_vertex_ids is not None:
+        candidate_cover_vertex_ids.append([int(value) for value in cover_vertex_ids])
+        candidate_cover_vertices.append([])
+    elif cover_vertices_points is not None:
         candidate_cover_vertices.append(list(cover_vertices_points))
+        candidate_cover_vertex_ids.append([_grid_vertex_id(point) for point in cover_vertices_points])
     else:
         cover_vertices = _primitive_occupied_vertices(result, segments or [], vias or [])
-        candidate_cover_vertices.append([
-            router_core.GridPoint(x, y, z)
+        candidate_cover_vertices.append([])
+        candidate_cover_vertex_ids.append([
+            _pack_grid_vertex_id(x, y, z)
             for (x, y, z) in sorted(cover_vertices)
         ])
     candidate_preview_items.append(
@@ -2379,11 +3344,10 @@ def _interactive_router_env_flag(name: str) -> bool:
 
 def _final_candidate_angle_y_fix_enabled() -> bool:
     """Return true when final routed-board candidates should be sanitized."""
-    return (
-        _interactive_router_env_flag("INTERACTIVE_ROUTER_FINAL_CANDIDATE_PAD_ENTRY_FIX")
-        or _interactive_router_env_flag("INTERACTIVE_ROUTER_CANDIDATE_PAD_ENTRY_FIX")
-        or _interactive_router_env_flag("INTERACTIVE_ROUTER_FREEROUTING_CANDIDATE_PAD_ENTRY_FIX")
-    )
+    # Final candidates should enter the selector exactly as the router wrote
+    # them.  Keep this disabled even if old experiment flags remain in the
+    # caller's environment.
+    return False
 
 
 def _maybe_repair_final_candidate_angle_y(
@@ -2539,33 +3503,40 @@ def _repair_final_candidate_with_local_entry_chains(
     """
     if not invalid_entries:
         return None
-    unique_entries: list[Any] = []
-    seen_segment_indexes: set[int] = set()
-    for entry in sorted(invalid_entries, key=lambda value: int(value.segment_index), reverse=True):
-        # A single segment with two bad pad endpoints needs a larger two-sided
-        # rewrite. Keep this fallback conservative by repairing each segment at
-        # most once and letting the selector reject rare ambiguous cases.
-        if int(entry.segment_index) in seen_segment_indexes:
-            continue
-        seen_segment_indexes.add(int(entry.segment_index))
-        unique_entries.append(entry)
+    grouped_entries: dict[int, list[Any]] = {}
+    for entry in invalid_entries:
+        grouped_entries.setdefault(int(entry.segment_index), []).append(entry)
+    entry_groups = [
+        sorted(group, key=lambda value: str(value.endpoint_key))
+        for _, group in sorted(grouped_entries.items(), key=lambda item: item[0], reverse=True)
+    ]
 
     def search(entry_index: int, current_segments: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
-        if entry_index >= len(unique_entries):
+        if entry_index >= len(entry_groups):
             if _find_invalid_pad_entry_locations(board, net_id, current_segments):
                 return None
             if _final_candidate_repair_rejection_reason(board, result, net_id, current_segments, vias) is not None:
                 return None
             return current_segments
 
-        entry = unique_entries[entry_index]
-        if entry.segment_index >= len(current_segments):
+        entries = entry_groups[entry_index]
+        segment_index = int(entries[0].segment_index)
+        if segment_index >= len(current_segments):
             return None
-        segment = current_segments[entry.segment_index]
-        for replacement in _pad_entry_chain_repair_variants(segment, entry.endpoint_key, entry.other_key, entry.pad):
+        for remove_indexes, replacement in _pad_entry_chain_repair_options(current_segments, entries):
             if _candidate_violates_foreign_pad_clearance(board, net_id, replacement, []):
                 continue
-            trial_segments = current_segments[:entry.segment_index] + replacement + current_segments[entry.segment_index + 1 :]
+            remove_set = {int(index) for index in remove_indexes}
+            if not remove_set or any(index < 0 or index >= len(current_segments) for index in remove_set):
+                continue
+            insert_index = min(remove_set)
+            trial_segments = [
+                dict(segment)
+                for index, segment in enumerate(current_segments)
+                if index not in remove_set
+            ]
+            adjusted_insert_index = sum(1 for index in range(insert_index) if index not in remove_set)
+            trial_segments[adjusted_insert_index:adjusted_insert_index] = replacement
             repaired = search(entry_index + 1, trial_segments)
             if repaired is not None:
                 return repaired
@@ -2582,6 +3553,153 @@ def _repair_final_candidate_with_local_entry_chains(
             return None
         repaired_segments = y_segments
     return SimpleNamespace(checked=True, repaired=True, rejected=False, reason="repaired_chain", segments=repaired_segments, vias=vias)
+
+
+def _pad_entry_chain_repair_options(
+    segments: list[dict[str, Any]],
+    entries: list[Any],
+) -> list[tuple[list[int], list[dict[str, Any]]]]:
+    """Build candidate replacement options for one bad pad-entry segment group.
+
+    A one-segment repair can fail when the segment's non-pad endpoint is still
+    inside a dense pad escape area. For a single bad endpoint, this helper also
+    tries replacing a short degree-2 chain outward from that endpoint, giving
+    the repair room to reconnect at a less congested anchor.
+    """
+    if not entries:
+        return []
+    segment_index = int(entries[0].segment_index)
+    if segment_index < 0 or segment_index >= len(segments):
+        return []
+    segment = segments[segment_index]
+    options: list[tuple[list[int], list[dict[str, Any]]]] = []
+    for replacement in _pad_entry_chain_repair_variants_for_entries(segment, entries):
+        options.append(([segment_index], replacement))
+    if len(entries) != 1:
+        return options
+
+    entry = entries[0]
+    for chain in _pad_entry_chain_expansion_options(segments, entry, max_segments=3):
+        if len(chain.segment_indexes) <= 1:
+            continue
+        for replacement in _pad_entry_chain_repair_variants_for_anchor(
+            segment_template=segment,
+            endpoint_key=str(entry.endpoint_key),
+            anchor=chain.anchor,
+            pad=entry.pad,
+        ):
+            options.append((list(chain.segment_indexes), replacement))
+    return options
+
+
+def _pad_entry_chain_expansion_options(
+    segments: list[dict[str, Any]],
+    entry: Any,
+    max_segments: int,
+) -> list[Any]:
+    """Trace short degree-2 chains away from one invalid pad-entry endpoint."""
+    segment_index = int(entry.segment_index)
+    if segment_index < 0 or segment_index >= len(segments):
+        return []
+    edge_nodes: list[tuple[tuple[str, float, float], tuple[str, float, float]]] = []
+    node_to_edges: dict[tuple[str, float, float], list[int]] = {}
+    for index, segment in enumerate(segments):
+        layer_name = str(segment.get("layer", ""))
+        start = tuple(segment.get("start", (0.0, 0.0)))
+        end = tuple(segment.get("end", (0.0, 0.0)))
+        if len(start) != 2 or len(end) != 2:
+            continue
+        start_node = (layer_name, round(float(start[0]), 6), round(float(start[1]), 6))
+        end_node = (layer_name, round(float(end[0]), 6), round(float(end[1]), 6))
+        while len(edge_nodes) <= index:
+            edge_nodes.append((("", 0.0, 0.0), ("", 0.0, 0.0)))
+        edge_nodes[index] = (start_node, end_node)
+        node_to_edges.setdefault(start_node, []).append(index)
+        node_to_edges.setdefault(end_node, []).append(index)
+
+    if segment_index >= len(edge_nodes):
+        return []
+    segment_edge = edge_nodes[segment_index]
+    if str(entry.endpoint_key) == "start":
+        current_node = segment_edge[1]
+    else:
+        current_node = segment_edge[0]
+    previous_edge = segment_index
+    chain_indexes = [segment_index]
+    options: list[Any] = [
+        SimpleNamespace(segment_indexes=list(chain_indexes), anchor=(current_node[1], current_node[2]))
+    ]
+
+    for _depth in range(max(1, int(max_segments)) - 1):
+        adjacent = [edge_index for edge_index in node_to_edges.get(current_node, []) if edge_index != previous_edge]
+        if len(adjacent) != 1 or len(node_to_edges.get(current_node, [])) != 2:
+            break
+        next_edge = adjacent[0]
+        if next_edge in chain_indexes or next_edge >= len(edge_nodes):
+            break
+        next_node = _other_edge_node(edge_nodes[next_edge], current_node)
+        if next_node is None:
+            break
+        chain_indexes.append(next_edge)
+        current_node = next_node
+        previous_edge = next_edge
+        options.append(SimpleNamespace(segment_indexes=list(chain_indexes), anchor=(current_node[1], current_node[2])))
+    return options
+
+
+def _pad_entry_chain_repair_variants_for_anchor(
+    segment_template: dict[str, Any],
+    endpoint_key: str,
+    anchor: tuple[float, float],
+    pad: Any,
+) -> list[list[dict[str, Any]]]:
+    """Build local chain replacements from a pad center to a farther anchor."""
+    fake_segment = dict(segment_template)
+    if endpoint_key == "start":
+        fake_segment["end"] = (float(anchor[0]), float(anchor[1]))
+        other_key = "end"
+    else:
+        fake_segment["start"] = (float(anchor[0]), float(anchor[1]))
+        other_key = "start"
+    return _pad_entry_chain_repair_variants(fake_segment, endpoint_key, other_key, pad)
+
+
+def _pad_entry_chain_repair_variants_for_entries(
+    segment: dict[str, Any],
+    entries: list[Any],
+) -> list[list[dict[str, Any]]]:
+    """Build replacement chains for one segment with one or two bad pad exits."""
+    if len(entries) == 1:
+        entry = entries[0]
+        return _pad_entry_chain_repair_variants(segment, entry.endpoint_key, entry.other_key, entry.pad)
+
+    start_entry = next((entry for entry in entries if str(entry.endpoint_key) == "start"), None)
+    end_entry = next((entry for entry in entries if str(entry.endpoint_key) == "end"), None)
+    if start_entry is None or end_entry is None:
+        # More than two ambiguous entries should not happen for a two-endpoint
+        # segment; fall back to the first entry instead of inventing topology.
+        entry = entries[0]
+        return _pad_entry_chain_repair_variants(segment, entry.endpoint_key, entry.other_key, entry.pad)
+
+    trace_width = float(segment.get("width_mm", segment.get("width", 0.2)) or 0.2)
+    start_center = (float(start_entry.pad.center[0]), float(start_entry.pad.center[1]))
+    end_center = (float(end_entry.pad.center[0]), float(end_entry.pad.center[1]))
+    variants: list[list[dict[str, Any]]] = []
+    for start_entry_point in _pad_entry_repair_candidates(end_center, start_entry.pad):
+        for end_entry_point in _pad_entry_repair_candidates(start_center, end_entry.pad):
+            bridge_paths = _entry_bridge_paths(start_entry_point, end_entry_point)
+            for bridge in bridge_paths:
+                if len(bridge) < 2:
+                    continue
+                if not _pad_entry_angle_is_valid(start_entry_point, bridge[1], start_entry.pad, trace_width):
+                    continue
+                if not _pad_entry_angle_is_valid(end_entry_point, bridge[-2], end_entry.pad, trace_width):
+                    continue
+                path = [start_center, *bridge, end_center]
+                replacement = _segments_from_point_chain(segment, _dedupe_adjacent_points(path))
+                if replacement:
+                    variants.append(replacement)
+    return _dedupe_repair_variants(variants)
 
 
 def _pad_entry_chain_repair_variants(
@@ -2617,6 +3735,86 @@ def _pad_entry_chain_repair_variants(
             if replacement:
                 variants.append(replacement)
 
+        for escape_point in _pad_entry_escape_points(entry_point, pad, trace_width):
+            if not _pad_entry_angle_is_valid(entry_point, escape_point, pad, trace_width):
+                continue
+            for bridge in _entry_bridge_paths(escape_point, other):
+                pad_to_anchor_path = [center, entry_point, *bridge]
+                world_path = _dedupe_adjacent_points(pad_to_anchor_path)
+                if endpoint_key != "start":
+                    world_path = list(reversed(world_path))
+                replacement = _segments_from_point_chain(segment, world_path)
+                if replacement:
+                    variants.append(replacement)
+
+    return _dedupe_repair_variants(variants)
+
+
+def _pad_entry_escape_points(
+    entry_point: tuple[float, float],
+    pad: Any,
+    trace_width_mm: float,
+) -> list[tuple[float, float]]:
+    """Return short outward escape points for PcbRouter-style pad repair.
+
+    The escape point lets the repaired trace leave the pad through a legal
+    normal first, then dogleg back to the existing route anchor. This is needed
+    near fine-pitch pads where connecting the legal entry directly to the old
+    anchor would cut through a neighboring pad clearance.
+    """
+    local_entry = _pad_local_point(entry_point[0], entry_point[1], pad)
+    half_x = float(pad.size[0]) * 0.5
+    half_y = float(pad.size[1]) * 0.5
+    if half_x <= 0.0 or half_y <= 0.0:
+        return []
+    escape_distance = max(float(trace_width_mm) * 1.5, 0.2)
+    shape = str(getattr(pad, "shape", "")).lower()
+    directions: list[tuple[float, float]] = []
+    if shape in {"circle", "oval", "ellipse"}:
+        nx = local_entry[0] / (half_x * half_x)
+        ny = local_entry[1] / (half_y * half_y)
+        length = math.hypot(nx, ny)
+        if length > 1e-9:
+            directions.append((nx / length, ny / length))
+    else:
+        tol = 1e-6
+        near_x = abs(abs(local_entry[0]) - half_x) <= tol
+        near_y = abs(abs(local_entry[1]) - half_y) <= tol
+        if near_x and near_y:
+            dx = math.copysign(1.0, local_entry[0])
+            dy = math.copysign(1.0, local_entry[1])
+            root2 = math.sqrt(2.0)
+            directions.append((dx / root2, dy / root2))
+        elif near_x:
+            directions.append((math.copysign(1.0, local_entry[0]), 0.0))
+        elif near_y:
+            directions.append((0.0, math.copysign(1.0, local_entry[1])))
+    escapes: list[tuple[float, float]] = []
+    for dx, dy in directions:
+        local_escape = (local_entry[0] + dx * escape_distance, local_entry[1] + dy * escape_distance)
+        escapes.append(_pad_world_point_from_local(local_escape[0], local_escape[1], pad))
+    return escapes
+
+
+def _entry_bridge_paths(
+    start_entry: tuple[float, float],
+    end_entry: tuple[float, float],
+) -> list[list[tuple[float, float]]]:
+    """Return short board-space bridge paths between two legal pad entries."""
+    sx, sy = start_entry
+    ex, ey = end_entry
+    midpoint = ((sx + ex) * 0.5, (sy + ey) * 0.5)
+    return [
+        [start_entry, end_entry],
+        [start_entry, (sx, ey), end_entry],
+        [start_entry, (ex, sy), end_entry],
+        [start_entry, (sx, midpoint[1]), (ex, midpoint[1]), end_entry],
+        [start_entry, (midpoint[0], sy), (midpoint[0], ey), end_entry],
+    ]
+
+
+def _dedupe_repair_variants(variants: list[list[dict[str, Any]]]) -> list[list[dict[str, Any]]]:
+    """Remove duplicate replacement chains while preserving deterministic order."""
     deduped: list[list[dict[str, Any]]] = []
     seen: set[tuple[tuple[float, float], ...]] = set()
     for replacement in variants:
@@ -2692,18 +3890,37 @@ def _pad_entry_repair_candidates(outside_point: tuple[float, float], pad: Any) -
         return candidates
     shape = str(getattr(pad, "shape", "")).lower()
     if shape in {"circle", "oval", "ellipse"}:
+        for degrees in range(0, 360, 45):
+            radians = degrees * math.pi / 180.0
+            candidates.append(_pad_world_point_from_local(half_x * math.cos(radians), half_y * math.sin(radians), pad))
         return candidates
     ox, oy = local_outside
     clamped_x = max(-half_x, min(half_x, ox))
     clamped_y = max(-half_y, min(half_y, oy))
+    local_candidates = [
+        (-half_x, clamped_y),
+        (half_x, clamped_y),
+        (clamped_x, -half_y),
+        (clamped_x, half_y),
+        (-half_x, 0.0),
+        (half_x, 0.0),
+        (0.0, -half_y),
+        (0.0, half_y),
+        (-half_x, -half_y),
+        (-half_x, half_y),
+        (half_x, -half_y),
+        (half_x, half_y),
+    ]
     if abs(ox) >= abs(oy):
         side_x = math.copysign(half_x, ox if abs(ox) > 1e-9 else 1.0)
-        candidates.append(_pad_world_point_from_local(side_x, clamped_y, pad))
-        candidates.append(_pad_world_point_from_local(side_x, 0.0, pad))
+        local_candidates.insert(0, (side_x, clamped_y))
+        local_candidates.insert(1, (side_x, 0.0))
     else:
         side_y = math.copysign(half_y, oy if abs(oy) > 1e-9 else 1.0)
-        candidates.append(_pad_world_point_from_local(clamped_x, side_y, pad))
-        candidates.append(_pad_world_point_from_local(0.0, side_y, pad))
+        local_candidates.insert(0, (clamped_x, side_y))
+        local_candidates.insert(1, (0.0, side_y))
+    for local_x, local_y in local_candidates:
+        candidates.append(_pad_world_point_from_local(local_x, local_y, pad))
     deduped: list[tuple[float, float]] = []
     seen: set[tuple[float, float]] = set()
     for candidate in candidates:
@@ -2732,76 +3949,9 @@ def _maybe_repair_freerouting_candidate_pad_entry(
     from the repaired primitives instead of mixing old graph nodes with new
     segment coordinates.
     """
-    # The default freerouting pad-entry repair now runs inside the freerouting
-    # writer, where the router's live board state is still available. Keep this
-    # Python path as an explicit external fallback only, so a candidate is not
-    # repaired twice when the public writer-side switch is enabled.
-    if source_backend != "freerouting" or not _interactive_router_env_flag("INTERACTIVE_ROUTER_FREEROUTING_EXTERNAL_CANDIDATE_PAD_ENTRY_FIX"):
-        return SimpleNamespace(checked=False, repaired=False, pad_repaired=False, y_cleaned=False, rejected=False, reason="disabled", segments=segments, vias=vias, explicit_graph=explicit_graph)
-
-    copied_segments = [dict(segment) for segment in segments]
-    copied_vias = [dict(via) for via in vias]
-    net_pads = _all_net_pads(board, net_id)
-    invalid_entries = 0
-    repaired_entries = 0
-    repaired_segment_indexes: set[int] = set()
-
-    for segment_index, segment in enumerate(copied_segments):
-        layer_name = str(segment.get("layer", ""))
-        for endpoint_key, other_key in (("start", "end"), ("end", "start")):
-            endpoint = tuple(segment.get(endpoint_key, (0.0, 0.0)))
-            other = tuple(segment.get(other_key, (0.0, 0.0)))
-            if len(endpoint) != 2 or len(other) != 2:
-                continue
-            pad = _candidate_endpoint_pad(board, net_pads, layer_name, tuple(map(float, endpoint)))
-            if pad is None:
-                continue
-            if _point_inside_pad_body(float(other[0]), float(other[1]), pad):
-                continue
-            trace_width = float(segment.get("width_mm", segment.get("width", 0.2)) or 0.2)
-            if _pad_entry_angle_is_valid(tuple(map(float, endpoint)), tuple(map(float, other)), pad, trace_width):
-                continue
-            invalid_entries += 1
-            repaired = _repair_pad_entry_endpoint(tuple(map(float, other)), pad)
-            if repaired is None:
-                return SimpleNamespace(checked=True, repaired=False, pad_repaired=False, y_cleaned=False, rejected=True, reason="pad_entry_unrepairable", segments=segments, vias=vias, explicit_graph=explicit_graph)
-            segment[endpoint_key] = repaired
-            repaired_entries += 1
-            repaired_segment_indexes.add(segment_index)
-
-    if repaired_entries != invalid_entries:
-        return SimpleNamespace(checked=True, repaired=False, pad_repaired=False, y_cleaned=False, rejected=True, reason="pad_entry_partial_repair", segments=segments, vias=vias, explicit_graph=explicit_graph)
-    repaired_segments = [
-        segment
-        for segment_index, segment in enumerate(copied_segments)
-        if segment_index in repaired_segment_indexes
-    ]
-    if _candidate_violates_foreign_pad_clearance(board, net_id, repaired_segments, []):
-        return SimpleNamespace(checked=True, repaired=True, pad_repaired=True, y_cleaned=False, rejected=True, reason="pad_entry_repair_foreign_pad_violation", segments=segments, vias=vias, explicit_graph=explicit_graph)
-
-    y_segments, y_cleaned = _cleanup_freerouting_candidate_y_stub(board, net_id, copied_segments, copied_vias)
-    if y_cleaned:
-        copied_segments = y_segments
-
-    if invalid_entries == 0 and not y_cleaned:
-        return SimpleNamespace(checked=True, repaired=False, pad_repaired=False, y_cleaned=False, rejected=False, reason="ok", segments=segments, vias=vias, explicit_graph=explicit_graph)
-
-    if _candidate_violates_existing_route_clearance(board, net_id, copied_segments, copied_vias):
-        return SimpleNamespace(checked=True, repaired=True, pad_repaired=invalid_entries > 0, y_cleaned=y_cleaned, rejected=True, reason="pad_entry_repair_route_collision", segments=segments, vias=vias, explicit_graph=explicit_graph)
-
-    pad_reason = _external_candidate_pad_coverage_reason(
-        board=board,
-        result=result,
-        net_id=net_id,
-        segments=copied_segments,
-        vias=copied_vias,
-        explicit_graph=None,
-    )
-    if pad_reason is not None:
-        return SimpleNamespace(checked=True, repaired=True, pad_repaired=invalid_entries > 0, y_cleaned=y_cleaned, rejected=True, reason=f"pad_entry_repair_{pad_reason}", segments=segments, vias=vias, explicit_graph=explicit_graph)
-
-    return SimpleNamespace(checked=True, repaired=True, pad_repaired=invalid_entries > 0, y_cleaned=y_cleaned, rejected=False, reason="repaired", segments=copied_segments, vias=copied_vias, explicit_graph=None)
-
+    # The current comparison path records diagnostics only; it does not move
+    # freerouting candidate endpoints or perform angle/Y cleanup.
+    return SimpleNamespace(checked=False, repaired=False, pad_repaired=False, y_cleaned=False, rejected=False, reason="disabled", segments=segments, vias=vias, explicit_graph=explicit_graph)
 
 def _cleanup_freerouting_candidate_y_stub(
     board: BoardData,
@@ -3101,8 +4251,12 @@ def _candidate_violates_foreign_pad_clearance(board: BoardData, net_id: int, seg
         end = tuple(segment.get("end", (0.0, 0.0)))
         if len(start) != 2 or len(end) != 2:
             continue
+        start_xy = tuple(map(float, start))
+        end_xy = tuple(map(float, end))
+        if _segment_inside_same_net_pad_body(board, net_id, layer_name, start_xy, end_xy):
+            continue
         radius = float(segment.get("width_mm", 0.2)) * 0.5 + clearance
-        if _sampled_primitive_hits_foreign_pad(board, net_id, layer_name, tuple(map(float, start)), tuple(map(float, end)), radius):
+        if _sampled_primitive_hits_foreign_pad(board, net_id, layer_name, start_xy, end_xy, radius):
             return True
     for via in vias:
         center = tuple(via.get("center", (0.0, 0.0)))
@@ -4142,20 +5296,16 @@ def _batch_cpp_external_candidate_analysis(
         elapsed_per_entry = batch_elapsed / max(1, len(unique_entries))
         unique_results: list[tuple[list[dict[str, Any]], list[Any], str | None, bool, float, float]] = []
         for unique_key, entry, analysis in zip(unique_keys, unique_entries, batch_results):
-            boundary_set = {
-                (int(point.x), int(point.y), int(point.z))
-                for point in getattr(getattr(analysis, "raster", None), "boundary_vertices", [])
-            }
+            raster = getattr(analysis, "raster", None)
+            boundary_ids = [int(value) for value in getattr(raster, "boundary_vertex_ids", [])]
+            boundary_set = {_unpack_grid_vertex_id(value) for value in boundary_ids}
             raw_vertices = _serialize_boundary_vertices_with_anchors(
                 getattr(entry, "source_board", selector_board),
                 boundary_set,
                 getattr(entry, "start_anchor", None),
                 getattr(entry, "goal_anchor", None),
             )
-            cover_vertices = [
-                router_core.GridPoint(int(point.x), int(point.y), int(point.z))
-                for point in getattr(getattr(analysis, "raster", None), "occupied_vertices", [])
-            ]
+            cover_vertices = [int(value) for value in getattr(raster, "occupied_vertex_ids", [])]
             pad_reason = _pad_coverage_reason_from_analysis(getattr(analysis, "coverage", None))
             result_tuple = (
                 raw_vertices,
@@ -4244,15 +5394,10 @@ def _cpp_rasterize_candidate_geometry(
             explicit_graph,
         )
         raster = router_core.rasterize_selector_geometry(request)
-        boundary_set = {
-            (int(point.x), int(point.y), int(point.z))
-            for point in getattr(raster, "boundary_vertices", [])
-        }
+        boundary_ids = [int(value) for value in getattr(raster, "boundary_vertex_ids", [])]
+        boundary_set = {_unpack_grid_vertex_id(value) for value in boundary_ids}
         raw_vertices = _serialize_boundary_vertices_with_anchors(board, boundary_set, start_anchor, goal_anchor)
-        cover_vertices = [
-            router_core.GridPoint(int(point.x), int(point.y), int(point.z))
-            for point in getattr(raster, "occupied_vertices", [])
-        ]
+        cover_vertices = [int(value) for value in getattr(raster, "occupied_vertex_ids", [])]
         return raw_vertices, cover_vertices
     except Exception:
         raw_vertices = _build_boundary_payload_from_primitives(
@@ -4265,7 +5410,7 @@ def _cpp_rasterize_candidate_geometry(
             vias=vias,
         )
         cover_vertices = [
-            router_core.GridPoint(x, y, z)
+            _pack_grid_vertex_id(x, y, z)
             for (x, y, z) in sorted(_primitive_occupied_vertices(result, segments, vias))
         ]
         return raw_vertices, cover_vertices
@@ -5177,7 +6322,7 @@ def _load_external_payload_paths(candidate_export_path: Path | None) -> list[Pat
 
 def _guess_freerouting_payload_paths(board_path: Path) -> list[Path]:
     app_root = Path(__file__).resolve().parents[1]
-    work_dir = app_root / "out" / "freerouting_full"
+    work_dir = _artifact_root(app_root) / "freerouting_full"
     stems = [board_path.stem]
     if board_path.stem.endswith(".freerouting.routed"):
         stems.append(board_path.stem[: -len(".freerouting.routed")])
@@ -5566,7 +6711,7 @@ def _write_selector_stub_manifest(
     backend_label: str = "external",
 ) -> Path:
     root = Path(__file__).resolve().parents[1]
-    export_dir = root / "out" / "candidate_path_exports"
+    export_dir = _artifact_root(root) / "candidate_path_exports"
     export_dir.mkdir(parents=True, exist_ok=True)
     board_stem = board.path.stem or "board"
     net_label = "-".join(str(net_id) for net_id in net_ids) or "none"
@@ -5852,7 +6997,7 @@ def _export_candidate_path_manifest(
         return None
 
     root = Path(__file__).resolve().parents[1]
-    export_dir = root / "out" / "candidate_path_exports"
+    export_dir = _artifact_root(root) / "candidate_path_exports"
     export_dir.mkdir(parents=True, exist_ok=True)
 
     board_stem = board.path.stem or "board"
@@ -5881,6 +7026,19 @@ def _export_candidate_path_manifest(
     }
     export_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return export_path
+
+
+def _artifact_root(app_root: Path) -> Path:
+    """Return the root directory for generated selector/router artifacts.
+
+    The default remains the application's out directory. Headless regression
+    runs can set INTERACTIVE_ROUTER_ARTIFACT_ROOT when that default location is
+    unavailable to the Python process launched by the test harness.
+    """
+    override = os.environ.get("INTERACTIVE_ROUTER_ARTIFACT_ROOT")
+    if override:
+        return Path(override).expanduser().resolve()
+    return app_root / "out"
 
 
 def _serialize_route_result(
@@ -6052,6 +7210,8 @@ def _serialize_grid_vertex_tuple(
 
 
 def _grid_point_to_vertex_tuple(point: Any) -> tuple[int, int, int]:
+    if isinstance(point, int):
+        return _unpack_grid_vertex_id(point)
     return (
         int(getattr(point, "x", 0)),
         int(getattr(point, "y", 0)),

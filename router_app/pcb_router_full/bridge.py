@@ -90,7 +90,7 @@ def run_pcb_router_full(board_path: str | Path, profile_manifest_path: str | Pat
     board_cache: BoardCache = {}
     router_source_board_path = _canonical_router_source_board(board_path, board_cache)
     app_root = Path(__file__).resolve().parents[2]
-    work_dir = app_root / "out" / "pcb_router_full" / board_path.stem
+    work_dir = _artifact_root(app_root) / "pcb_router_full" / board_path.stem
     work_dir.mkdir(parents=True, exist_ok=True)
 
     routed_board_path = work_dir / f"{board_path.stem}.pcbrouter.routed.kicad_pcb"
@@ -241,6 +241,19 @@ def run_pcb_router_full(board_path: str | Path, profile_manifest_path: str | Pat
     )
 
 
+def _artifact_root(app_root: Path) -> Path:
+    """Return the root directory for generated router artifacts.
+
+    INTERACTIVE_ROUTER_ARTIFACT_ROOT lets headless tests write artifacts outside
+    the GUI's default out directory while preserving the default path for normal
+    application runs.
+    """
+    override = os.environ.get("INTERACTIVE_ROUTER_ARTIFACT_ROOT")
+    if override:
+        return Path(override).expanduser().resolve()
+    return app_root / "out"
+
+
 def _load_pcbrouter_profiles(manifest_path: str | Path | None = None) -> tuple[PcbRouterProfile, ...]:
     """Load reproducible PcbRouter profiles from a manifest or use diversity defaults."""
     if manifest_path:
@@ -266,7 +279,9 @@ def _load_pcbrouter_profiles(manifest_path: str | Path | None = None) -> tuple[P
     return (
         *light_profiles,
         PcbRouterProfile(name="high_pin_first", order_strategy="high_pin_first", order_seed=1470295829),
-        PcbRouterProfile(name="high_obstacle", order_strategy="natural", order_seed=1470295829, track_obstacle_weight=500.0),
+        # high_obstacle is intentionally excluded for now: recent bm3 runs show
+        # it can dominate runtime without producing a selector-useful candidate.
+        # PcbRouterProfile(name="high_obstacle", order_strategy="natural", order_seed=1470295829, track_obstacle_weight=500.0),
     )
 
 
@@ -382,12 +397,19 @@ def _run_pcbrouter_profile_stage(
     env = os.environ.copy()
     env["PCBROUTER_ORDER_STRATEGY"] = profile.order_strategy
     env["PCBROUTER_FINAL_REPAIR"] = "1" if final_repair_enabled else "0"
-    # Forward the candidate-cleanup experiment explicitly. The PcbRouter side
-    # treats "no_check" as an inert diagnostic mode and only performs cleanup
-    # for concrete modes such as "y_only", "acute_only", or "1".
-    env.pop("PCBROUTER_CANDIDATE_PAD_ENTRY_FIX", None)
-    if _env_flag("INTERACTIVE_ROUTER_CANDIDATE_PAD_ENTRY_FIX"):
-        env["PCBROUTER_CANDIDATE_PAD_ENTRY_FIX"] = os.environ["INTERACTIVE_ROUTER_CANDIDATE_PAD_ENTRY_FIX"]
+    # Clear every pad-entry experiment switch before launching PcbRouter so
+    # stale shell variables cannot re-enable normal-cone routing or candidate
+    # geometry cleanup in pipeline runs.
+    for key in (
+        "PCBROUTER_NORMAL_CONE_HARD",
+        "PCBROUTER_PAD_ACCESS_POINTS",
+        "PCBROUTER_CANDIDATE_PAD_ENTRY_FIX",
+    ):
+        env.pop(key, None)
+    # PcbRouter's upstream acute-angle/Y post-processing is disabled for all
+    # Interactive-Router launches; the router binary also hard-disables it for
+    # standalone runs.
+    env["PCBROUTER_DISABLE_ANGLE_Y_FIX"] = "1"
     if profile.order_seed is not None:
         env["PCBROUTER_ORDER_SEED"] = str(profile.order_seed)
     prepare_sec = perf_counter() - prepare_started_at
