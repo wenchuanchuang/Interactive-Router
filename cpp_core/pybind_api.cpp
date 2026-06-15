@@ -1,11 +1,253 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <limits>
+#include <queue>
+#include <stdexcept>
+#include <unordered_map>
+#include <unordered_set>
+
 #include "include/geometry.h"
 #include "include/router.h"
 
 namespace py = pybind11;
 using namespace interactive_router;
+
+namespace {
+
+struct RandomGridQueueItem {
+    double priority = 0.0;
+    double cost = 0.0;
+    int state = 0;
+};
+
+struct RandomGridQueueGreater {
+    bool operator()(const RandomGridQueueItem& lhs, const RandomGridQueueItem& rhs) const {
+        if (lhs.priority == rhs.priority) {
+            return lhs.cost > rhs.cost;
+        }
+        return lhs.priority > rhs.priority;
+    }
+};
+
+int randomGridPackVertex(int nx, int ny, int x, int y, int z) {
+    return z * nx * ny + y * nx + x;
+}
+
+void randomGridUnpackVertex(int nx, int ny, int vertex, int& x, int& y, int& z) {
+    const int xy_count = nx * ny;
+    z = vertex / xy_count;
+    const int xy = vertex - z * xy_count;
+    y = xy / nx;
+    x = xy - y * nx;
+}
+
+double randomGridHeuristic(
+    int nx,
+    int ny,
+    double pitch,
+    int vertex,
+    const std::vector<std::pair<int, int>>& target_grid_xy
+) {
+    int x = 0;
+    int y = 0;
+    int z = 0;
+    randomGridUnpackVertex(nx, ny, vertex, x, y, z);
+    double best = std::numeric_limits<double>::infinity();
+    for (const auto& target : target_grid_xy) {
+        const double dx = static_cast<double>(x - target.first) * pitch;
+        const double dy = static_cast<double>(y - target.second) * pitch;
+        best = std::min(best, std::hypot(dx, dy));
+    }
+    return best;
+}
+
+int randomGridDirectionDelta(int first, int second) {
+    const int delta = std::abs(first - second);
+    return std::min(delta, 8 - delta);
+}
+
+double randomGridUnitRandom(std::uint64_t& state) {
+    // Use a tiny deterministic generator to avoid Python RNG calls inside A*.
+    state ^= state << 13;
+    state ^= state >> 7;
+    state ^= state << 17;
+    return static_cast<double>(state & 0xFFFFFFULL) / static_cast<double>(0x1000000ULL);
+}
+
+std::pair<int, std::vector<int>> randomGridAstar(
+    int nx,
+    int ny,
+    int nz,
+    double pitch,
+    const std::vector<int>& sources,
+    const std::vector<int>& target_vertices,
+    const std::vector<int>& target_indices,
+    const std::vector<std::pair<int, int>>& target_grid_xy,
+    py::buffer trace_blocked_buffer,
+    py::buffer via_blocked_buffer,
+    const std::vector<int>& used_penalty_vertices,
+    const std::vector<int>& bounds,
+    bool randomize,
+    std::uint64_t seed,
+    int max_expanded
+) {
+    if (target_vertices.size() != target_indices.size()) {
+        throw std::runtime_error("target_vertices and target_indices must have the same length");
+    }
+    const py::buffer_info trace_info = trace_blocked_buffer.request();
+    const py::buffer_info via_info = via_blocked_buffer.request();
+    const auto* trace_blocked = static_cast<const unsigned char*>(trace_info.ptr);
+    const auto* via_blocked = static_cast<const unsigned char*>(via_info.ptr);
+    const int xy_count = nx * ny;
+    const int vertex_count = xy_count * nz;
+    if (trace_info.size < vertex_count || via_info.size < xy_count) {
+        throw std::runtime_error("random-grid blocked buffers are smaller than the grid");
+    }
+
+    std::unordered_map<int, int> target_by_vertex;
+    target_by_vertex.reserve(target_vertices.size() * 2 + 1);
+    for (std::size_t index = 0; index < target_vertices.size(); ++index) {
+        target_by_vertex.emplace(target_vertices[index], target_indices[index]);
+    }
+
+    std::unordered_set<int> used_penalty;
+    if (randomize) {
+        used_penalty.reserve(used_penalty_vertices.size() * 2 + 1);
+        for (int vertex : used_penalty_vertices) {
+            used_penalty.insert(vertex);
+        }
+    }
+
+    const bool has_bounds = bounds.size() == 4;
+    const int min_bound_x = has_bounds ? bounds[0] : 0;
+    const int min_bound_y = has_bounds ? bounds[1] : 0;
+    const int max_bound_x = has_bounds ? bounds[2] : nx - 1;
+    const int max_bound_y = has_bounds ? bounds[3] : ny - 1;
+    auto in_bounds = [&](int x, int y) {
+        return x >= 0 && x < nx && y >= 0 && y < ny
+            && x >= min_bound_x && x <= max_bound_x
+            && y >= min_bound_y && y <= max_bound_y;
+    };
+
+    static constexpr int dirs[8][2] = {
+        {1, 0}, {1, 1}, {0, 1}, {-1, 1},
+        {-1, 0}, {-1, -1}, {0, -1}, {1, -1},
+    };
+
+    std::priority_queue<RandomGridQueueItem, std::vector<RandomGridQueueItem>, RandomGridQueueGreater> heap;
+    std::unordered_map<int, double> best_cost;
+    std::unordered_map<int, int> came_from;
+    best_cost.reserve(4096);
+    came_from.reserve(4096);
+
+    for (int source : sources) {
+        int x = 0;
+        int y = 0;
+        int z = 0;
+        randomGridUnpackVertex(nx, ny, source, x, y, z);
+        if (!in_bounds(x, y) || trace_blocked[source]) {
+            continue;
+        }
+        const int state = source * 9 + 8;
+        best_cost[state] = 0.0;
+        came_from[state] = -1;
+        heap.push({randomGridHeuristic(nx, ny, pitch, source, target_grid_xy), 0.0, state});
+    }
+
+    std::uint64_t rng_state = seed ? seed : 1ULL;
+    int expanded = 0;
+    while (!heap.empty() && expanded < max_expanded) {
+        const RandomGridQueueItem item = heap.top();
+        heap.pop();
+        const auto best_it = best_cost.find(item.state);
+        if (best_it == best_cost.end() || item.cost > best_it->second + 1e-9) {
+            continue;
+        }
+        ++expanded;
+
+        const int vertex = item.state / 9;
+        const int prev_dir = item.state % 9;
+        const auto target_it = target_by_vertex.find(vertex);
+        if (target_it != target_by_vertex.end()) {
+            std::vector<int> path;
+            int current = item.state;
+            while (current >= 0) {
+                path.push_back(current / 9);
+                const auto parent_it = came_from.find(current);
+                if (parent_it == came_from.end()) {
+                    break;
+                }
+                current = parent_it->second;
+            }
+            std::reverse(path.begin(), path.end());
+            return {target_it->second, path};
+        }
+
+        int x = 0;
+        int y = 0;
+        int z = 0;
+        randomGridUnpackVertex(nx, ny, vertex, x, y, z);
+        for (int dir_index = 0; dir_index < 8; ++dir_index) {
+            if (prev_dir != 8 && randomGridDirectionDelta(prev_dir, dir_index) > 1) {
+                continue;
+            }
+            const int next_x = x + dirs[dir_index][0];
+            const int next_y = y + dirs[dir_index][1];
+            if (!in_bounds(next_x, next_y)) {
+                continue;
+            }
+            const int next_vertex = randomGridPackVertex(nx, ny, next_x, next_y, z);
+            if (trace_blocked[next_vertex]) {
+                continue;
+            }
+            const double step = std::hypot(static_cast<double>(dirs[dir_index][0]), static_cast<double>(dirs[dir_index][1])) * pitch;
+            const double bend = (prev_dir == 8 || prev_dir == dir_index) ? 0.0 : 0.30;
+            double penalty = 0.0;
+            if (randomize) {
+                penalty += randomGridUnitRandom(rng_state) * 0.08;
+                if (used_penalty.find(next_vertex) != used_penalty.end()) {
+                    penalty += 1.5;
+                }
+            }
+            const double next_cost = item.cost + step + bend + penalty;
+            const int next_state = next_vertex * 9 + dir_index;
+            const auto next_best = best_cost.find(next_state);
+            if (next_best == best_cost.end() || next_cost + 1e-9 < next_best->second) {
+                best_cost[next_state] = next_cost;
+                came_from[next_state] = item.state;
+                heap.push({next_cost + randomGridHeuristic(nx, ny, pitch, next_vertex, target_grid_xy), next_cost, next_state});
+            }
+        }
+
+        if (nz > 1 && !via_blocked[y * nx + x]) {
+            for (int next_z = 0; next_z < nz; ++next_z) {
+                if (next_z == z) {
+                    continue;
+                }
+                const int next_vertex = randomGridPackVertex(nx, ny, x, y, next_z);
+                if (trace_blocked[next_vertex]) {
+                    continue;
+                }
+                const double via_cost = randomize ? (5.0 + randomGridUnitRandom(rng_state) * 9.0) : 8.0;
+                const double next_cost = item.cost + via_cost;
+                const int next_state = next_vertex * 9 + prev_dir;
+                const auto next_best = best_cost.find(next_state);
+                if (next_best == best_cost.end() || next_cost + 1e-9 < next_best->second) {
+                    best_cost[next_state] = next_cost;
+                    came_from[next_state] = item.state;
+                    heap.push({next_cost + randomGridHeuristic(nx, ny, pitch, next_vertex, target_grid_xy), next_cost, next_state});
+                }
+            }
+        }
+    }
+    return {-1, {}};
+}
+
+}  // namespace
 
 PYBIND11_MODULE(router_core, m) {
     m.doc() = "Interactive Router C++ grid and Dijkstra test core";
@@ -245,4 +487,23 @@ PYBIND11_MODULE(router_core, m) {
     m.def("analyze_pad_coverage", &analyzePadCoverage, py::arg("request"));
     m.def("analyze_selector_geometry_batch", &analyzeSelectorGeometryBatch, py::arg("requests"));
     m.def("analyze_selector_geometry_candidate_batch", &analyzeSelectorGeometryCandidateBatch, py::arg("request"));
+    m.def(
+        "random_grid_astar",
+        &randomGridAstar,
+        py::arg("nx"),
+        py::arg("ny"),
+        py::arg("nz"),
+        py::arg("pitch"),
+        py::arg("sources"),
+        py::arg("target_vertices"),
+        py::arg("target_indices"),
+        py::arg("target_grid_xy"),
+        py::arg("trace_blocked"),
+        py::arg("via_blocked"),
+        py::arg("used_penalty_vertices"),
+        py::arg("bounds"),
+        py::arg("randomize"),
+        py::arg("seed"),
+        py::arg("max_expanded")
+    );
 }

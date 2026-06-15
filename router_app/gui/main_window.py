@@ -31,6 +31,7 @@ from PyQt5.QtWidgets import (
 from router_app.freerouting_full import FreeroutingRunResult, run_freerouting_full
 from router_app.kicad_parser import BoardData, TrackSegment, load_board
 from router_app.pcb_router_full import PcbRouterRunResult, run_pcb_router_full
+from router_app.random_grid_router import RandomGridRunResult, run_random_grid_router
 from router_app.reroute_engine import (
     RerouteOutcome,
     _board_bend_count_outside_pads,
@@ -49,6 +50,7 @@ class MainWindow(QMainWindow):
         initial_file: str | None = None,
         freerouting_full: bool = False,
         pcb_router: bool = False,
+        random_grid_router: bool = False,
         router_profile_manifest: str | None = None,
         drc_feedback_pairwise: bool = False,
         drc_feedback_unary: bool = False,
@@ -64,6 +66,7 @@ class MainWindow(QMainWindow):
         self._external_selector_net_ids: set[int] = set()
         self._freerouting_full_enabled = freerouting_full
         self._pcb_router_enabled = pcb_router
+        self._random_grid_router_enabled = random_grid_router
         self._router_profile_manifest = router_profile_manifest
         self._drc_feedback_pairwise = drc_feedback_pairwise
         self._drc_feedback_unary = drc_feedback_unary
@@ -71,6 +74,7 @@ class MainWindow(QMainWindow):
         self._drc_feedback_kicad_cli = drc_feedback_kicad_cli
         self._freerouting_run: FreeroutingRunResult | None = None
         self._pcb_router_run: PcbRouterRunResult | None = None
+        self._random_grid_run: RandomGridRunResult | None = None
         self._freerouting_candidates_ready = False
         self._external_candidate_timing: dict[str, datetime] = {}
 
@@ -189,7 +193,7 @@ class MainWindow(QMainWindow):
         if self._freerouting_full_enabled and not self._pcb_router_enabled:
             self._open_board_with_freerouting(file_name)
             return
-        if self._freerouting_full_enabled or self._pcb_router_enabled:
+        if self._freerouting_full_enabled or self._pcb_router_enabled or self._random_grid_router_enabled:
             self._open_board_with_external_backends(file_name)
             return
         try:
@@ -242,6 +246,7 @@ class MainWindow(QMainWindow):
         # board and payload available to the selector candidate builder.
         freerouting_result: FreeroutingRunResult | None = None
         pcbrouter_result: PcbRouterRunResult | None = None
+        random_grid_result: RandomGridRunResult | None = None
         self._external_candidate_timing = {
             "program_started_at": self._program_started_at,
             "collection_started_at": datetime.now().astimezone(),
@@ -262,21 +267,34 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 QMessageBox.critical(self, "pcb-router failed", str(exc))
                 return
+        if self._random_grid_router_enabled:
+            try:
+                self._external_candidate_timing["random_grid_started_at"] = datetime.now().astimezone()
+                random_grid_result = run_random_grid_router(file_name)
+                self._external_candidate_timing["random_grid_finished_at"] = datetime.now().astimezone()
+            except Exception as exc:
+                QMessageBox.critical(self, "random-grid-router failed", str(exc))
+                return
         self._external_candidate_timing["collection_finished_at"] = datetime.now().astimezone()
 
         self._freerouting_run = freerouting_result
         self._pcb_router_run = pcbrouter_result
+        self._random_grid_run = random_grid_result
         display_result = freerouting_result or pcbrouter_result
         if display_result is None:
-            return
+            if random_grid_result is None:
+                return
+            display_board = random_grid_result.original_board
+            self._original_board = random_grid_result.original_board
+        else:
+            display_board = self._display_board_for_external_backends(
+                file_name,
+                display_result,
+                freerouting_result=freerouting_result,
+                pcbrouter_result=pcbrouter_result,
+            )
+            self._original_board = display_result.original_board
 
-        display_board = self._display_board_for_external_backends(
-            file_name,
-            display_result,
-            freerouting_result=freerouting_result,
-            pcbrouter_result=pcbrouter_result,
-        )
-        self._original_board = display_result.original_board
         self._board = display_board
         self._reset_candidate_generation_state()
         self.canvas.load_board(display_board)
@@ -301,6 +319,15 @@ class MainWindow(QMainWindow):
             self._print_freerouting_summary(freerouting_result)
         if pcbrouter_result is not None:
             self._print_pcbrouter_summary(pcbrouter_result)
+        if random_grid_result is not None:
+            print(
+                "random_grid_router_gui_summary "
+                f"unique_nets={random_grid_result.unique_ripped_net_count} "
+                f"candidates={random_grid_result.candidate_count} "
+                f"infeasible_nets={random_grid_result.infeasible_net_count} "
+                f"elapsed_sec={random_grid_result.elapsed_seconds:.3f}",
+                flush=True,
+            )
 
     def _display_board_for_external_backends(
         self,
@@ -647,7 +674,7 @@ class MainWindow(QMainWindow):
             self._show_status_counts("Rip-up undone")
 
     def _update_ripup_buttons(self, *_args) -> None:
-        if self._freerouting_full_enabled or self._pcb_router_enabled:
+        if self._freerouting_full_enabled or self._pcb_router_enabled or self._random_grid_router_enabled:
             self.rip_up_button.setEnabled(False)
             self.undo_rip_up_button.setEnabled(False)
             self.generate_candidates_button.setEnabled(bool(self._external_ripup_previews()))
@@ -677,7 +704,7 @@ class MainWindow(QMainWindow):
         self._update_ripup_buttons()
 
     def _generate_candidates_for_ripped_nets(self) -> None:
-        if self._freerouting_full_enabled or self._pcb_router_enabled:
+        if self._freerouting_full_enabled or self._pcb_router_enabled or self._random_grid_router_enabled:
             self._show_external_backend_ripped_routes()
             return
         if self._board is None:
@@ -706,7 +733,7 @@ class MainWindow(QMainWindow):
         self._update_ripup_buttons()
 
     def _reroute_selected_removed_nets(self) -> None:
-        if self._freerouting_full_enabled or self._pcb_router_enabled:
+        if self._freerouting_full_enabled or self._pcb_router_enabled or self._random_grid_router_enabled:
             if self._board is None or not self._external_ripup_previews():
                 self.statusBar().showMessage("External router result is not available.")
                 return
@@ -808,7 +835,7 @@ class MainWindow(QMainWindow):
         self._candidate_ripped_net_ids = set()
         self._external_selector_net_ids = set()
         self._freerouting_candidates_ready = False
-        if self._freerouting_full_enabled or self._pcb_router_enabled:
+        if self._freerouting_full_enabled or self._pcb_router_enabled or self._random_grid_router_enabled:
             self.route_preview.show_message("Generate candidates to show external ripped routes")
         else:
             self.route_preview.show_message("Generate candidates first")
@@ -845,6 +872,7 @@ class MainWindow(QMainWindow):
         for router_key, label in (
             ("freerouting", "freerouting_profiles"),
             ("pcbrouter", "pcbrouter_profiles"),
+            ("random_grid", "random_grid_router"),
         ):
             started = timing.get(f"{router_key}_started_at")
             finished = timing.get(f"{router_key}_finished_at")
@@ -863,6 +891,8 @@ class MainWindow(QMainWindow):
             previews.extend(self._freerouting_run.ripup_previews)
         if self._pcb_router_run is not None:
             previews.extend(self._pcb_router_run.ripup_previews)
+        if self._random_grid_run is not None:
+            previews.extend(self._random_grid_run.ripup_previews)
         return previews
 
     def _external_final_boards(self) -> list[BoardData]:
@@ -894,6 +924,12 @@ class MainWindow(QMainWindow):
         if self._pcb_router_run is None or self._pcb_router_run.ripup_payload_path is None:
             return []
         return list(self._pcb_router_run.candidate_ripup_payload_paths or (self._pcb_router_run.ripup_payload_path,))
+
+    def _random_grid_payload_paths(self) -> list[Path]:
+        """Return candidate-only payloads from the random grid router."""
+        if self._random_grid_run is None:
+            return []
+        return list(self._random_grid_run.candidate_ripup_payload_paths)
 
     def _external_final_route_net_ids(self, selector_board: BoardData) -> set[int]:
         """Return selector-board net ids that have copper in external final boards.
@@ -1108,6 +1144,7 @@ class MainWindow(QMainWindow):
             original_candidate_boards=self._external_original_candidate_boards(),
             freerouting_payload_paths=self._freerouting_payload_paths(),
             pcbrouter_payload_paths=self._pcbrouter_payload_paths(),
+            external_payload_paths=self._random_grid_payload_paths(),
             left_top_reference_board=self._board,
             backend_label="external",
         )

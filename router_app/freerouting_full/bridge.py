@@ -16,6 +16,7 @@ import pcbnew
 
 from router_app.kicad_parser import BoardData, TrackSegment, Via, load_board
 from router_app.reroute_engine import _find_invalid_pad_entry_locations
+from router_app.sj_bridge import SolderJumperBridge, detect_solder_jumper_bridges, point_inside_pad_copper
 
 
 FREEROUTING_PROFILE_SCHEMA = "interactive_router_freerouting_profiles_v1"
@@ -126,6 +127,9 @@ def run_freerouting_full(board_path: str | Path, profile_manifest_path: str | Pa
     _export_dsn(unrouted_input_board_path, dsn_path)
     _normalize_dsn_pcb_name(dsn_path, router_source_board_path.stem)
     _force_dsn_snap_angle_fortyfive(dsn_path)
+    sj_keepout_count = _inject_solder_jumper_bridge_keepouts_into_dsn(unrouted_input_board_path, dsn_path)
+    if sj_keepout_count:
+        print(f"freerouting_sj_bridge_keepouts_inserted = {sj_keepout_count}")
     started_at = perf_counter()
     stage_results = _run_freerouting_profiles(
         profile_paths=profile_paths,
@@ -732,6 +736,236 @@ def _force_dsn_snap_angle_fortyfive(dsn_path: Path) -> None:
     dsn_path.write_text(patched_text, encoding="utf-8")
 
 
+def _inject_solder_jumper_bridge_keepouts_into_dsn(board_path: Path, dsn_path: Path) -> int:
+    """Insert net-aware solder-jumper bridge metadata as special DSN keepouts.
+
+    The emitted keepout is recognized by the patched freerouting core via its
+    `ir_sj_bridge_v2` name prefix.  The first polygon is the bridge body and
+    each window polygon is an endpoint pad copper region paired with the net ids
+    encoded in the name.  Freerouting then decides at maze-search time whether
+    the current net may pass through the overlapped window.
+    """
+    try:
+        board = load_board(board_path)
+    except Exception:
+        return 0
+    bridges = detect_solder_jumper_bridges(board)
+    if not bridges:
+        return 0
+
+    keepout_scopes: list[str] = []
+    for bridge_index, bridge in enumerate(bridges):
+        layer_name = _dsn_layer_for_kicad_layer(bridge.layer)
+        if not layer_name:
+            continue
+        endpoint_pads = [pad for pad in bridge.endpoint_pads if pad.net_id is not None and int(pad.net_id) > 0]
+        if len(endpoint_pads) < 2:
+            continue
+        net_suffix = "".join(f"__h{_dsn_net_name_token(pad.net_name)}" for pad in endpoint_pads)
+        name = _dsn_identifier(f"ir_sj_bridge_v2{net_suffix}__{bridge.footprint_ref}_{bridge_index}")
+        bridge_polygon = _bridge_body_polygon(bridge)
+        if len(bridge_polygon) < 3:
+            continue
+        keepout_scopes.append(
+            f'    (keepout "{name}"\n'
+            f"      {_dsn_polygon_scope(layer_name, bridge_polygon)}\n"
+            + "".join(
+                f"      (window\n"
+                f"        {_dsn_polygon_scope(layer_name, _pad_copper_polygon(pad))}\n"
+                f"      )\n"
+                for pad in endpoint_pads
+            )
+            + "    )"
+        )
+
+    if not keepout_scopes:
+        return 0
+    text = dsn_path.read_text(encoding="utf-8")
+    structure_end = _find_dsn_scope_end(text, "structure")
+    if structure_end is None:
+        raise RuntimeError("Could not find '(structure ...)' scope in DSN to insert solder-jumper bridge keepouts.")
+    insertion = "\n" + "\n".join(keepout_scopes) + "\n"
+    dsn_path.write_text(text[:structure_end] + insertion + text[structure_end:], encoding="utf-8")
+    return len(keepout_scopes)
+
+
+def _bridge_body_polygon(bridge: SolderJumperBridge) -> list[tuple[float, float]]:
+    """Return a rectangle polygon for the actual solder-jumper bridge copper body."""
+    sx, sy = bridge.start
+    ex, ey = bridge.end
+    dx = ex - sx
+    dy = ey - sy
+    length = math.hypot(dx, dy)
+    if length <= 1e-9:
+        return []
+    nx = -dy / length * bridge.width * 0.5
+    ny = dx / length * bridge.width * 0.5
+    return [
+        (sx + nx, sy + ny),
+        (ex + nx, ey + ny),
+        (ex - nx, ey - ny),
+        (sx - nx, sy - ny),
+    ]
+
+
+def _pad_copper_polygon(pad: object) -> list[tuple[float, float]]:
+    """Approximate a KiCad pad copper body as a DSN polygon window."""
+    cx, cy = pad.center
+    width, height = float(pad.size[0]), float(pad.size[1])
+    rotation = math.radians(float(getattr(pad, "rotation_degrees", 0.0) or 0.0))
+    shape = str(getattr(pad, "shape", "") or "").lower()
+    if shape in {"circle", "oval"}:
+        points = []
+        steps = 32
+        for index in range(steps):
+            angle = 2.0 * math.pi * index / steps
+            points.append((math.cos(angle) * width * 0.5, math.sin(angle) * height * 0.5))
+    else:
+        points = [
+            (-width * 0.5, -height * 0.5),
+            (width * 0.5, -height * 0.5),
+            (width * 0.5, height * 0.5),
+            (-width * 0.5, height * 0.5),
+        ]
+    cos_a = math.cos(rotation)
+    sin_a = math.sin(rotation)
+    return [(cx + x * cos_a - y * sin_a, cy + x * sin_a + y * cos_a) for x, y in points]
+
+
+def _dsn_polygon_scope(layer_name: str, points: list[tuple[float, float]]) -> str:
+    """Format a KiCad-mm polygon as a Specctra DSN polygon scope."""
+    coords: list[str] = []
+    for point in points:
+        x, y = _kicad_mm_to_dsn_um(point)
+        coords.extend([_dsn_number(x), _dsn_number(y)])
+    return f"(polygon {layer_name} 0  {' '.join(coords)})"
+
+
+def _dsn_net_name_token(net_name: str) -> str:
+    """Encode a net name into a DSN identifier-safe hex token."""
+    return str(net_name).encode("utf-8").hex().upper()
+
+
+def _solder_jumper_bridge_blocked_segments(bridge: SolderJumperBridge) -> list[tuple[tuple[float, float], tuple[float, float]]]:
+    """Return bridge centerline intervals outside endpoint pad copper."""
+    sample_count = 96
+    intervals: list[tuple[float, float]] = []
+    in_blocked = False
+    start_t = 0.0
+    previous_t = 0.0
+    previous_blocked = False
+    for step in range(sample_count + 1):
+        t = step / sample_count
+        point = _interpolate(bridge.start, bridge.end, t)
+        blocked = not any(point_inside_pad_copper(point[0], point[1], pad, tolerance=0.0) for pad in bridge.endpoint_pads)
+        if step == 0:
+            in_blocked = blocked
+            previous_blocked = blocked
+            if blocked:
+                start_t = 0.0
+            previous_t = t
+            continue
+        if blocked != previous_blocked:
+            boundary_t = _refine_solder_jumper_pad_boundary(bridge, previous_t, t, previous_blocked)
+            if previous_blocked:
+                intervals.append((start_t, boundary_t))
+            else:
+                start_t = boundary_t
+            in_blocked = blocked
+        previous_t = t
+        previous_blocked = blocked
+    if in_blocked:
+        intervals.append((start_t, 1.0))
+
+    min_length_mm = max(0.01, bridge.width * 0.25)
+    return [
+        (_interpolate(bridge.start, bridge.end, start_t), _interpolate(bridge.start, bridge.end, end_t))
+        for start_t, end_t in intervals
+        if _distance(_interpolate(bridge.start, bridge.end, start_t), _interpolate(bridge.start, bridge.end, end_t)) >= min_length_mm
+    ]
+
+
+def _refine_solder_jumper_pad_boundary(bridge: SolderJumperBridge, low_t: float, high_t: float, low_blocked: bool) -> float:
+    """Binary-search the transition between pad-open and bridge-blocked regions."""
+    lo = low_t
+    hi = high_t
+    for _ in range(24):
+        mid = (lo + hi) * 0.5
+        point = _interpolate(bridge.start, bridge.end, mid)
+        mid_blocked = not any(point_inside_pad_copper(point[0], point[1], pad, tolerance=0.0) for pad in bridge.endpoint_pads)
+        if mid_blocked == low_blocked:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) * 0.5
+
+
+def _find_dsn_scope_end(text: str, scope_name: str) -> int | None:
+    """Find the byte index of the closing parenthesis for a top-level DSN scope."""
+    match = re.search(r"\(\s*" + re.escape(scope_name) + r"\b", text, re.IGNORECASE)
+    if match is None:
+        return None
+    depth = 0
+    in_string = False
+    escape = False
+    for index in range(match.start(), len(text)):
+        ch = text[index]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return index
+    return None
+
+
+def _dsn_layer_for_kicad_layer(layer: str) -> str | None:
+    """Map KiCad copper layer names to KiCad DSN layer names."""
+    canonical = layer.strip().lower()
+    if canonical in {"f.cu", "front", "top"}:
+        return "Top"
+    if canonical in {"b.cu", "back", "bottom"}:
+        return "Bottom"
+    return None
+
+
+def _kicad_mm_to_dsn_um(point: tuple[float, float]) -> tuple[float, float]:
+    """Convert KiCad millimeter board coordinates to DSN micrometer coordinates."""
+    return point[0] * 1000.0, -point[1] * 1000.0
+
+
+def _interpolate(start: tuple[float, float], end: tuple[float, float], t: float) -> tuple[float, float]:
+    """Interpolate between two points."""
+    return start[0] + (end[0] - start[0]) * t, start[1] + (end[1] - start[1]) * t
+
+
+def _distance(first: tuple[float, float], second: tuple[float, float]) -> float:
+    """Return Euclidean distance between two points."""
+    return math.hypot(first[0] - second[0], first[1] - second[1])
+
+
+def _dsn_number(value: float) -> str:
+    """Format DSN numbers compactly while keeping sub-micron precision."""
+    if abs(value - round(value)) < 1e-6:
+        return str(int(round(value)))
+    return f"{value:.6f}".rstrip("0").rstrip(".")
+
+
+def _dsn_identifier(value: str) -> str:
+    """Return a DSN-safe identifier fragment."""
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("_") or "sj_bridge"
+
+
 def _sanitize_ses_for_kicad_import(ses_path: Path) -> int:
     """Remove SES placement blocks that KiCad's importer rejects.
 
@@ -822,6 +1056,11 @@ def _run_freerouting(
     env = os.environ.copy()
     env["FREEROUTING__USER_DATA_PATH"] = str(home_dir)
     env["FREEROUTING_ITEM_ORDER_STRATEGY"] = order_strategy
+    # The KiCad-driven path has access to SJ geometry and handles intentional
+    # SJ contacts in downstream DRC feedback.  Do not let freerouting synthesize
+    # its DSN-only fallback, because that path cannot be net-aware and would
+    # over-block legal endpoint pad access.
+    env["FREEROUTING_KICAD_SJ_KEEPOUTS_INSERTED"] = "1"
     if "FREEROUTING_BOARD_EDGE_CLEARANCE_MM" not in env and board_edge_clearance_mm is not None:
         # Pass KiCad's copper-to-edge clearance into freerouting because the
         # DSN export often omits this design setting while KiCad DRC still

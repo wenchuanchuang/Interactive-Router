@@ -891,7 +891,7 @@ def _parse_pad(
         if layers_node is not None
         else tuple()
     )
-    net_id = _to_int(_child_value(node, "net"))
+    net_id = _pad_net_id(node, nets)
 
     return Pad(
         name=name,
@@ -903,6 +903,21 @@ def _parse_pad(
         net_name=nets.get(net_id, f"Net {net_id}") if net_id is not None else "",
         rotation_degrees=footprint_angle + pad_angle,
     )
+
+
+def _pad_net_id(node: list[Any], nets: dict[int, str]) -> int | None:
+    """Read legacy numeric pad net ids or KiCad 6+ pad net names."""
+    net_value = _child_value(node, "net")
+    net_id = _to_int(net_value)
+    if net_id is not None:
+        return net_id
+    if net_value is None:
+        return None
+    net_name = str(net_value)
+    for candidate_id, candidate_name in nets.items():
+        if candidate_name == net_name:
+            return candidate_id
+    return None
 
 
 def _footprint_reference(node: list[Any]) -> str | None:

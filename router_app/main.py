@@ -13,6 +13,7 @@ def main() -> int:
     parser.add_argument("board", nargs="?")
     parser.add_argument("--freerouting-full", action="store_true")
     parser.add_argument("--pcb-router", action="store_true")
+    parser.add_argument("--random-grid-router", action="store_true")
     parser.add_argument("--router-profile-manifest")
     parser.add_argument("--drc-feedback-pairwise", action="store_true")
     parser.add_argument("--drc-feedback-unary", action="store_true")
@@ -25,6 +26,7 @@ def main() -> int:
         args.board,
         freerouting_full=args.freerouting_full,
         pcb_router=args.pcb_router,
+        random_grid_router=args.random_grid_router,
         router_profile_manifest=args.router_profile_manifest,
         drc_feedback_pairwise=args.drc_feedback_pairwise,
         drc_feedback_unary=args.drc_feedback_unary,

@@ -6,7 +6,7 @@ import re
 import shutil
 import subprocess
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from math import ceil
 import math
@@ -20,6 +20,7 @@ from typing import Any
 from router_app.kicad_parser import BoardData, load_board
 from router_app.path_selector import SelectionResult
 from router_app.path_selector.types import NetSelection as PyNetSelection
+from router_app.sj_bridge import filter_allowed_sj_bridge_violations
 
 _DLL_DIR_HANDLES: list[Any] = []
 
@@ -382,6 +383,7 @@ def select_reroute_candidates(
     selected_source_counts = {
         "freerouting": 0,
         "pcbrouter": 0,
+        "random_grid_router": 0,
         "other": 0,
     }
     for selection in selections:
@@ -426,6 +428,7 @@ def select_reroute_candidates(
             "selector_selected_source_counts = "
             f"freerouting:{selected_source_counts['freerouting']}, "
             f"pcbrouter:{selected_source_counts['pcbrouter']}, "
+            f"random_grid_router:{selected_source_counts['random_grid_router']}, "
             f"other:{selected_source_counts['other']}",
             flush=True,
         )
@@ -555,6 +558,11 @@ def select_reroute_candidates(
     )
     if feedback_result is not None:
         return feedback_result
+    _print_final_selection_drc_summaries(
+        selected_board_path=gurobi_board_artifact.path if gurobi_board_artifact is not None else None,
+        left_top_board=left_top_board,
+        kicad_cli_hint=drc_feedback_kicad_cli,
+    )
     artifacts = {}
     if gurobi_result_path is not None:
         artifacts["gurobi_result_json"] = str(gurobi_result_path.resolve())
@@ -567,6 +575,142 @@ def select_reroute_candidates(
         message=str(cpp_result.message),
         artifacts=artifacts or None,
     )
+
+
+def _print_final_selection_drc_summaries(
+    selected_board_path: Path | None,
+    left_top_board: BoardData | None,
+    kicad_cli_hint: str | Path | None,
+) -> None:
+    """Print KiCad DRC summaries for the final selected and visible boards."""
+    kicad_cli = _resolve_kicad_cli(kicad_cli_hint)
+    if kicad_cli is None:
+        print("selector_kicad_drc_summary_unavailable reason=kicad_cli_not_found", flush=True)
+        return
+    if selected_board_path is not None:
+        _print_kicad_drc_summary_for_board(
+            label="selector_gurobi_kicad_drc",
+            board_path=Path(selected_board_path),
+            kicad_cli=kicad_cli,
+        )
+    if left_top_board is not None:
+        _print_kicad_drc_summary_for_board(
+            label="selector_left_top_kicad_drc",
+            board_path=Path(left_top_board.path),
+            kicad_cli=kicad_cli,
+        )
+
+
+def _print_kicad_drc_summary_for_board(label: str, board_path: Path, kicad_cli: Path) -> None:
+    """Run KiCad DRC for one board and print stable, grep-friendly counts."""
+    report_path = _kicad_drc_summary_report_path(board_path, label)
+    try:
+        summary = _run_kicad_drc_summary(board_path, report_path, kicad_cli)
+    except Exception as exc:
+        print(
+            f"{label}_unavailable reason={type(exc).__name__}:{exc} board={Path(board_path).resolve()}",
+            flush=True,
+        )
+        return
+    type_counts = summary["type_counts"]
+    type_text = ",".join(
+        f"{key}:{type_counts[key]}"
+        for key in sorted(type_counts)
+    ) or "(none)"
+    print(
+        f"{label} "
+        f"total={summary['total']} "
+        f"unconnected_items={summary['unconnected_items']} "
+        f"priority_bad={summary['priority_bad']} "
+        f"clearance={type_counts.get('clearance', 0)} "
+        f"shorting_items={type_counts.get('shorting_items', 0)} "
+        f"tracks_crossing={type_counts.get('tracks_crossing', 0)} "
+        f"hole_clearance={type_counts.get('hole_clearance', 0)} "
+        f"ignored_sj_bridge={summary.get('ignored_sj_bridge', 0)} "
+        f"types={type_text} "
+        f"report={report_path.resolve()} "
+        f"board={Path(board_path).resolve()}",
+        flush=True,
+    )
+
+
+def _kicad_drc_summary_report_path(board_path: Path, label: str) -> Path:
+    """Return a nearby DRC report path for final selector log summaries."""
+    safe_label = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(label)).strip("_") or "drc"
+    board = Path(board_path)
+    if board.parent.name == "gurobi_selection_boards":
+        report_dir = board.parent.parent / "gurobi_selection_drc"
+    else:
+        report_dir = board.parent / "drc"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    return report_dir / f"{board.stem}__{safe_label}.drc.json"
+
+
+def _run_kicad_drc_summary(board_path: Path, report_path: Path, kicad_cli: Path) -> dict[str, Any]:
+    """Run KiCad DRC and return counts used by terminal summaries."""
+    completed = subprocess.run(
+        [
+            str(kicad_cli),
+            "pcb",
+            "drc",
+            "--format",
+            "json",
+            "--severity-all",
+            "--all-track-errors",
+            "--output",
+            str(report_path),
+            str(board_path),
+        ],
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if not report_path.exists():
+        raise FileNotFoundError(f"missing KiCad DRC report, exit={completed.returncode}")
+    report = json.loads(report_path.read_text(encoding="utf-8", errors="replace"))
+    violations = list(report.get("violations", []))
+    violations, ignored_sj_bridge = _filter_allowed_sj_bridge_violations_for_board(board_path, violations)
+    type_counts: dict[str, int] = {}
+    for violation in violations:
+        violation_type = str(violation.get("type", "unknown") or "unknown")
+        type_counts[violation_type] = type_counts.get(violation_type, 0) + 1
+    unconnected_items = len(report.get("unconnected_items", []))
+    priority_bad = (
+        type_counts.get("clearance", 0)
+        + type_counts.get("shorting_items", 0)
+        + type_counts.get("tracks_crossing", 0)
+        + type_counts.get("hole_clearance", 0)
+        + unconnected_items
+    )
+    if completed.returncode not in (0,):
+        print(
+            "selector_kicad_drc_cli_exit "
+            f"label={report_path.stem} code={completed.returncode} "
+            f"stdout={completed.stdout.strip()!r} stderr={completed.stderr.strip()!r}",
+            flush=True,
+        )
+    return {
+        "total": len(violations),
+        "unconnected_items": unconnected_items,
+        "priority_bad": priority_bad,
+        "type_counts": type_counts,
+        "ignored_sj_bridge": ignored_sj_bridge,
+    }
+
+
+def _filter_allowed_sj_bridge_violations_for_board(
+    board_path: Path,
+    violations: list[dict[str, Any]],
+    uuid_to_candidate: dict[str, tuple[int, int]] | None = None,
+) -> tuple[list[dict[str, Any]], int]:
+    """Filter intentional normally-closed solder-jumper bridge contacts from DRC results."""
+    try:
+        board = load_board(board_path)
+    except Exception:
+        return violations, 0
+    return filter_allowed_sj_bridge_violations(board, violations, uuid_to_candidate)
 
 
 def _maybe_resolve_with_drc_feedback(
@@ -603,7 +747,7 @@ def _maybe_resolve_with_drc_feedback(
 
     report_path = _drc_feedback_report_path(board_artifact.path, drc_feedback_attempt)
     drc_summary = _run_kicad_drc_for_feedback(board_artifact.path, report_path, kicad_cli)
-    extracted_pairs, extracted_unary = _candidate_cuts_from_drc_report(report_path, board_artifact.uuid_to_candidate)
+    extracted_pairs, extracted_unary = _candidate_cuts_from_drc_report(report_path, board_artifact.uuid_to_candidate, board_artifact.path)
     if not drc_feedback_pairwise:
         extracted_pairs = []
     if not drc_feedback_unary:
@@ -636,6 +780,7 @@ def _maybe_resolve_with_drc_feedback(
         f"extracted_pairs={len(extracted_pairs)} "
         f"new_unary={len(new_unary)} "
         f"new_pairs={len(new_pairs)} "
+        f"ignored_sj_bridge={drc_summary.get('ignored_sj_bridge', 0)} "
         f"report={report_path.resolve()}",
         flush=True,
     )
@@ -645,6 +790,27 @@ def _maybe_resolve_with_drc_feedback(
     if not new_pairs and not new_unary:
         print(f"drc_feedback_stop attempt={drc_feedback_attempt} reason=no_new_candidate_cuts", flush=True)
         return None
+
+    # Print each newly added DRC feedback cut so headless tests can be audited
+    # without changing the selector model or objective.
+    for candidate in new_unary:
+        canonical = _canonical_candidate(candidate)
+        print(
+            "drc_feedback_new_unary_cut "
+            f"attempt={drc_feedback_attempt} "
+            f"net={canonical[0]} candidate={canonical[1]}",
+            flush=True,
+        )
+    for pair in new_pairs:
+        canonical = _canonical_candidate_pair(pair)
+        first, second = canonical
+        print(
+            "drc_feedback_new_pair_cut "
+            f"attempt={drc_feedback_attempt} "
+            f"a_net={first[0]} a_candidate={first[1]} "
+            f"b_net={second[0]} b_candidate={second[1]}",
+            flush=True,
+        )
 
     next_selections = list(forbidden_selections or [])
     for candidate in new_unary:
@@ -732,11 +898,19 @@ def _run_kicad_drc_for_feedback(board_path: Path, report_path: Path, kicad_cli: 
             str(board_path),
         ],
         text=True,
+        encoding="utf-8",
+        errors="replace",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
     text = report_path.read_text(encoding="utf-8", errors="replace") if report_path.exists() else ""
-    types = re.findall(r'"type"\s*:\s*"([^"]+)"', text)
+    ignored_sj_bridge = 0
+    try:
+        report = json.loads(text) if text else {}
+        violations, ignored_sj_bridge = _filter_allowed_sj_bridge_violations_for_board(board_path, list(report.get("violations", [])))
+        types = [str(violation.get("type", "")) for violation in violations]
+    except json.JSONDecodeError:
+        types = re.findall(r'"type"\s*:\s*"([^"]+)"', text)
     clearance = sum(1 for violation_type in types if "clearance" in violation_type.lower())
     actionable = sum(1 for violation_type in types if _is_drc_feedback_cut_type(violation_type))
     if completed.returncode not in (0,):
@@ -745,7 +919,7 @@ def _run_kicad_drc_for_feedback(board_path: Path, report_path: Path, kicad_cli: 
             f"code={completed.returncode} stdout={completed.stdout.strip()!r} stderr={completed.stderr.strip()!r}",
             flush=True,
         )
-    return {"total": len(types), "clearance": clearance, "actionable": actionable}
+    return {"total": len(types), "clearance": clearance, "actionable": actionable, "ignored_sj_bridge": ignored_sj_bridge}
 
 
 def _is_drc_feedback_cut_type(violation_type: str) -> bool:
@@ -776,6 +950,7 @@ def _canonical_candidate_pair(
 def _candidate_cuts_from_drc_report(
     report_path: Path,
     uuid_to_candidate: dict[str, tuple[int, int]],
+    board_path: Path | None = None,
 ) -> tuple[list[tuple[tuple[int, int], tuple[int, int]]], list[tuple[int, int]]]:
     """Extract pairwise and unary candidate cuts from actionable KiCad DRC items."""
     if not report_path.exists():
@@ -790,7 +965,11 @@ def _candidate_cuts_from_drc_report(
     seen_pairs: set[tuple[tuple[int, int], tuple[int, int]]] = set()
     seen_unary: set[tuple[int, int]] = set()
 
-    for violation in report.get("violations", []):
+    violations = list(report.get("violations", []))
+    if board_path is not None:
+        violations, _ = _filter_allowed_sj_bridge_violations_for_board(board_path, violations, uuid_to_candidate)
+
+    for violation in violations:
         if not _is_drc_feedback_cut_type(str(violation.get("type", ""))):
             continue
         candidates: list[tuple[int, int]] = []
@@ -902,6 +1081,8 @@ def _selected_external_router_source_bucket(source: str) -> str:
         return "freerouting"
     if "pcbrouter" in normalized:
         return "pcbrouter"
+    if "random_grid_router" in normalized or "random-grid" in normalized or "random_grid" in normalized:
+        return "random_grid_router"
     return "other"
 
 
@@ -6429,9 +6610,13 @@ def _load_freerouting_occurrences_by_net(
 def _external_payload_backend(payload: dict[str, Any], payload_path: Path) -> str:
     """Return the backend label used for selector debug output."""
     backend = str(payload.get("backend", "") or payload.get("generator", "")).lower()
+    if "random_grid" in backend:
+        return "random_grid_router"
     if "pcbrouter" in backend or "pcb_router" in backend:
         return "pcbrouter"
     name = Path(payload_path).name.lower()
+    if "random_grid" in name:
+        return "random_grid_router"
     if "pcbrouter" in name or "pcb_router" in name:
         return "pcbrouter"
     return "freerouting"
@@ -6566,6 +6751,117 @@ def _matching_net_id_by_name(board: BoardData | None, net_name: str) -> int:
     if len(matches) == 1:
         return matches[0]
     return 0
+
+
+def _candidate_board_aligned_to_selector(selector_board: BoardData, candidate_board: BoardData, label: str) -> BoardData:
+    """Return candidate geometry translated into the selector-board coordinate frame.
+
+    External final/original boards can be simple translations of the selector
+    board.  The selector pre-check compares route geometry against selector
+    pads, so all candidate copper and pads must use the selector coordinate
+    frame before rasterization and pad-coverage analysis.
+    """
+    try:
+        dx, dy = _board_translation_from_common_pads(source_board=candidate_board, target_board=selector_board)
+    except ValueError as exc:
+        print(f"external_candidate_alignment_status label={label} status=unchanged reason={exc}", flush=True)
+        return candidate_board
+    if abs(dx) <= 1e-9 and abs(dy) <= 1e-9:
+        return candidate_board
+    print(f"external_candidate_alignment_mm label={label} dx={dx:.6f} dy={dy:.6f}", flush=True)
+    return _translated_board_data(candidate_board, dx, dy)
+
+
+def _align_candidate_boards_to_selector(
+    selector_board: BoardData,
+    boards: list[BoardData] | None,
+    label: str,
+) -> list[BoardData]:
+    """Translate every candidate board that is a simple offset from selector_board."""
+    aligned: list[BoardData] = []
+    for index, candidate_board in enumerate(list(boards or [])):
+        if candidate_board is None:
+            continue
+        aligned.append(_candidate_board_aligned_to_selector(selector_board, candidate_board, f"{label}[{index}]"))
+    return aligned
+
+
+def _translated_board_data(board: BoardData, dx: float, dy: float) -> BoardData:
+    """Create a BoardData copy whose geometry is translated by dx/dy millimeters."""
+    translated_tracks = [
+        replace(
+            track,
+            start=(float(track.start[0]) + dx, float(track.start[1]) + dy),
+            end=(float(track.end[0]) + dx, float(track.end[1]) + dy),
+        )
+        for track in board.tracks
+    ]
+    translated_vias = [
+        replace(via, center=(float(via.center[0]) + dx, float(via.center[1]) + dy))
+        for via in board.vias
+    ]
+    translated_footprints = []
+    for footprint in board.footprints:
+        # Pads are translated together with routes so source-board pad
+        # coverage checks still use the same coordinate frame as the copper.
+        translated_pads = [
+            replace(pad, center=(float(pad.center[0]) + dx, float(pad.center[1]) + dy))
+            for pad in footprint.pads
+        ]
+        translated_footprints.append(
+            replace(
+                footprint,
+                position=(float(footprint.position[0]) + dx, float(footprint.position[1]) + dy),
+                pads=translated_pads,
+            )
+        )
+    return replace(board, tracks=translated_tracks, vias=translated_vias, footprints=translated_footprints)
+
+
+def _board_translation_from_common_pads(source_board: BoardData, target_board: BoardData) -> tuple[float, float]:
+    """Calculate a constant source-to-target translation from matching pad centers."""
+    source_pads = _pad_centers_by_reference(source_board)
+    target_pads = _pad_centers_by_reference(target_board)
+    common_keys = sorted(set(source_pads) & set(target_pads))
+    if len(common_keys) < 2:
+        raise ValueError("too_few_common_pads")
+
+    offsets = [
+        (
+            target_pads[key][0] - source_pads[key][0],
+            target_pads[key][1] - source_pads[key][1],
+        )
+        for key in common_keys
+    ]
+    dx = _median(value[0] for value in offsets)
+    dy = _median(value[1] for value in offsets)
+    max_deviation = max(max(abs(item_dx - dx), abs(item_dy - dy)) for item_dx, item_dy in offsets)
+    if max_deviation > 0.01:
+        raise ValueError(f"not_simple_translation max_deviation_mm={max_deviation:.6f}")
+    return dx, dy
+
+
+def _pad_centers_by_reference(board: BoardData) -> dict[tuple[str, str], tuple[float, float]]:
+    """Index pad centers by footprint reference and pad name for board-frame matching."""
+    centers: dict[tuple[str, str], tuple[float, float]] = {}
+    for footprint in board.footprints:
+        for pad in footprint.pads:
+            centers[(str(footprint.reference), str(pad.name))] = (
+                float(pad.center[0]),
+                float(pad.center[1]),
+            )
+    return centers
+
+
+def _median(values: object) -> float:
+    """Return the median value from a finite numeric iterable."""
+    ordered = sorted(float(value) for value in values)
+    if not ordered:
+        raise ValueError("empty_values")
+    midpoint = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[midpoint]
+    return (ordered[midpoint - 1] + ordered[midpoint]) * 0.5
 
 
 def _external_selector_bounds(
@@ -6766,6 +7062,15 @@ def build_freerouting_external_selector_outcome(
 ) -> RerouteOutcome:
     if not ripped_net_ids:
         return RerouteOutcome(False, f"No ripped nets were provided for {backend_label} selector input.")
+
+    final_boards = _align_candidate_boards_to_selector(board, final_boards, "final_board")
+    if final_board is not None:
+        final_board = _candidate_board_aligned_to_selector(board, final_board, "final_board")
+    original_candidate_boards = _align_candidate_boards_to_selector(
+        board,
+        original_candidate_boards,
+        "original_candidate_board",
+    )
 
     layers = board.copper_layers or ["F.Cu"]
     nz = len(layers)
